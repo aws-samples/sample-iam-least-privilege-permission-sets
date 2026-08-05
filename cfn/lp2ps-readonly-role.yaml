@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  LP2PS cross-account read-only role. The customer deploys this into **each member (analyzed) account** via
+  StackSet. The tooling account's engine role assumes this role to read IAM usage. Read-only only — there are
+  no write APIs (invariant #1: analyzed accounts are never modified). Not needed for single-account validation.
+
+Parameters:
+  ToolingEngineRoleArn:
+    Type: String
+    Description: The tooling account's engine Lambda role ARN (only this role may assume).
+  ReadOnlyRoleName:
+    Type: String
+    Default: lp2ps-readonly
+    Description: Name of the read-only role to create (must match config.readonly_role_name).
+  ExternalId:
+    Type: String
+    Default: ""
+    Description: >
+      (Optional, recommended) ExternalId for confused-deputy protection. When set, the tooling engine can
+      assume only with this value. It must match the tooling config.external_id. Empty means no condition.
+
+Conditions:
+  HasExternalId: !Not [!Equals [!Ref ExternalId, ""]]
+
+Resources:
+  Lp2psReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref ReadOnlyRoleName
+      Description: LP2PS read-only inventory access (assumed by tooling engine)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref ToolingEngineRoleArn
+            Action: "sts:AssumeRole"
+            # When ExternalId is provided, add a confused-deputy protection condition to the trust policy.
+            Condition: !If
+              - HasExternalId
+              - StringEquals:
+                  "sts:ExternalId": !Ref ExternalId
+              - !Ref "AWS::NoValue"
+      Policies:
+        - PolicyName: lp2ps-readonly-inventory
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Only the describe/list APIs used by collectors (matches the awsguard allowlist). No writes.
+              - Sid: IamReadOnly
+                Effect: Allow
+                Action:
+                  - "iam:GetAccountAuthorizationDetails"
+                  - "iam:GenerateCredentialReport"
+                  - "iam:GetCredentialReport"
+                  - "iam:GenerateServiceLastAccessedDetails"
+                  - "iam:GetServiceLastAccessedDetails"
+                  - "iam:ListRoles"
+                  - "iam:ListUsers"
+                  - "iam:GetPolicyVersion"
+                Resource: "*"
+              - Sid: AccessAnalyzerReadOnly
+                Effect: Allow
+                Action:
+                  - "access-analyzer:ListAnalyzers"
+                  - "access-analyzer:ListFindingsV2"
+                  - "access-analyzer:GetFindingV2"
+                Resource: "*"
+              - Sid: CloudTrailReadOnly
+                Effect: Allow
+                Action:
+                  # CloudTrail Lake is not used — only the default LookupEvents (free). No Lake permissions (StartQuery, etc.) needed.
+                  - "cloudtrail:LookupEvents"
+                Resource: "*"
+              - Sid: StsIdentity
+                Effect: Allow
+                Action: "sts:GetCallerIdentity"
+                Resource: "*"
+      Tags:
+        - Key: ManagedBy
+          Value: lp2ps
+        - Key: auto-delete
+          Value: "no"
+
+Outputs:
+  ReadOnlyRoleArn:
+    Description: ARN of the created read-only role (referenced by tooling config.readonly_role_name).
+    Value: !GetAtt Lp2psReadOnlyRole.Arn

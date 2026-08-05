@@ -1,0 +1,457 @@
+"""M6 Reporter — cleanup 백로그 + 리포트 + exec summary.
+
+M3/M4/M5 로 enrich 된 normalized.parquet + catalog 를 읽어:
+- `cleanup_backlog.csv` — 5유형(unused_permission/unused_role/long_lived_key/no_mfa/escalation_path)
+  CleanupItem 목록(계약 model). UI 는 카테고리 요약→드릴다운.
+- `exec_summary.json` — ExecSummary(accounts/principals/personas/unused_permissions_removed/generated_at).
+- `report.html` — 사람이 읽는 요약(결정론 정적 HTML).
+
+불변식 ②(결정론): 안정 정렬, generated_at 은 run.started_at(유일 허용 wall-clock)에서. 불변식 ③: AI 미사용.
+"""
+
+from __future__ import annotations
+
+import csv
+import html
+import io
+import re
+from typing import TYPE_CHECKING
+
+from .models import CatalogEntry, CleanupItem, CleanupType, ExecSummary, PrincipalRecord
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .config import Config
+    from .runctx import RunContext
+    from .storage import Storage
+
+BACKLOG_NAME = "cleanup_backlog.csv"
+EXEC_SUMMARY_NAME = "exec_summary.json"
+REPORT_NAME = "report.html"
+
+
+def build_reports(storage: "Storage", run: "RunContext", cfg: "Config") -> ExecSummary:
+    records = storage.read_normalized()
+    catalog = _load_catalog(storage)
+
+    items = _cleanup_items(records, cfg)
+    _write_backlog(storage, items)
+
+    summary = _exec_summary(records, catalog, items, run)
+    storage.write_json(EXEC_SUMMARY_NAME, summary.model_dump())
+    # 종합 리포트: manifest(소스 신뢰도)·escalation 요약도 함께 실어 사람이 읽는 보고서 생성.
+    manifest = _read_json_safe(storage, MANIFEST_NAME)
+    escalation = _read_json_safe(storage, "escalation_status.json")
+    # 전체(모든 계정 통합) 리포트.
+    storage.write_text(
+        REPORT_NAME, _render_html(summary, items, catalog, records, manifest, escalation, run)
+    )
+    # 계정별 리포트(report-<account>.html) — 리포트 페이지가 특정 계정 선택 시 다운로드/열람.
+    acct_ids = sorted({r.account_id for r in records})
+    if len(acct_ids) > 1:
+        for aid in acct_ids:
+            arecs = [r for r in records if r.account_id == aid]
+            acat = [e for e in catalog if any(f":{aid}:" in m for m in e.members)]
+            aitems = [it for it in items if it.account_id == aid]
+            asum = next((b for b in summary.by_account if b.account_id == aid), summary)
+            amanifest = _manifest_for_account(manifest, aid)
+            aesc = _escalation_for_account(arecs, escalation)
+            storage.write_text(
+                f"report-{aid}.html",
+                _render_html(asum, aitems, acat, arecs, amanifest, aesc, run),
+            )
+    return summary
+
+
+def _manifest_for_account(manifest: dict, account_id: str) -> dict:
+    """manifest 를 한 계정 것만 남긴 얕은 사본(소스 신뢰도 섹션이 그 계정만 보이게)."""
+    if not isinstance(manifest, dict):
+        return {}
+    accts = [a for a in manifest.get("accounts", []) if a.get("account_id") == account_id]
+    return {**manifest, "accounts": accts}
+
+
+def _escalation_for_account(records: list[PrincipalRecord], escalation: dict) -> dict:
+    """계정별 escalation 요약 재계산(escalation_status.json 은 전체 집계라 계정별로 다시 센다)."""
+    scanned = len(records)
+    with_esc = sum(1 for r in records if r.escalation_paths)
+    total = sum(len(r.escalation_paths) for r in records)
+    base = dict(escalation) if isinstance(escalation, dict) else {}
+    base.update({"principals_scanned": scanned, "principals_with_escalation": with_esc,
+                 "total_escalation_paths": total})
+    return base
+
+
+MANIFEST_NAME = "collection_manifest.json"
+
+
+def _read_json_safe(storage: "Storage", relpath: str) -> dict:
+    if not storage.exists(relpath):
+        return {}
+    data = storage.read_json(relpath)
+    return data if isinstance(data, dict) else {}
+
+
+def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[CleanupItem]:
+    """principal 레코드에서 5유형 cleanup 항목 도출(결정론 id·정렬)."""
+    items: list[CleanupItem] = []
+
+    for rec in records:
+        # unused_role: role 인데 used_actions 가 전혀 없음(미사용 역할).
+        # 권한 보유는 inline(granted_actions) 또는 attached managed 정책 중 하나면 성립
+        # (managed-only 역할도 미사용 대상으로 잡는다).
+        if rec.identity_type == "role" and not rec.used_actions and (rec.granted_actions or rec.has_managed_policies):
+            items.append(_item("unused_role", rec, rec.risk_level,
+                               "90일간 미사용 역할", "역할 삭제 (미사용 — PS 카탈로그에 불필요)",
+                               evidence={
+                                   "식별 유형": "role",
+                                   "부여된 action 수": str(len(rec.granted_actions)),
+                                   "90일 사용 action": "0",
+                                   "관리형 정책 연결": "예" if rec.has_managed_policies else "아니오",
+                                   "수집 소스": ", ".join(rec.source) or "-",
+                               }))
+
+        # unused_permission: granted-vs-used 갭(unused_findings 중 action 형태).
+        action_gaps = [f for f in rec.unused_findings if ":" in f]
+        if action_gaps:
+            detail = f"granted 이나 미사용: {action_gaps[0]} 외 {max(0, len(action_gaps) - 1)}건"
+            items.append(_item("unused_permission", rec, rec.risk_level, detail,
+                               "실사용 기반 최소권한 Permission Set 로 마이그레이션",
+                               evidence={
+                                   "부여된 action 수": str(len(rec.granted_actions)),
+                                   "실사용 action 수": str(len(rec.used_actions)),
+                                   "미사용 action 수": str(len(action_gaps)),
+                                   "대표 미사용": ", ".join(action_gaps[:5]),
+                                   "수집 소스": ", ".join(rec.source) or "-",
+                               }))
+
+        # long_lived_key
+        if rec.access_key_age_days is not None and rec.access_key_age_days >= cfg.risk_rules.long_lived_key_days:
+            items.append(_item("long_lived_key", rec, rec.risk_level,
+                               f"액세스키 age {rec.access_key_age_days}일",
+                               "Identity Center(SSO) + Permission Set 임시 자격증명으로 전환 (장기 키 폐기)",
+                               evidence={
+                                   "액세스키 나이": f"{rec.access_key_age_days}일",
+                                   "임계 기준": f"{cfg.risk_rules.long_lived_key_days}일 이상",
+                                   "MFA": "설정" if rec.mfa else "미설정",
+                                   "콘솔 로그인": "가능" if rec.console_login else "불가",
+                               }))
+
+        # no_mfa (콘솔 로그인 가능한 user 한정 — 서비스 계정 오탐 방지)
+        if rec.identity_type == "user" and rec.console_login and not rec.mfa:
+            items.append(_item("no_mfa", rec, rec.risk_level,
+                               "MFA 미설정 콘솔 사용자", "Identity Center(SSO+MFA) + Permission Set 로 전환 (IAM User 폐기)",
+                               evidence={
+                                   "식별 유형": "user",
+                                   "콘솔 로그인": "가능",
+                                   "MFA": "미설정",
+                                   "액세스키 나이": f"{rec.access_key_age_days}일" if rec.access_key_age_days is not None else "해당 없음",
+                               }))
+
+        # escalation_path (건별)
+        for path in rec.escalation_paths:
+            items.append(_item("escalation_path", rec, rec.risk_level,
+                               f"{path.via} → {path.to} ({path.mitre})",
+                               "상승 유발 권한을 제거한 최소권한 Permission Set 로 마이그레이션",
+                               evidence={
+                                   "경유(via)": path.via,
+                                   "도달 대상(to)": path.to,
+                                   "MITRE ATT&CK": path.mitre,
+                                   "부여된 action 수": str(len(rec.granted_actions)),
+                               }))
+
+    # 결정론 id: (type, account, principal, detail) 정렬 후 c1.. 부여.
+    items.sort(key=lambda x: (x.type, x.account_id, x.principal, x.detail))
+    for i, item in enumerate(items, start=1):
+        item.id = f"c{i}"
+    return items
+
+
+def _item(ctype: CleanupType, rec: PrincipalRecord, risk, detail: str, rec_text: str,
+          evidence: dict[str, str] | None = None) -> CleanupItem:
+    return CleanupItem(
+        id="",  # 나중에 정렬 후 부여
+        type=ctype,
+        account_id=rec.account_id,
+        principal=rec.principal,
+        detail=detail,
+        risk_level=risk,
+        recommendation=rec_text,
+        # M4 점수·근거를 그대로 실어 "왜 이 레벨인지" 설명 가능하게(운영자 위험 인지).
+        risk_score=rec.risk_score,
+        risk_reasons=rec.risk_reasons,
+        evidence=evidence or {},
+    )
+
+
+_CSV_INJECT_RE = re.compile(r"^[=+\-@\t\r\n]")  # 개행(\n)도 포함(줄바꿈 시작 셀 방지)
+
+
+def _csv_safe(value: object) -> str:
+    """CSV formula injection 무력화. 셀 앞글자가 `= + - @ tab CR` 이면 `'` 프리픽스로
+    스프레드시트가 수식으로 해석하지 못하게 한다. 프론트 toCsv 의 csvSafe 와 동일 규칙."""
+    s = "" if value is None else str(value)
+    return "'" + s if _CSV_INJECT_RE.match(s) else s
+
+
+def _write_backlog(storage: "Storage", items: list[CleanupItem]) -> None:
+    import json
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")  # 결정론(플랫폼 무관 개행)
+    # risk_score/risk_reasons/evidence 추가 — reasons 는 '|' join, evidence 는 JSON(정렬키·결정론).
+    writer.writerow(["id", "type", "account_id", "principal", "risk_level", "detail",
+                     "recommendation", "risk_score", "risk_reasons", "evidence"])
+    for it in items:
+        # 사용자/자원 유래 텍스트 셀을 formula-injection 무력화(수치 컬럼 제외).
+        writer.writerow([_csv_safe(it.id), _csv_safe(it.type), _csv_safe(it.account_id),
+                         _csv_safe(it.principal), _csv_safe(it.risk_level), _csv_safe(it.detail),
+                         _csv_safe(it.recommendation), it.risk_score,
+                         _csv_safe("|".join(it.risk_reasons)),
+                         _csv_safe(json.dumps(it.evidence, sort_keys=True, ensure_ascii=False))])
+    storage.write_text(BACKLOG_NAME, buf.getvalue())
+
+
+def _exec_summary(
+    records: list[PrincipalRecord], catalog: list[CatalogEntry],
+    items: list[CleanupItem], run: "RunContext",
+) -> ExecSummary:
+    total = _exec_summary_for(records, catalog, items, run, account_id="")
+    # 계정별 분해(계정 2개 이상일 때만). 리포트 페이지가 특정 계정 선택 시 사용.
+    acct_ids = sorted({r.account_id for r in records})
+    if len(acct_ids) > 1:
+        by: list[ExecSummary] = []
+        for aid in acct_ids:
+            arecs = [r for r in records if r.account_id == aid]
+            acat = [e for e in catalog if any(f":{aid}:" in m for m in e.members)]
+            aitems = [it for it in items if it.account_id == aid]
+            by.append(_exec_summary_for(arecs, acat, aitems, run, account_id=aid))
+        total.by_account = by
+    return total
+
+
+def _exec_summary_for(
+    records: list[PrincipalRecord], catalog: list[CatalogEntry],
+    items: list[CleanupItem], run: "RunContext", account_id: str,
+) -> ExecSummary:
+    accounts = len({r.account_id for r in records})
+    unused_removed = sum(1 for it in items if it.type == "unused_permission")
+    return ExecSummary(
+        accounts=accounts,
+        principals=len(records),
+        personas=len(catalog),
+        unused_permissions_removed=unused_removed,
+        generated_at=run.started_at,  # 유일 허용 wall-clock(불변식 ②)
+        account_id=account_id,
+    )
+
+
+_TYPE_LABEL_HTML = {
+    "unused_permission": "미사용 권한",
+    "unused_role": "미사용 역할",
+    "long_lived_key": "장기 액세스키",
+    "no_mfa": "MFA 미설정",
+    "escalation_path": "권한 상승 경로",
+}
+_SOURCE_LABEL_HTML = {
+    "access_advisor": "Access Advisor",
+    "cloudtrail": "CloudTrail",
+    "analyzer_unused": "Access Analyzer",
+    "credential_report": "Credential Report",
+    "idc_permission_sets": "Identity Center",
+}
+_RISK_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+_RISK_COLOR = {"critical": "#d13212", "high": "#e07b00", "medium": "#b8a300", "low": "#1d8102"}
+
+
+def _render_html(
+    summary: ExecSummary, items: list[CleanupItem], catalog: list[CatalogEntry],
+    records: list[PrincipalRecord], manifest: dict, escalation: dict, run: "RunContext",
+) -> str:
+    """사람이 읽는 종합 보고서(결정론 정적 HTML, 외부 자원·스크립트 없음)."""
+    esc = html.escape
+
+    # 위험 등급 분포(활성 principal 기준).
+    dist = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for r in records:
+        dist[r.risk_level] = dist.get(r.risk_level, 0) + 1
+
+    # 유형별 건수.
+    by_type: dict[str, int] = {}
+    for it in items:
+        by_type[it.type] = by_type.get(it.type, 0) + 1
+
+    # 데이터 소스 신뢰도(manifest). status 를 사람이 읽는 라벨로 구분한다:
+    #  - ok       : 정상 수집(초록)
+    #  - degraded : 수집은 됐으나 부분/저품질 — 실제 주의 필요(주황)
+    #  - skipped  : 선택적 소스가 없어 대체됨 — 정상, 조치 불필요(회색·'선택적')
+    _STATUS_LABEL = {
+        "ok": ("정상", "#1d8102"),
+        "degraded": ("부분 수집", "#e07b00"),
+        "skipped": ("선택적 소스 없음 (정상)", "#879596"),
+    }
+    src_rows = ""
+    accounts_m = manifest.get("accounts", []) if isinstance(manifest, dict) else []
+    seen_src: dict[str, dict] = {}
+    any_degraded = False
+    for acct in accounts_m:
+        for s in acct.get("sources", []):
+            seen_src.setdefault(s.get("source", ""), s)  # 소스별 대표 1건(단일계정 기준 충분)
+            if s.get("status") == "degraded":
+                any_degraded = True
+    for src, s in sorted(seen_src.items()):
+        status = s.get("status", "")
+        label, color = _STATUS_LABEL.get(status, (status, "#879596"))
+        note = s.get("note", "")
+        src_rows += (
+            f"<tr><td>{esc(_SOURCE_LABEL_HTML.get(src, src))}</td>"
+            f"<td style='color:{color};font-weight:600'>{esc(label)}</td>"
+            f"<td>{esc(note) or '—'}</td></tr>"
+        )
+    # 경고 배너는 **실제 부분 수집(degraded)**이 있을 때만. skipped(선택적 소스 없음)는 정상이라 경고 안 함.
+    degraded_note = ""
+    if any_degraded:
+        degraded_note = (
+            "<div class='banner warn'>⚠ 일부 소스가 <b>부분 수집(degraded)</b> 상태입니다 — 사용 실태가 "
+            "과소 집계됐을 수 있습니다. 아래 '데이터 소스 신뢰도'를 확인하세요.</div>"
+        )
+    else:
+        degraded_note = (
+            "<div class='banner ok'>✓ 핵심 소스는 정상 수집됐습니다. "
+            "'선택적 소스 없음'은 정상이며(대체 소스로 커버), 조치가 필요하지 않습니다.</div>"
+        )
+
+    # 위험도별 Top — **principal 단위 집계**(경로 건별 중복 나열 방지). 한 principal 의 여러 항목을
+    # 묶어 최고 위험도·최고 점수·항목 유형 요약·대표 권장조치로. critical·high 만, 점수순 최대 20명.
+    by_principal: dict[str, list[CleanupItem]] = {}
+    for it in items:
+        by_principal.setdefault(it.principal, []).append(it)
+    principal_rows_data = []
+    for principal, its in by_principal.items():
+        worst = min(its, key=lambda x: (_RISK_ORDER.get(x.risk_level, 9), -x.risk_score))
+        if worst.risk_level not in ("critical", "high"):
+            continue
+        type_counts: dict[str, int] = {}
+        for x in its:
+            type_counts[x.type] = type_counts.get(x.type, 0) + 1
+        issues = ", ".join(
+            f"{_TYPE_LABEL_HTML.get(t, t)} {n}건" for t, n in sorted(type_counts.items(), key=lambda kv: -kv[1])
+        )
+        principal_rows_data.append((worst.risk_level, worst.risk_score, principal, issues, worst.recommendation))
+    principal_rows_data.sort(key=lambda r: (_RISK_ORDER.get(r[0], 9), -r[1]))
+    top_rows = "".join(
+        f"<tr><td><span style='color:{_RISK_COLOR.get(lv)};font-weight:600'>{esc(lv)}</span></td>"
+        f"<td>{sc}</td><td class='mono'>{esc(pr)}</td><td>{esc(iss)}</td>"
+        f"<td>{esc(rec)}</td></tr>"
+        for lv, sc, pr, iss, rec in principal_rows_data[:20]
+    ) or "<tr><td colspan='5'>critical/high 항목 없음</td></tr>"
+    top_principal_count = len(principal_rows_data)
+
+    # 유형별 건수 행.
+    type_rows = "".join(
+        f"<tr><td>{esc(_TYPE_LABEL_HTML.get(t, t))}</td><td>{n}</td></tr>"
+        for t, n in sorted(by_type.items(), key=lambda kv: -kv[1])
+    )
+
+    # persona 카탈로그(멤버·action·기여 소스·승인).
+    persona_rows = "".join(
+        f"<tr><td>{esc(e.persona)}</td><td>{e.member_count}</td><td>{len(e.actions)}</td>"
+        f"<td>{esc(', '.join(_SOURCE_LABEL_HTML.get(s, s) for s in (e.contributing_sources or [])) or '—')}</td>"
+        f"<td>{esc(e.approval_status)}</td></tr>"
+        for e in catalog
+    )
+
+    # 위험 등급 분포 막대(인라인).
+    total_p = summary.principals or 1
+    dist_bars = "".join(
+        f"<div class='distrow'><span class='distlabel' style='color:{_RISK_COLOR[k]}'>{k}</span>"
+        f"<span class='distbar' style='width:{max(1, round(300 * dist[k] / total_p))}px;background:{_RISK_COLOR[k]}'></span>"
+        f"<span class='distn'>{dist[k]}</span></div>"
+        for k in ("critical", "high", "medium", "low")
+    )
+
+    e = escalation if isinstance(escalation, dict) else {}
+    esc_scanned = e.get("principals_scanned", 0)
+    esc_with = e.get("principals_with_escalation", 0)
+    esc_total = e.get("total_escalation_paths", 0)
+    esc_pct = round(100 * esc_with / esc_scanned) if isinstance(esc_scanned, int) and esc_scanned else 0
+
+    return f"""<!DOCTYPE html>
+<html lang="ko"><head><meta charset="utf-8">
+<title>LP2PS 분석 리포트 — {esc(run.run_id)}</title>
+<style>
+  body {{ font-family: -apple-system, "Segoe UI", Roboto, "Noto Sans KR", sans-serif; color:#16191f;
+         max-width: 1080px; margin: 0 auto; padding: 32px 24px; line-height: 1.5; }}
+  h1 {{ font-size: 26px; margin: 0 0 4px; }}
+  h2 {{ font-size: 19px; margin: 34px 0 12px; padding-bottom: 6px; border-bottom: 2px solid #e9ebed; }}
+  .meta {{ color:#5f6b7a; font-size: 13px; margin-bottom: 20px; }}
+  .kpis {{ display:flex; gap:16px; flex-wrap:wrap; }}
+  .kpi {{ flex:1; min-width:150px; border:1px solid #e9ebed; border-radius:8px; padding:14px 16px; }}
+  .kpi .n {{ font-size:30px; font-weight:700; }}
+  .kpi .l {{ color:#5f6b7a; font-size:13px; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 13px; margin-top:8px; }}
+  th, td {{ border:1px solid #e9ebed; padding:7px 10px; text-align:left; vertical-align:top; }}
+  th {{ background:#f2f3f3; font-weight:600; }}
+  .mono {{ font-family: ui-monospace, Menlo, monospace; font-size:12px; word-break:break-all; }}
+  .banner {{ padding:12px 16px; border-radius:8px; margin:16px 0; font-size:14px; }}
+  .banner.warn {{ background:#fef6f0; border:1px solid #e07b00; color:#8a4b00; }}
+  .banner.ok {{ background:#f0faf2; border:1px solid #1d8102; color:#0f5c01; }}
+  .distrow {{ display:flex; align-items:center; gap:10px; margin:4px 0; }}
+  .distlabel {{ width:70px; font-weight:600; font-size:13px; }}
+  .distbar {{ height:16px; border-radius:3px; }}
+  .distn {{ font-size:13px; color:#5f6b7a; }}
+  footer {{ margin-top:40px; color:#879596; font-size:12px; border-top:1px solid #e9ebed; padding-top:12px; }}
+</style></head>
+<body>
+<h1>LP2PS 최소권한 분석 리포트</h1>
+<div class="meta">실행 ID {esc(run.run_id)} · 생성 {esc(summary.generated_at)} · 고객 {esc(run.customer)}</div>
+
+{degraded_note}
+
+<h2>1. 요약 (Executive Summary)</h2>
+<div class="kpis">
+  <div class="kpi"><div class="n">{summary.accounts}</div><div class="l">분석 계정</div></div>
+  <div class="kpi"><div class="n">{summary.principals:,}</div><div class="l">Principal</div></div>
+  <div class="kpi"><div class="n">{summary.personas}</div><div class="l">Persona</div></div>
+  <div class="kpi"><div class="n">{summary.unused_permissions_removed:,}</div><div class="l">미사용 권한 정리 대상</div></div>
+  <div class="kpi"><div class="n">{esc_with}</div><div class="l">상승 경로 보유 principal</div></div>
+</div>
+
+<h2>2. 위험 등급 분포</h2>
+{dist_bars}
+
+<h2>3. 권한 상승 경로 요약</h2>
+<p style="color:#5f6b7a;font-size:13px;margin:0 0 10px">
+낮은 권한으로 시작해 <b>스스로 더 큰 권한(관리자급)을 부여</b>할 수 있는 principal 을 규칙 기반으로 탐지합니다.
+이런 principal 이 탈취되면 계정 전체가 위험합니다.</p>
+<div class="kpis">
+  <div class="kpi"><div class="n">{esc_with} <span style="font-size:16px;color:#5f6b7a">/ {esc_scanned}</span></div><div class="l">상승 경로 보유 principal ({esc_pct}%)</div></div>
+  <div class="kpi"><div class="n">{esc_total}</div><div class="l">탐지된 상승 경로 (한 principal 이 여러 개 보유 가능)</div></div>
+</div>
+
+<h2>4. 위험 Top principal (critical · high) — {top_principal_count}명</h2>
+<p style="color:#5f6b7a;font-size:13px;margin:0 0 10px">principal 단위로 묶어 표시합니다(같은 주체의 여러 경로·항목은 한 행으로 합산).</p>
+<table><tr><th>위험도</th><th>점수</th><th>Principal</th><th>발견 항목</th><th>권장 조치</th></tr>{top_rows}</table>
+
+<h2>5. 조치 필요 항목 (유형별)</h2>
+<table><tr><th>유형</th><th>건수</th></tr>{type_rows}</table>
+
+<h2>6. Persona 카탈로그</h2>
+<table><tr><th>Persona</th><th>멤버 수</th><th>Action 수</th><th>기여 소스</th><th>승인 상태</th></tr>{persona_rows}</table>
+
+<h2>7. 데이터 소스 신뢰도</h2>
+<p style="color:#5f6b7a;font-size:13px;margin:0 0 10px">
+<b>정상</b>=완전 수집 · <b>부분 수집</b>=일부만(주의) · <b>선택적 소스 없음</b>=해당 소스가 없어 대체
+소스로 커버(정상, 조치 불필요). LP2PS 는 무료 소스만 사용합니다(CloudTrail Lake·유료 분석기 미사용).</p>
+<table><tr><th>소스</th><th>상태</th><th>비고</th></tr>{src_rows or "<tr><td colspan=3>—</td></tr>"}</table>
+
+<footer>LP2PS — IAM 최소권한 분석. 이 리포트는 읽기 전용 수집 데이터 기반으로 결정론적으로 생성됩니다.
+실제 권한 변경(Permission Set 적용·역할 삭제 등)은 사람이 검토 후 수행합니다.</footer>
+</body></html>
+"""
+
+
+def _load_catalog(storage: "Storage") -> list[CatalogEntry]:
+    if not storage.exists("catalog.json"):
+        return []
+    raw = storage.read_json("catalog.json")
+    return [CatalogEntry.model_validate(e) for e in raw]  # type: ignore[union-attr]

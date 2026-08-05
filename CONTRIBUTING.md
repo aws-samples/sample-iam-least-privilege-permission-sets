@@ -1,59 +1,72 @@
-# Contributing Guidelines
+# Contributing to LP2PS
 
-Thank you for your interest in contributing to our project. Whether it's a bug report, new feature, correction, or additional
-documentation, we greatly value feedback and contributions from our community.
+Thank you for contributing. Because this project is a security tool that produces IAM policies, a few
+invariants must always be upheld.
 
-Please read through this document before submitting any issues or pull requests to ensure we have all the necessary
-information to effectively respond to your bug report or contribution.
+## Invariants you must uphold
 
+1. **Read-only.** Code that runs against analyzed accounts calls only allowlisted describe/list APIs.
+   Adding a write API makes `test_awsguard` fail.
+2. **Deterministic core.** Analysis and synthesis logic produces the same output for the same input. Do not
+   use `datetime.now()` or `random` in the core.
+3. **AI is purely additive.** AI results are isolated under the `ai_suggested` namespace, and the
+   deterministic core never imports `lp2ps.ai`.
+4. **Customer-agnostic.** Account IDs, ARNs, persona names, and thresholds live only in
+   `config/<customer>.yaml`. Do not hardcode them in code or tests.
 
-## Reporting Bugs/Feature Requests
+## Development workflow
 
-We welcome you to use the GitHub issue tracker to report bugs or suggest features.
+**Install the engine before the backend.** The backend reuses the engine's contract
+(`models.py`) and storage layer, so it needs the `lp2ps` package importable. That dependency is
+deliberately not declared in `backend/pyproject.toml`: `lp2ps` is a local sibling package with no
+public PyPI release, and declaring it by name would let pip resolve the name against the public
+index instead. Install engine first — into the same virtualenv, or with the backend venv able to
+see it.
 
-When filing an issue, please check existing open, or recently closed, issues to make sure somebody else hasn't already
-reported the issue. Please try to include as much information as you can. Details like these are incredibly useful:
+```bash
+# Engine (install this first)
+cd engine && pip install -e '.[dev]'
+pytest                     # all tests (especially test_awsguard, test_determinism)
+bandit -r lp2ps            # SAST
+pip-audit                  # dependency vulnerabilities
 
-* A reproducible test case or series of steps
-* The version of our code being used
-* Any modifications you've made relevant to the bug
-* Anything unusual about your environment or deployment
+# Backend API (requires the engine above; otherwise ModuleNotFoundError: lp2ps)
+cd backend && pip install -e '.[dev]'
+pytest
 
+# Frontend
+cd frontend && npm install
+npm run typecheck && npm run build
 
-## Contributing via Pull Requests
-Contributions via pull requests are much appreciated. Before sending us a pull request, please ensure that:
+# Infra (CDK)
+cd infra && npm install
+npm test                   # assertion tests
+npx cdk synth --all -c config=../config/example.yaml
+```
 
-1. You are working against the latest source on the *main* branch.
-2. You check existing open, and recently merged, pull requests to make sure someone else hasn't addressed the problem already.
-3. You open an issue to discuss any significant work - we would hate for your time to be wasted.
+## Security scanners (pre-commit)
 
-To send us a pull request, please:
+`.pre-commit-config.yaml` defines shift-left gates such as detect-secrets, bandit, and private-key checks.
 
-1. Fork the repository.
-2. Modify the source; please focus on the specific change you are contributing. If you also reformat all the code, it will be hard for us to focus on your change.
-3. Ensure local tests pass.
-4. Commit to your fork using clear commit messages.
-5. Send us a pull request, answering any default questions in the pull request interface.
-6. Pay attention to any automated CI failures reported in the pull request, and stay involved in the conversation.
+```bash
+pip install pre-commit
+pre-commit run --all-files      # full scan (recommended before committing)
+pre-commit run                  # staged files only
+```
 
-GitHub provides additional document on [forking a repository](https://help.github.com/articles/fork-a-repo/) and
-[creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
+> **Note on automatic git hook installation:** In managed environments, `core.hooksPath` may be set to a
+> security tool (e.g., a corporate security hook), which can cause `pre-commit install` to be rejected. In
+> that case run `pre-commit run` **manually / in CI** as shown above — do not disable the system hook. CI
+> (`.github/workflows/ci.yml`) enforces the same scanners, so regressions are blocked in the PR.
 
+## PR checklist
 
-## Finding contributions to work on
-Looking at the existing issues is a great way to find something to contribute on. As our projects, by default, use the default GitHub issue labels (enhancement/bug/duplicate/help wanted/invalid/question/wontfix), looking at any 'help wanted' issues is a great place to start.
+- [ ] `pytest` passes (including read-only and determinism tests)
+- [ ] No hardcoded secrets or credentials (detect-secrets)
+- [ ] New dependencies are not copyleft-licensed (GPL/LGPL/AGPL/SSPL)
+- [ ] For UI changes, verified actual render (passing transpile alone is not sufficient)
+- [ ] `frontend/src/api/types.ts` and `engine/lp2ps/models.py` contracts stay in sync
 
+## Commits
 
-## Code of Conduct
-This project has adopted the [Amazon Open Source Code of Conduct](https://aws.github.io/code-of-conduct).
-For more information see the [Code of Conduct FAQ](https://aws.github.io/code-of-conduct-faq) or contact
-opensource-codeofconduct@amazon.com with any additional questions or comments.
-
-
-## Security issue notifications
-If you discover a potential security issue in this project we ask that you notify AWS/Amazon Security via our [vulnerability reporting page](http://aws.amazon.com/security/vulnerability-reporting/). Please do **not** create a public github issue.
-
-
-## Licensing
-
-See the [LICENSE](LICENSE) file for our project's licensing. We will ask you to confirm the licensing of your contribution.
+Use clear commit messages and split work into single logical changes.

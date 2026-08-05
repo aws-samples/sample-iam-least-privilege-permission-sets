@@ -1,0 +1,40 @@
+# LP2PS customer config template. Onboard a new customer = copy this file + replace values (no code changes).
+customer: example
+region: us-west-2
+
+# How credentials are obtained. false: the deploying account itself (ambient). true: assume the member
+# accounts listed below (multi-account).
+cross_account: true
+
+# Member accounts to analyze (cross_account=true). When cross_account=false, only ["self"] is allowed.
+accounts:
+  - "111122223333"
+  - "444455556666"
+
+# Read-only role for cross-account collection (deployed into member accounts via StackSet). Required when
+# cross_account=true.
+readonly_role_name: lp2ps-readonly
+
+# Engine runtime.
+engine:
+  runtime: lambda
+
+# Schedule (EventBridge). Leave empty for manual runs only.
+schedule:
+  cron: "cron(0 2 ? * MON *)"
+
+# AI harness. When false, the tool works fully in deterministic-only mode.
+ai:
+  enabled: false
+  model: anthropic.claude-sonnet-4
+
+# Permission Set definition creation (relaxation of the read-only invariant — off by default).
+# Even when enabled, a PS "definition" is created in the tooling account's IdC only after a second UI
+# confirmation. Account assignment is never performed.
+provisioning:
+  idc_region: ""  # IdC region (empty = use config.region). The PS-creation gate is enforced at runtime.
+
+# Risk-scoring rule thresholds (tunable per customer; never hardcode in code).
+risk_rules:
+  long_lived_key_days: 90
+  unused_action_days: 90

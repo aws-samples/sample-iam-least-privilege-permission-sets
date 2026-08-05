@@ -1,0 +1,55 @@
+# Multi-account (cross-account) config — the tooling account analyzes itself + member account(s).
+# session.py: the tooling account (caller) uses ambient credentials (no assume); member accounts are
+# reached by assuming readonly_role_name.
+customer: self
+region: us-west-2
+
+# true: collect each account in `accounts` (tooling via ambient, members via assume).
+cross_account: true
+accounts:
+  - "111122223333"  # tooling account — also analyzed as itself (ambient)
+  - "444455556666"  # member account — cross-account assume
+
+# Name of the read-only role deployed in member accounts.
+readonly_role_name: lp2ps-readonly
+
+engine:
+  runtime: lambda
+
+schedule:
+  cron: null
+
+ai:
+  enabled: false
+  model: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+# PS definition creation is gated by an approved persona + a second/final UI confirmation (no opt-in config
+# needed). The IdC instance ARN is resolved at runtime; only idc_region is specified (one region per account).
+provisioning:
+  # The IdC may live in a different region than config.region. Region used for IdC read/write.
+  idc_region: us-east-1
+
+risk_rules:
+  long_lived_key_days: 90
+  unused_action_days: 90
+  # Risk weights (summed, then clamped to 0-100). Rationale is recorded in risk_audit.jsonl.
+  weight_long_lived_key: 20
+  weight_no_mfa: 15
+  weight_unused_permission: 1
+  weight_unused_permission_cap: 25
+  weight_escalation_path: 30
+  weight_escalation_cap: 40
+  weight_wildcard_action: 20
+  weight_admin_like: 25
+  level_critical: 75
+  level_high: 50
+  level_medium: 25
+
+catalog:
+  min_members_for_persona: 2
+  confidence_access_analyzer: 0.9
+  confidence_fallback: 0.5
+
+permission_sets:
+  session_duration: PT8H
+  session_duration_overrides: {}

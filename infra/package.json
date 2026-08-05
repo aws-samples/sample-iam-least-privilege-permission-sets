@@ -1,0 +1,29 @@
+{
+  "name": "lp2ps-infra",
+  "version": "0.1.0",
+  "description": "LP2PS multi-customer CDK infrastructure (TypeScript)",
+  "license": "MIT-0",
+  "bin": {
+    "lp2ps": "bin/lp2ps.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy",
+    "destroy": "cdk destroy",
+    "test": "ts-node test/data-stack.test.ts && ts-node test/web-stack.test.ts && ts-node test/api-stack.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "aws-cdk": "^2.160.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.160.0",
+    "cdk-nag": "^2.28.0",
+    "constructs": "^10.3.0",
+    "js-yaml": "^4.1.0",
+    "@types/js-yaml": "^4.0.9"
+  }
+}

@@ -1,0 +1,49 @@
+# Cross-account (multi-account) example config.
+# Analyzes member account(s) by assuming their read-only role from the tooling account.
+customer: self
+region: us-west-2
+
+# Cross-account mode: collect member accounts by assuming their role.
+cross_account: true
+accounts:
+  - "444455556666"
+
+# Name of the read-only role deployed in member accounts (ReadOnlyRoleName in cfn/lp2ps-readonly-role.yaml).
+readonly_role_name: lp2ps-readonly
+
+engine:
+  runtime: lambda
+
+schedule:
+  cron: null
+
+ai:
+  enabled: false
+  model: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+provisioning:
+  idc_region: ""  # IdC region (empty = use config.region). The PS-creation gate is enforced at runtime.
+
+risk_rules:
+  long_lived_key_days: 90
+  unused_action_days: 90
+  weight_long_lived_key: 20
+  weight_no_mfa: 15
+  weight_unused_permission: 1
+  weight_unused_permission_cap: 25
+  weight_escalation_path: 30
+  weight_escalation_cap: 40
+  weight_wildcard_action: 20
+  weight_admin_like: 25
+  level_critical: 75
+  level_high: 50
+  level_medium: 25
+
+catalog:
+  min_members_for_persona: 2
+  confidence_access_analyzer: 0.9
+  confidence_fallback: 0.5
+
+permission_sets:
+  session_duration: PT8H
+  session_duration_overrides: {}

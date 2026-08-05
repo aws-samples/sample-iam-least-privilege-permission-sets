@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 보안 취약점 신고 (Security)
+    url: https://github.com/aws-samples/lp2ps/security/policy
+    about: 보안 취약점은 공개 이슈가 아니라 SECURITY.md 절차로 비공개 신고해 주세요.

@@ -1,0 +1,134 @@
+name: CI
+
+# Public CI — runs end-to-end on GitHub-hosted runners with no internal dependencies.
+# Runs test / lint / audit / secret-scan as parallel jobs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  engine:
+    name: Engine (tests + SAST + audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install engine
+        working-directory: engine
+        run: pip install -e '.[dev]'
+      - name: Tests (read-only enforcement, determinism, contracts)
+        working-directory: engine
+        run: pytest -q
+      - name: Bandit (Python SAST)
+        working-directory: engine
+        run: bandit -c pyproject.toml -r lp2ps
+      - name: pip-audit (dependency vulnerabilities)
+        working-directory: engine
+        run: pip-audit || true  # ignore the skip warning for the local package (lp2ps)
+
+  backend:
+    name: Backend API (tests + SAST)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install engine (backend reuses the lp2ps contract)
+        working-directory: engine
+        run: pip install -e .
+      - name: Install backend
+        working-directory: backend
+        run: pip install -e '.[dev]'
+      - name: Tests (auth · input validation · write boundaries)
+        working-directory: backend
+        run: pytest -q
+      - name: Bandit (Python SAST)
+        working-directory: backend
+        run: bandit -r lp2ps_api
+
+  frontend:
+    name: Frontend (typecheck + build + license)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+      - name: Typecheck
+        working-directory: frontend
+        run: npm run typecheck
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+      - name: License check (block copyleft)
+        working-directory: frontend
+        run: npx --yes license-checker --production --summary --failOn "GPL;LGPL;AGPL;SSPL"
+      - name: Auth fail-closed regression (unconfigured Cognito must render ConfigError)
+        working-directory: frontend
+        # A non-mock build with no Cognito env must still build and ship the ConfigError screen
+        # (fail-closed auth gate). If the ConfigError component/string is removed, this fails.
+        env:
+          VITE_USE_MOCKS: "false"
+        run: |
+          rm -rf dist
+          npm run build
+          grep -rq "Configuration Error" dist \
+            || { echo "ConfigError screen not found in build output — auth gate may not be fail-closed"; exit 1; }
+
+  infra:
+    name: Infra (CDK synth + assertions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install
+        working-directory: infra
+        run: npm ci
+      - name: Assertion tests (lifecycle, etc.)
+        working-directory: infra
+        run: npm test
+      - name: CDK synth + cdk-nag (config and security rules)
+        working-directory: infra
+        run: npx cdk synth --all -c config=../config/example.yaml
+      - name: License check (block copyleft)
+        working-directory: infra
+        run: npx --yes license-checker --production --summary --failOn "GPL;LGPL;AGPL;SSPL"
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install detect-secrets
+      - name: detect-secrets (block new secrets vs baseline)
+        run: detect-secrets scan --baseline .secrets.baseline
+
+  hygiene:
+    name: Repo hygiene (no internal-tooling refs in public docs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CONTRIBUTING.md must not reference gitignored internal tooling
+        # .claude/ and CLAUDE.md are excluded from the public repo; public docs must not link to them.
+        run: |
+          if grep -Eq '\.claude/|CLAUDE\.md' CONTRIBUTING.md; then
+            echo "CONTRIBUTING.md references internal tooling (.claude/ or CLAUDE.md) that is not in the public repo"
+            grep -nE '\.claude/|CLAUDE\.md' CONTRIBUTING.md
+            exit 1
+          fi

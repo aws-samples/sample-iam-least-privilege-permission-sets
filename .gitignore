@@ -1,0 +1,47 @@
+# deps / build
+node_modules/
+dist/
+*.tsbuildinfo
+
+# env & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+cdk.context.json
+
+# Debug/experiment artifacts (console screenshots, etc. — not for public repo)
+debug/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Outputs
+out/
+
+# os
+.DS_Store
+
+# CDK build artifacts
+infra/assets/
+infra/cdk.out/
+infra/node_modules/
+infra/dist/
+backend/.venv/
+
+# Build output
+/build
+
+# Security scanner artifacts
+.security-scan/
+
+# Internal dev docs/skills (excluded from public repo)
+.claude/
+CLAUDE.md
+
+# Build config directory (on macOS it collides case-insensitively with config/)
+/Config

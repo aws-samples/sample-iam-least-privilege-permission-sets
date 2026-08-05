@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LP2PS 다크 팔레트 비교 — Cloudscape vs Slate vs Sage</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Helvetica Neue", "Noto Sans KR", sans-serif;
+    background: #050607; color: #d0d3d8; padding: 32px 24px 80px;
+  }
+  .page-head { max-width: 1200px; margin: 0 auto 28px; }
+  .page-head h1 { font-size: 20px; font-weight: 650; color: #f2f3f5; letter-spacing: -0.01em; }
+  .page-head p { font-size: 13px; color: #868b93; margin-top: 8px; line-height: 1.6; max-width: 760px; }
+  .page-head code { background: #1a1c1f; padding: 1px 6px; border-radius: 4px; font-size: 12px; color: #b8bcc2; }
+
+  .grid { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
+
+  /* ---- theme card frame ---- */
+  .theme {
+    border-radius: 14px; overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.06);
+    background: var(--bg);
+    display: flex; flex-direction: column;
+  }
+  .theme-label {
+    padding: 12px 16px; font-size: 12px; font-weight: 650; letter-spacing: 0.02em;
+    text-transform: uppercase; color: var(--muted);
+    border-bottom: 1px solid var(--border);
+    background: var(--surface2);
+  }
+  .theme-body { padding: 16px; display: flex; flex-direction: column; gap: 14px; background: var(--bg); }
+
+  /* ---- KPI cards ---- */
+  .kpi-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .kpi {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 13px;
+  }
+  .kpi .k-label { font-size: 10.5px; color: var(--muted); letter-spacing: 0.02em; }
+  .kpi .k-value { font-size: 22px; font-weight: 680; color: var(--text); margin-top: 5px; line-height: 1; }
+  .kpi .k-delta { font-size: 10.5px; margin-top: 6px; display: inline-flex; align-items: center; gap: 3px; }
+  .k-delta.down { color: var(--good); }
+  .k-delta.up { color: var(--critical); }
+
+  /* ---- section title ---- */
+  .sec { font-size: 11px; color: var(--secondary); font-weight: 600; margin-bottom: 2px; letter-spacing: 0.02em; }
+
+  /* ---- panel ---- */
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 13px; }
+
+  /* ---- risk stacked bar ---- */
+  .riskbar { display: flex; height: 12px; border-radius: 6px; overflow: hidden; margin-top: 4px; }
+  .riskbar > span { display: block; height: 100%; }
+  .risk-legend { display: flex; flex-wrap: wrap; gap: 10px 14px; margin-top: 10px; }
+  .risk-legend .item { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--secondary); }
+  .dot { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+
+  /* ---- line chart (svg trend) ---- */
+  .chart { margin-top: 6px; }
+  .chart-legend { display: flex; gap: 14px; margin-top: 8px; flex-wrap: wrap; }
+  .chart-legend .item { display: flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--secondary); }
+  .chart-legend .line { width: 14px; height: 2.5px; border-radius: 2px; }
+
+  /* ---- persona table ---- */
+  table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 10.5px; letter-spacing: 0.02em; }
+  td { padding: 8px; border-bottom: 1px solid var(--border-faint); color: var(--text); }
+  tr:last-child td { border-bottom: none; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 4px; font-size: 10px; font-weight: 600;
+    padding: 2px 8px; border-radius: 20px; letter-spacing: 0.01em;
+  }
+  .badge.ai { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent); }
+  .badge.approved { background: color-mix(in srgb, var(--good) 15%, transparent); color: var(--good); }
+  .badge.review { background: color-mix(in srgb, var(--warning) 15%, transparent); color: var(--warning); }
+  .btn {
+    background: var(--accent); color: #fff; border: none; font-size: 11px; font-weight: 600;
+    padding: 7px 14px; border-radius: 8px; cursor: pointer; letter-spacing: 0.01em;
+  }
+  .btn.secondary { background: transparent; color: var(--text); border: 1px solid var(--border-strong); }
+  .btn-row { display: flex; gap: 8px; }
+
+  .swatches { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  .sw { width: 34px; height: 34px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.08); position: relative; }
+  .footnote { font-size: 10px; color: var(--muted); margin-top: 2px; line-height: 1.5; }
+
+  /* =========================================================
+     THEME A — Cloudscape 기본 다크 (근사값: AWS 다크모드 네이비-그레이)
+     ========================================================= */
+  .cloudscape {
+    --bg: #0f1b2a; --surface: #192534; --surface2: #16212e;
+    --border: #354150; --border-faint: #26313e; --border-strong: #48566a;
+    --text: #e9ebed; --secondary: #b6bec9; --muted: #8d99a8;
+    --accent: #539fe5; --good: #29ad32; --warning: #e0ca57; --critical: #eb6f6f;
+  }
+  /* =========================================================
+     THEME B — Radix Slate Dark (청회색, 테크)
+     ========================================================= */
+  .slate {
+    --bg: #111113; --surface: #18191b; --surface2: #141517;
+    --border: #272a2d; --border-faint: #202225; --border-strong: #363a3f;
+    --text: #edeef0; --secondary: #b0b4ba; --muted: #696e77;
+    --accent: #3987e5; --good: #0ca30c; --warning: #fab219; --critical: #d03b3b;
+  }
+  /* =========================================================
+     THEME C — Radix Sage Dark (녹회색, 차분)
+     ========================================================= */
+  .sage {
+    --bg: #101211; --surface: #171918; --surface2: #131514;
+    --border: #272a25; --border-faint: #1f211f; --border-strong: #373b35;
+    --text: #eceeec; --secondary: #b0b4b0; --muted: #6a6e69;
+    --accent: #3987e5; --good: #0ca30c; --warning: #fab219; --critical: #d03b3b;
+  }
+</style>
+</head>
+<body>
+  <div class="page-head">
+    <h1>LP2PS 다크 팔레트 비교</h1>
+    <p>
+      동일한 미니 대시보드를 <b>Cloudscape 기본 다크 / Slate(청회색) / Sage(녹회색)</b> 세 가지 중립 톤으로 렌더한
+      것입니다. 차트·상태색은 세 곳 모두 검증된 <b>CVD-safe 팔레트</b>(dataviz)를 씁니다 — 중립 톤만 비교하시면 됩니다.
+      <br>※ Cloudscape 값은 실제 런타임 토큰의 <b>근사값</b>이며, 실제 앱에선 Cloudscape가 자동 적용합니다. Slate/Sage는 Radix Colors 실제 hex입니다.
+    </p>
+  </div>
+
+  <div class="grid" id="grid"></div>
+
+<script>
+  const THEMES = [
+    { cls: "cloudscape", label: "A · Cloudscape 기본 다크 (권장)" },
+    { cls: "slate",      label: "B · Slate — 청회색 / 테크" },
+    { cls: "sage",       label: "C · Sage — 녹회색 / 차분" },
+  ];
+
+  // CVD-safe chart palette (dataviz, dark) — 세 테마 공통
+  const CHART = { blue:"#3987e5", aqua:"#199e70", yellow:"#c98500", green:"#008300", violet:"#9085e9", red:"#e66767" };
+  const RISK  = { critical:"#d03b3b", high:"#ec835a", medium:"#fab219", low:"#0ca30c" };
+
+  function trendSvg(color) {
+    // Run1→Run5 미사용 권한 추이 (감소)
+    const pts = [[0,40],[55,52],[110,34],[165,26],[220,14]];
+    const path = pts.map((p,i)=>(i?"L":"M")+p[0]+" "+p[1]).join(" ");
+    const area = path + " L220 72 L0 72 Z";
+    return `<svg class="chart" width="100%" viewBox="0 0 220 76" preserveAspectRatio="none" height="76">
+      <defs><linearGradient id="g-${color.slice(1)}" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="${color}" stop-opacity="0.28"/>
+        <stop offset="1" stop-color="${color}" stop-opacity="0"/>
+      </linearGradient></defs>
+      <path d="${area}" fill="url(#g-${color.slice(1)})"/>
+      <path d="${path}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      ${pts.map(p=>`<circle cx="${p[0]}" cy="${p[1]}" r="2.6" fill="${color}"/>`).join("")}
+    </svg>`;
+  }
+
+  function card(t) {
+    return `
+    <div class="theme ${t.cls}">
+      <div class="theme-label">${t.label}</div>
+      <div class="theme-body">
+
+        <div class="kpi-row">
+          <div class="kpi"><div class="k-label">미사용 권한</div><div class="k-value">1,284</div><div class="k-delta down">▼ 320 (Run1→5)</div></div>
+          <div class="kpi"><div class="k-label">미사용 역할</div><div class="k-value">47</div><div class="k-delta down">▼ 12</div></div>
+          <div class="kpi"><div class="k-label">장기 액세스키</div><div class="k-value">18</div><div class="k-delta up">▲ 2</div></div>
+          <div class="kpi"><div class="k-label">MFA 미설정</div><div class="k-value">9</div><div class="k-delta down">▼ 5</div></div>
+        </div>
+
+        <div class="panel">
+          <div class="sec">위험 등급 분포 (principal 1,284)</div>
+          <div class="riskbar">
+            <span style="width:8%;background:${RISK.critical}"></span>
+            <span style="width:19%;background:${RISK.high}"></span>
+            <span style="width:34%;background:${RISK.medium}"></span>
+            <span style="width:39%;background:${RISK.low}"></span>
+          </div>
+          <div class="risk-legend">
+            <span class="item"><span class="dot" style="background:${RISK.critical}"></span>Critical 103</span>
+            <span class="item"><span class="dot" style="background:${RISK.high}"></span>High 244</span>
+            <span class="item"><span class="dot" style="background:${RISK.medium}"></span>Medium 437</span>
+            <span class="item"><span class="dot" style="background:${RISK.low}"></span>Low 500</span>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="sec">미사용 권한 추이 · 24개 계정</div>
+          ${trendSvg(CHART.blue)}
+          <div class="chart-legend">
+            <span class="item"><span class="line" style="background:${CHART.blue}"></span>미사용 권한</span>
+            <span class="item"><span class="line" style="background:${CHART.aqua}"></span>PS 마이그레이션</span>
+            <span class="item"><span class="line" style="background:${CHART.violet}"></span>상승 경로</span>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="sec">Persona 카탈로그</div>
+          <table>
+            <thead><tr><th>Persona</th><th>멤버</th><th>상태</th></tr></thead>
+            <tbody>
+              <tr><td>DataEngineer <span class="badge ai">✦ AI 제안</span></td><td>312</td><td><span class="badge review">검토중</span></td></tr>
+              <tr><td>ReadOnlyAuditor</td><td>88</td><td><span class="badge approved">✓ 승인</span></td></tr>
+              <tr><td>PlatformAdmin</td><td>24</td><td><span class="badge review">검토중</span></td></tr>
+            </tbody>
+          </table>
+          <div class="btn-row" style="margin-top:12px">
+            <button class="btn">이 정책으로 승인</button>
+            <button class="btn secondary">JSON 보기</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="sec">중립 톤 스와치 (배경→텍스트)</div>
+          <div class="swatches" id="sw-${t.cls}"></div>
+          <div class="footnote">bg · surface · surface2 · border · border-strong · muted · secondary · text</div>
+        </div>
+
+      </div>
+    </div>`;
+  }
+
+  const grid = document.getElementById("grid");
+  grid.innerHTML = THEMES.map(card).join("");
+
+  // fill neutral swatches by reading computed CSS vars
+  const varOrder = ["--bg","--surface","--surface2","--border","--border-strong","--muted","--secondary","--text"];
+  THEMES.forEach(t => {
+    const el = document.querySelector("."+t.cls);
+    const cs = getComputedStyle(el);
+    const box = document.getElementById("sw-"+t.cls);
+    box.innerHTML = varOrder.map(v => {
+      const c = cs.getPropertyValue(v).trim();
+      return `<div class="sw" title="${v} ${c}" style="background:${c}"></div>`;
+    }).join("");
+  });
+</script>
+</body>
+</html>
