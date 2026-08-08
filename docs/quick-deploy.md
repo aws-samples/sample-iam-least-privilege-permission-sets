@@ -31,7 +31,7 @@ If you used SSO, activate the profile: `export AWS_PROFILE=<profile-name>`
 
 ### 0-3. Source + dependencies (one time only)
 ```bash
-git clone <repo URL> lp2ps && cd lp2ps
+git clone https://github.com/aws-samples/sample-iam-least-privilege-permission-sets.git lp2ps && cd lp2ps
 cd infra && npm install && cd ..
 cd frontend && npm install && cd ..
 python3 -m venv engine/.venv && engine/.venv/bin/pip install -e 'engine[dev]'

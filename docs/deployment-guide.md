@@ -144,7 +144,7 @@ Success if `Account` shows the tooling account ID and `Arn` shows your role.
 
 ```bash
 # 1) Clone the source (or move into the extracted folder)
-git clone <repository URL> lp2ps
+git clone https://github.com/aws-samples/sample-iam-least-privilege-permission-sets.git lp2ps
 cd lp2ps
 
 # 2) Infrastructure (CDK) dependencies
