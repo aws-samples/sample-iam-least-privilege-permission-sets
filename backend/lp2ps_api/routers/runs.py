@@ -52,13 +52,46 @@ def start_run() -> Run:
         stateMachineArn=s.state_machine_arn,
         input=json.dumps({"run_id": run.run_id, "started_at": run.started_at}),
     )
-    return Run(
+    row = Run(
         run_id=run.run_id,
         customer=s.customer,
         started_at=run.started_at,
         account_scope=_account_scope(),
         status="running",
     )
+    _record_running(row)
+    return row
+
+
+def _record_running(row: Run) -> None:
+    """진행 중 run 을 runs 테이블에 즉시 기록한다.
+
+    이 레코드가 없으면 시작된 run 은 **완료될 때까지 어디에도 존재하지 않는다** — 파이프라인 마지막
+    stage(engine snapshot)가 종료 시점에야 put 하기 때문이다. 그러면 GET /runs 로는 진행 중 run 을
+    관측할 수 없어 (1) 대시보드가 완료를 감지할 수 없고 (2) 실행 이력에 아무것도 안 보이며
+    (3) 모델에 정의된 status="running" 이 도달 불가 상태가 된다.
+
+    엔진의 종료 상태 기록은 status == "running" 인 레코드를 덮어쓰도록 허용된다
+    (engine/lp2ps/snapshot.py `_write_dynamodb`) — 즉 여기 쓴 값은 완료 시 최종 상태로 갱신된다.
+
+    실패해도 예외를 올리지 않는다: 실행은 이미 Step Functions 에 트리거됐고 파일 산출물이 SoT 이므로,
+    이력 기록 실패로 트리거 자체를 실패 처리하면 오히려 오해를 부른다. 로그만 남긴다.
+    """
+    import json
+    import logging
+
+    s = get_settings()
+    if not s.runs_table:
+        return  # 테이블 미주입(로컬/테스트) — 파일 산출물만.
+    try:
+        boto3.resource("dynamodb", region_name=s.region).Table(s.runs_table).put_item(
+            Item=json.loads(row.model_dump_json()),
+            ConditionExpression="attribute_not_exists(run_id)",
+        )
+    except Exception:
+        logging.getLogger("lp2ps.api").warning(
+            "진행 중 run 레코드 기록 실패(실행은 계속 진행): %s", row.run_id, exc_info=True
+        )
 
 
 def _account_scope() -> int:

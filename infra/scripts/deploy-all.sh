@@ -36,15 +36,18 @@ echo "== Deploy target: prefix=$PREFIX region=$REGION config=$CONFIG =="
 ACCT="$(aws sts get-caller-identity --query Account --output text)" || { echo "❌ AWS sign-in required (aws sso login)"; exit 1; }
 echo "   AWS account: $ACCT"
 
-# 0) (optional) bootstrap
-if [[ -n "$DO_BOOTSTRAP" ]]; then
-  echo "== [0/5] cdk bootstrap aws://$ACCT/$REGION =="
-  ( cd "$ROOT/infra" && npx cdk bootstrap "aws://$ACCT/$REGION" )
-fi
-
-# 1) Build engine/API assets (always — reflects code changes)
-echo "== [1/5] Build engine/API assets =="
+# 0) Build engine/API assets (always — reflects code changes).
+#    Must run before any cdk command: cdk synthesizes bin/lp2ps.ts even for `bootstrap`, and the synth
+#    reads infra/assets/* (Lambda layer/code). Bootstrapping first would fail with CannotFindAsset.
+echo "== [0/5] Build engine/API assets =="
 bash "$ROOT/infra/scripts/build-engine-assets.sh"
+
+# 1) (optional) bootstrap. Pass the config so the synth that bootstrap performs uses this customer's
+#    config rather than the default config/self.yaml.
+if [[ -n "$DO_BOOTSTRAP" ]]; then
+  echo "== [1/5] cdk bootstrap aws://$ACCT/$REGION =="
+  ( cd "$ROOT/infra" && npx cdk bootstrap "aws://$ACCT/$REGION" -c "config=$CONFIG" )
+fi
 
 # 2) Deploy 4 infra stacks (excluding web — web needs the Api/Auth outputs)
 echo "== [2/5] Deploy infra: Data / Auth / Engine / Api =="

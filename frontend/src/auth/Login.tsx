@@ -65,6 +65,10 @@ export default function Login({ onSignedIn }: { onSignedIn: () => void }) {
               </FormField>
               <Box color="text-status-inactive" fontSize="body-s">
                 IAM Identity Center / Cognito 자격증명으로 로그인합니다.
+                {/* 토큰을 메모리에만 보관하므로(auth/inMemoryStorage.ts — XSS 탈취 노출 축소)
+                    페이지를 새로고침하면 세션이 사라진다. 예상 동작임을 미리 알린다. */}
+                <br />
+                보안상 토큰을 브라우저 저장소에 남기지 않으므로, 페이지를 새로고침하면 다시 로그인해야 합니다.
               </Box>
             </SpaceBetween>
           </Form>

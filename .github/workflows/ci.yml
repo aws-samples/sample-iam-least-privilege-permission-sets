@@ -94,9 +94,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Install
         working-directory: infra
         run: npm ci
+      # infra/assets/ is generated (gitignored), and both the assertion tests and `cdk synth` below
+      # instantiate EngineStack/ApiStack, which resolve Lambda code from it. Without this step a
+      # fresh checkout fails with «CannotFindAsset» at infra/lib/engine-stack.ts.
+      - name: Build Lambda assets (layers + code)
+        run: bash infra/scripts/build-engine-assets.sh
       - name: Assertion tests (lifecycle, etc.)
         working-directory: infra
         run: npm test

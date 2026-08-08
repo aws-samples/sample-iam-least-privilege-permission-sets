@@ -57,7 +57,8 @@ export interface Api {
   getCleanup(): Promise<CleanupItem[]>;
   getRiskCriteria(): Promise<RiskCriteria>;
   getReport(runId: string): Promise<ReportRef>;
-  getLatestReport(account?: string): Promise<ReportRef>; // account="" 이면 전체
+  // null = 아직 볼 수 있는 리포트가 없다(갓 배포한 상태 · 전체 조회 미실행). 오류가 아니다.
+  getLatestReport(account?: string): Promise<ReportRef | null>; // account="" 이면 전체
   askAssistant(question: string): Promise<AssistantAnswer>;
   // 주기적 전체 조회 예약 조회/갱신(EventBridge 규칙).
   getSchedule(): Promise<ScheduleState>;

@@ -28,6 +28,7 @@ VITE_USE_MOCKS=false \
 VITE_API_BASE="$API_BASE" \
 VITE_COGNITO_USER_POOL_ID="$POOL_ID" \
 VITE_COGNITO_CLIENT_ID="$CLIENT_ID" \
+VITE_AWS_REGION="$REGION" \
   npm run build
 
 echo "frontend/dist build complete (real API wired): $ROOT/frontend/dist"

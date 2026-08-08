@@ -22,7 +22,7 @@ It is not built for any specific customer — it is a reusable sample you can de
 | `frontend/` | React + Cloudscape web UI (dashboard, persona review, cleanup backlog, reports, assistant) |
 | `backend/` | FastAPI + Mangum API (Cognito auth, read + curate tool-owned resources) |
 | `infra/` | TypeScript CDK — deployment stacks (Data / Auth / Engine / Api / Web) |
-| `config/` | Configuration (`example.yaml` template) |
+| `config/` | Configuration templates — copy `self.yaml` (the deployment guide's starting point); `example.yaml`, `multi.yaml` for reference |
 | `cfn/` | Cross-account read-only role deployed into member accounts (StackSet) |
 
 ## Architecture (overview)
@@ -73,7 +73,7 @@ cd engine && pip install -e '.[dev]'
 pytest
 
 aws sso login && export AWS_REGION=us-west-2
-cp config/example.yaml config/myenv.yaml   # edit customer/region/accounts
+cp config/self.yaml config/myenv.yaml       # edit customer/region/accounts
 lp2ps run -c config/myenv.yaml --out ./out  # full collect→analyze→synth→report
 
 # Frontend (mock-data UI)
@@ -113,6 +113,9 @@ infra/scripts/destroy-all.sh config/myenv.yaml
 - Deletes the five stacks in reverse dependency order. S3/DynamoDB use `removalPolicy: DESTROY`, so **their data is deleted as well** (sample behavior — change the policy before deploying if you need retention).
 - The member-account read-only role is removed by deleting the `lp2ps-readonly` stack in each member account.
 - To also remove the CDK bootstrap (CDKToolkit), delete it separately with `aws cloudformation delete-stack`.
+- **Shared account**: teardown also removes the account-wide API Gateway CloudWatch Logs role, which is a
+  per-Region singleton. If another REST API in that Region relies on it, set `cloudWatchRoleRemovalPolicy` in
+  `infra/lib/api-stack.ts` to `RETAIN` before deploying. See `docs/quick-deploy.md` §5.
 
 ## License
 

@@ -19,6 +19,10 @@ import Assistant from "@/pages/Assistant";
 import Runs from "@/pages/Runs";
 import ConfigError from "@/pages/ConfigError";
 
+// Region shown in the top nav. Falls back to a neutral placeholder rather than a specific region so a
+// misbuilt bundle cannot claim the wrong one.
+const DEPLOY_REGION = import.meta.env.VITE_AWS_REGION || "—";
+
 const NAV_ITEMS = [
   { type: "link" as const, text: "대시보드", href: "/dashboard" },
   { type: "link" as const, text: "Persona 검토", href: "/personas" },
@@ -84,7 +88,17 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
     <>
       <div id="top-nav">
         <TopNavigation
-          identity={{ href: "/dashboard", title: "LP2PS — IAM 최소권한 → Permission Set" }}
+          identity={{
+            href: "/dashboard",
+            title: "LP2PS — IAM 최소권한 → Permission Set",
+            // SPA 라우팅으로 처리한다. 기본 앵커 동작(전체 페이지 로드)을 그대로 두면 토큰을
+            // 브라우저 저장소에 남기지 않는 설계상 제목을 클릭하는 순간 로그아웃된다.
+            // 아래 SideNavigation 의 onFollow 와 같은 처리.
+            onFollow: (e) => {
+              e.preventDefault();
+              navigate("/dashboard");
+            },
+          }}
           utilities={[
             {
               type: "menu-dropdown",
@@ -93,7 +107,10 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
               items: accountItems,
               onItemClick: (e) => setSelected(e.detail.id === ALL ? "" : e.detail.id),
             },
-            { type: "button", text: "us-west-2" },
+            // Deployment region label. Injected at build time from the config's `region:`
+            // (build-web.sh), never hardcoded -- a literal here would show the wrong region to
+            // every customer who deploys elsewhere.
+            { type: "button", text: DEPLOY_REGION },
             ...(USING_MOCKS
               ? []
               : [{ type: "button" as const, text: "로그아웃", iconName: "external" as const, onClick: onSignOut }]),

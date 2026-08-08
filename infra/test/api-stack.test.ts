@@ -192,6 +192,27 @@ assert(
   "the API Lambda receives both LP2PS_GUARDRAIL_ID and LP2PS_GUARDRAIL_VERSION",
 );
 
+// ---- Runs-table write scope ----
+//
+// POST /runs records the started run as status="running" so it is observable before the pipeline
+// finishes. That needs one write action on the runs table, and the temptation is grantReadWriteData,
+// which also hands over UpdateItem and DeleteItem -- i.e. the API could mutate or erase completed
+// run history. PutItem alone is sufficient (the engine writes the terminal state, conditionally).
+const recordRun = statements.filter((s) => s.Sid === "RecordRunningRun");
+assert(recordRun.length === 1, "exactly one RecordRunningRun statement exists");
+
+const recordActions = recordRun.flatMap((s) =>
+  Array.isArray(s.Action) ? s.Action : [s.Action ?? ""],
+);
+assert(
+  recordActions.length === 1 && recordActions[0] === "dynamodb:PutItem",
+  "RecordRunningRun grants only dynamodb:PutItem (no UpdateItem/DeleteItem on run history)",
+);
+assert(
+  !JSON.stringify(recordRun.map((s) => s.Resource)).includes('"*"'),
+  "RecordRunningRun has no bare '*' resource",
+);
+
 if (process.exitCode && process.exitCode !== 0) {
   console.error("\n일부 어설션 실패");
 } else {

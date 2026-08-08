@@ -20,7 +20,35 @@ import { api } from "@/api/client";
 import { useAsync } from "@/api/useAsync";
 import { useAccounts } from "@/AccountContext";
 import { CHART_SERIES, RISK_COLOR } from "@/theme/tokens";
-import type { MetricsPoint, ScheduleState, AiSettings } from "@/api/types";
+import type { MetricsPoint, ScheduleState, AiSettings, RunStatus } from "@/api/types";
+
+// "전체 조회 실행" 완료 폴링 파라미터. 실 파이프라인은 계정 수·자원 수에 비례해 수 분 걸린다
+// (단일 계정 기준 관측치 약 5분 30초). 타임아웃은 넉넉히 두고, 넘으면 실패로 단정하지 않고
+// "아직 진행 중일 수 있다"고 안내한다 — 실행 자체는 Step Functions 에서 계속 돌기 때문이다.
+const POLL_INTERVAL_MS = 10_000;
+const POLL_TIMEOUT_MS = 30 * 60_000;
+const TERMINAL_STATUSES: readonly RunStatus[] = ["succeeded", "degraded", "failed"];
+
+/**
+ * 해당 run 이 종료 상태가 될 때까지 GET /runs 를 폴링한다.
+ * 반환: 종료 상태 문자열, 또는 타임아웃 시 null.
+ * 폴링 중 일시적 조회 실패는 무시한다(다음 주기에 재시도) — 실행은 서버에서 계속 진행되므로
+ * 네트워크 순간 오류로 완료를 놓치지 않는다.
+ */
+async function pollRunStatus(runId: string): Promise<RunStatus | null> {
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    try {
+      const runs = await api.listRuns();
+      const mine = runs.find((r) => r.run_id === runId);
+      if (mine && TERMINAL_STATUSES.includes(mine.status)) return mine.status;
+    } catch {
+      // 일시적 오류 — 다음 주기에 재시도.
+    }
+  }
+  return null;
+}
 
 // run 의 total MetricsPoint 에서 선택 계정 뷰를 뽑는다. 전체("")면 total 그대로,
 // 특정 계정이면 by_account 에서 매칭(없으면 0 이 담긴 빈 포인트).
@@ -139,6 +167,7 @@ export default function Dashboard() {
   const { data: metrics, loading, reload } = useAsync<MetricsPoint[]>(() => api.getMetrics());
   const [running, setRunning] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  const [runErr, setRunErr] = useState<string | null>(null);
 
   // 예약(스케줄) 상태 + 편집 모달.
   const [schedule, setSchedule] = useState<ScheduleState | null>(null);
@@ -191,20 +220,95 @@ export default function Dashboard() {
     }
   }
 
-  // "전체 조회 실행": 파이프라인 run 트리거 → 완료 시 지표 갱신.
+  // "전체 조회 실행": 파이프라인 run 트리거 → 완료를 폴링한 뒤 지표 갱신.
+  // 실 파이프라인은 수 분(계정 수·자원 수에 비례) 걸리므로 고정 대기로는 결과를 받을 수 없다.
+  // GET /runs 로 해당 run 의 status 가 종료 상태(succeeded|degraded|failed)가 될 때까지 폴링한다.
   async function runScan() {
     setRunning(true);
     setNote(null);
-    await api.startRun(); // POST /runs
-    // 실제로는 Step Functions 완료를 폴링. mock 은 지연 후 최신 지표 재조회.
-    await new Promise((r) => setTimeout(r, 1600));
-    reload();
-    setRunning(false);
-    setNote("전체 조회가 완료되어 대시보드를 갱신했습니다.");
+    setRunErr(null);
+    try {
+      const started = await api.startRun(); // POST /runs
+      const finalStatus = await pollRunStatus(started.run_id);
+      reload();
+      if (finalStatus === "failed") {
+        setRunErr("전체 조회가 실패했습니다. 실행 이력에서 상세 사유를 확인하세요.");
+      } else if (finalStatus === "degraded") {
+        setNote("전체 조회가 완료되었으나 일부 소스가 부분 수집되었습니다(degraded). 실행 이력에서 사유를 확인하세요.");
+      } else if (finalStatus === null) {
+        setRunErr(
+          `전체 조회가 ${Math.round((POLL_TIMEOUT_MS / 60000))}분 내에 끝나지 않았습니다. 실행은 계속 진행 중일 수 있습니다 — 실행 이력에서 상태를 확인하세요.`,
+        );
+      } else {
+        setNote("전체 조회가 완료되어 대시보드를 갱신했습니다.");
+      }
+    } catch (e) {
+      setRunErr(e instanceof Error ? `전체 조회 실행에 실패했습니다: ${e.message}` : "전체 조회 실행에 실패했습니다.");
+    } finally {
+      setRunning(false);
+    }
   }
+
+  // Header actions are shared by the empty state and the populated dashboard: on a fresh deployment the
+  // "전체 조회 실행" button is the only way to produce the first run, so it must stay reachable.
+  const headerActions = (
+    <SpaceBetween direction="horizontal" size="s" alignItems="center">
+      {ai && (
+        <Toggle checked={ai.enabled} disabled={aiSaving} onChange={(e) => toggleAi(e.detail.checked)}>
+          AI 기능 {ai.enabled ? "ON" : "OFF"}
+        </Toggle>
+      )}
+      <Button iconName="calendar" onClick={openSchedule}>예약 설정</Button>
+      <Button variant="primary" iconName="refresh" loading={running} onClick={runScan}>
+        {running ? "조회 중…" : "전체 조회 실행"}
+      </Button>
+    </SpaceBetween>
+  );
 
   if (loading || !metrics) {
     return <Box padding="xxl" textAlign="center"><Spinner size="large" /></Box>;
+  }
+
+  // No run yet (a fresh deployment returns an empty metrics list). Guarding only on `!metrics` is not
+  // enough -- `![]` is false, so an empty array would reach `scoped[scoped.length - 1]` below and read
+  // `risk_dist` off undefined, throwing during render and unmounting the whole app.
+  if (metrics.length === 0) {
+    return (
+      <ContentLayout
+        header={
+          <Header
+            variant="h1"
+            description={`아직 실행 이력이 없습니다 · 예약: ${schedule ? scheduleSummary(schedule) : "…"}`}
+            actions={headerActions}
+          >
+            대시보드
+          </Header>
+        }
+      >
+        <SpaceBetween size="l">
+          {running && (
+            <Flashbar items={[{ type: "in-progress", header: "전체 조회 실행 중", content: "대상 계정을 읽기 전용으로 수집·분석하고 있습니다. 계정·자원 수에 따라 수 분 걸립니다 — 완료되면 이 화면이 자동으로 갱신됩니다.", loading: true }]} />
+          )}
+          {note && (
+            <Flashbar items={[{ type: "success", header: "완료", content: note, dismissible: true, onDismiss: () => setNote(null) }]} />
+          )}
+          {runErr && (
+            <Flashbar items={[{ type: "error", header: "전체 조회", content: runErr, dismissible: true, onDismiss: () => setRunErr(null) }]} />
+          )}
+          <Container>
+            <Box padding="xxl" textAlign="center" color="text-body-secondary">
+              <SpaceBetween size="s">
+                <Box variant="h3" color="inherit">수집된 지표가 없습니다</Box>
+                <span>
+                  우측 상단의 <b>전체 조회 실행</b> 을 눌러 첫 조회를 시작하세요. 대상 계정을 읽기 전용으로
+                  수집·분석하며 수 분이 걸립니다. 완료되면 persona·리포트와 함께 지표가 채워집니다.
+                </span>
+              </SpaceBetween>
+            </Box>
+          </Container>
+        </SpaceBetween>
+      </ContentLayout>
+    );
   }
 
   // 선택 계정으로 각 run 지표를 스코프(전체=그대로, 특정 계정=by_account 뷰).
@@ -245,19 +349,7 @@ export default function Dashboard() {
         <Header
           variant="h1"
           description={`${selected ? `계정 ${selected}` : "전체 계정"} · 최신 실행 ${last.run_id} · principal ${totalPrincipals.toLocaleString()} · 예약: ${schedule ? scheduleSummary(schedule) : "…"}`}
-          actions={
-            <SpaceBetween direction="horizontal" size="s" alignItems="center">
-              {ai && (
-                <Toggle checked={ai.enabled} disabled={aiSaving} onChange={(e) => toggleAi(e.detail.checked)}>
-                  AI 기능 {ai.enabled ? "ON" : "OFF"}
-                </Toggle>
-              )}
-              <Button iconName="calendar" onClick={openSchedule}>예약 설정</Button>
-              <Button variant="primary" iconName="refresh" loading={running} onClick={runScan}>
-                {running ? "조회 중…" : "전체 조회 실행"}
-              </Button>
-            </SpaceBetween>
-          }
+          actions={headerActions}
         >
           대시보드
         </Header>
@@ -265,10 +357,13 @@ export default function Dashboard() {
     >
       <SpaceBetween size="l">
         {running && (
-          <Flashbar items={[{ type: "in-progress", header: "전체 조회 실행 중", content: "대상 계정을 읽기 전용으로 수집·분석하고 있습니다…", loading: true }]} />
+          <Flashbar items={[{ type: "in-progress", header: "전체 조회 실행 중", content: "대상 계정을 읽기 전용으로 수집·분석하고 있습니다. 계정·자원 수에 따라 수 분 걸립니다 — 완료되면 이 화면이 자동으로 갱신됩니다.", loading: true }]} />
         )}
         {note && (
           <Flashbar items={[{ type: "success", header: "완료", content: note, dismissible: true, onDismiss: () => setNote(null) }]} />
+        )}
+        {runErr && (
+          <Flashbar items={[{ type: "error", header: "전체 조회", content: runErr, dismissible: true, onDismiss: () => setRunErr(null) }]} />
         )}
         <Grid gridDefinition={[{ colspan: 3 }, { colspan: 3 }, { colspan: 3 }, { colspan: 3 }]}>
           <Kpi label="미사용 권한" value={last.unused_permissions.toLocaleString()} onClick={() => navigate("/cleanup?type=unused_permission")} />

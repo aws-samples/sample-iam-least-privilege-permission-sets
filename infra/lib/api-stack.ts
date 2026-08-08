@@ -193,6 +193,16 @@ export class ApiStack extends cdk.Stack {
     dataBucket.grantRead(apiFn);
     runsTable.grantReadData(apiFn);
     metricsTable.grantReadData(apiFn);
+    // POST /runs must record the started run as status="running" so it is observable before the
+    // pipeline finishes (the engine writes the terminal state at the end of the run). PutItem only --
+    // no UpdateItem/DeleteItem, so the API can never mutate or remove a completed run's history.
+    apiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "RecordRunningRun",
+        actions: ["dynamodb:PutItem"],
+        resources: [runsTable.tableArn],
+      }),
+    );
     catalogTable.grantReadWriteData(apiFn); // PATCH/approve 는 catalog 조정(도구 DynamoDB만)
     stateMachine.grantStartExecution(apiFn); // POST /runs 트리거
 
@@ -304,6 +314,19 @@ export class ApiStack extends cdk.Stack {
     const api = new apigw.LambdaRestApi(this, "RestApi", {
       handler: apiFn,
       proxy: true,
+      // 액세스/실행 로깅에 필요한 계정 수준 CloudWatch 역할. CDK 기본 removal policy 는 RETAIN
+      // 이라 스택을 지워도 IAM 역할과 AWS::ApiGateway::Account 가 남는다 — 배포·삭제를 반복하면
+      // 고객 계정에 역할이 누적되고, "테어다운하면 다 지워진다"는 가이드와 어긋난다. DESTROY 로
+      // 고정해 스택과 수명을 맞춘다.
+      //
+      // ⚠️ AWS::ApiGateway::Account 는 **계정+리전당 싱글톤**이고, 스택 삭제로 계정 설정 자체가
+      // 되돌려지지는 않는다(AWS 문서: 스택을 지워도 API Gateway 는 그 역할을 계속 assume 할 수
+      // 있다). 즉 삭제 후 계정 설정은 사라진 역할 ARN 을 가리킨 채 남는다. 같은 리전에서 로깅을
+      // 쓰는 **다른** REST API 가 있으면 그쪽 로깅이 끊긴다. LP2PS 는 전용 tooling 계정 배포를
+      // 전제하므로 DESTROY 가 맞지만, 공유 계정에 올릴 경우엔 docs/quick-deploy.md §5 의 주의를
+      // 따라 이 값을 RETAIN 으로 되돌려야 한다.
+      cloudWatchRole: true,
+      cloudWatchRoleRemovalPolicy: cdk.RemovalPolicy.DESTROY,
       defaultMethodOptions: {
         authorizer,
         authorizationType: apigw.AuthorizationType.COGNITO,

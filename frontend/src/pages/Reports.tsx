@@ -51,7 +51,7 @@ function Value({ label, children }: { label: string; children: React.ReactNode }
 export default function Reports() {
   // 선택 계정에 맞는 리포트(전체=""면 통합, 계정이면 그 계정). 계정 바뀌면 재조회.
   const { selected } = useAccounts();
-  const { data, loading, error, reload } = useAsync<ReportRef>(
+  const { data, loading, error, reload } = useAsync<ReportRef | null>(
     () => api.getLatestReport(selected), [selected],
   );
   // Download failures are shown instead of being swallowed by a window.open fallback.
@@ -71,12 +71,26 @@ export default function Reports() {
   if (loading) {
     return <Box padding="xxl" textAlign="center"><Spinner size="large" /></Box>;
   }
-  if (error || !data) {
+  // 오류와 "아직 리포트가 없음"을 구분한다. 전자는 붉은 오류, 후자는 갓 배포한 고객의 정상
+  // 상태이므로 안내로 보여준다. 이전에는 두 경우가 한 분기에 묶여 있었고, API 가 리포트 없음을
+  // 404 로 주는 바람에 `error` 가 항상 채워져 아래 안내 문구는 도달할 수 없는 죽은 코드였다 —
+  // 신규 배포 고객은 "리포트를 불러오지 못했습니다 / Error: 404 Not Found" 를 보게 됐다.
+  if (error) {
     return (
       <ContentLayout header={<Header variant="h1">리포트</Header>}>
         <Alert type="error" header="리포트를 불러오지 못했습니다"
           action={<Button onClick={reload}>다시 시도</Button>}>
-          {error ?? "실행 이력이 없거나 리포트가 아직 생성되지 않았습니다. 대시보드에서 전체 조회를 먼저 실행하세요."}
+          {error}
+        </Alert>
+      </ContentLayout>
+    );
+  }
+  if (!data) {
+    return (
+      <ContentLayout header={<Header variant="h1">리포트</Header>}>
+        <Alert type="info" header="아직 리포트가 없습니다"
+          action={<Button onClick={reload}>새로 고침</Button>}>
+          완료된 전체 조회가 없어 리포트가 아직 생성되지 않았습니다. 대시보드에서 <b>전체 조회 실행</b>을 먼저 수행하세요.
         </Alert>
       </ContentLayout>
     );

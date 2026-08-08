@@ -54,8 +54,19 @@ Security decisions for the dashboard (React) and API (FastAPI/Lambda) and their 
 
 ## Known dependency advisories
 
-npm audit reports one high finding (brace-expansion) bundled inside aws-cdk-lib; it affects CDK
-synthesis only, is not shipped, and is pending an upstream aws-cdk-lib release.
+`npm audit` in `frontend/` reports no findings. `npm audit` in `infra/` reports one high finding,
+`brace-expansion` (DoS via pathological brace expansion), reached through
+`aws-cdk-lib > minimatch`.
+
+It is not fixable from this repository and it is not shipped:
+
+- `aws-cdk-lib` **bundles** its own copy under `node_modules/aws-cdk-lib/node_modules/`, so an npm
+  `overrides` entry does not replace it (verified: adding one leaves the bundled 5.0.6 in place).
+- The advisory covers 3.0.0 – 5.0.8, and the latest `aws-cdk-lib` (2.263.0) still bundles 5.0.8, so
+  upgrading CDK does not clear it either. It is pending an upstream release.
+- `aws-cdk-lib` runs only at synthesis time on the operator's own machine. It is not part of any
+  deployed artifact, and the input it expands is this repository's own file globs — not
+  attacker-controlled. A denial-of-service against your own `cdk synth` is the whole exposure.
 
 ## Supported versions
 

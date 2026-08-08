@@ -132,6 +132,48 @@ def test_post_runs_account_scope_from_config(monkeypatch):
 
 
 @mock_aws
+def test_post_runs_records_running_row(monkeypatch):
+    """POST /runs 는 시작된 run 을 runs 테이블에 status="running" 으로 즉시 기록한다.
+
+    이 레코드가 없으면 시작된 run 은 파이프라인이 끝날 때까지 GET /runs 에 나타나지 않아
+    대시보드가 완료를 감지할 수 없다(실행 이력도 빈 상태).
+    """
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    sfn = boto3.client("stepfunctions", region_name="us-west-2")
+    sm = sfn.create_state_machine(name="P3", definition=json.dumps(
+        {"StartAt": "x", "States": {"x": {"Type": "Pass", "End": True}}}),
+        roleArn="arn:aws:iam::111122223333:role/sfn")
+    monkeypatch.setenv("LP2PS_STATE_MACHINE_ARN", sm["stateMachineArn"])
+    c = _client(monkeypatch)
+    run_id = c.post("/runs").json()["run_id"]
+
+    # DynamoDB 에 직접 들어갔는지.
+    item = boto3.resource("dynamodb", region_name="us-west-2").Table(RUNS_TABLE).get_item(
+        Key={"run_id": run_id})["Item"]
+    assert item["status"] == "running"
+    # API 계약으로도 관측 가능한지(대시보드 폴링 경로).
+    listed = {r["run_id"]: r for r in c.get("/runs").json()}
+    assert listed[run_id]["status"] == "running"
+
+
+@mock_aws
+def test_post_runs_survives_runs_table_write_failure(monkeypatch):
+    """이력 기록 실패는 트리거를 실패시키지 않는다 — SFN 실행은 이미 시작됐고 파일이 SoT."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    sfn = boto3.client("stepfunctions", region_name="us-west-2")
+    sm = sfn.create_state_machine(name="P4", definition=json.dumps(
+        {"StartAt": "x", "States": {"x": {"Type": "Pass", "End": True}}}),
+        roleArn="arn:aws:iam::111122223333:role/sfn")
+    monkeypatch.setenv("LP2PS_STATE_MACHINE_ARN", sm["stateMachineArn"])
+    monkeypatch.setenv("LP2PS_RUNS_TABLE", "does-not-exist")
+    c = _client(monkeypatch)
+    r = c.post("/runs")
+    assert r.status_code == 200
+    assert r.json()["status"] == "running"
+    assert len(sfn.list_executions(stateMachineArn=sm["stateMachineArn"])["executions"]) == 1
+
+
+@mock_aws
 def test_get_metrics(monkeypatch):
     _seed_env(monkeypatch); _seed_aws(monkeypatch)
     c = _client(monkeypatch)
@@ -232,6 +274,78 @@ def test_cleanup_and_reports(monkeypatch):
     latest = c.get("/reports").json()
     assert latest["run_id"] == "run-001"
     assert latest["exec_summary"]["personas"] == 3
+
+
+def _seed_aws_no_runs(monkeypatch):
+    """갓 배포한 상태 — 테이블/버킷은 있고 run 은 0건(_seed_aws 의 run-001 산출물이 없다)."""
+    s3 = boto3.client("s3", region_name="us-west-2")
+    s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
+    key_arn = boto3.client("kms", region_name="us-west-2").create_key()["KeyMetadata"]["Arn"]
+    monkeypatch.setenv("LP2PS_DATA_KEY_ARN", key_arn)
+    ddb = boto3.resource("dynamodb", region_name="us-west-2")
+    ddb.create_table(
+        TableName=RUNS_TABLE, KeySchema=[{"AttributeName": "run_id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "run_id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST")
+    ddb.create_table(
+        TableName=METRICS_TABLE,
+        KeySchema=[{"AttributeName": "run_id", "KeyType": "HASH"}, {"AttributeName": "ts", "KeyType": "RANGE"}],
+        AttributeDefinitions=[{"AttributeName": "run_id", "AttributeType": "S"}, {"AttributeName": "ts", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST")
+    ddb.create_table(
+        TableName="catalog", KeySchema=[{"AttributeName": "persona", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "persona", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST")
+
+
+@mock_aws
+def test_latest_report_is_null_not_404_on_fresh_deploy(monkeypatch):
+    """리포트가 아직 없는 것은 갓 배포한 고객의 정상 상태 — 200 + null 이어야 한다.
+
+    404 면 프론트가 이것을 오류로 취급해 "리포트를 불러오지 못했습니다 / 404 Not Found" 를 붉은
+    경고로 띄운다. 형제 endpoint 들과 동일하게 '비어 있음'으로 응답하는지 함께 고정한다.
+    """
+    _seed_env(monkeypatch); _seed_aws_no_runs(monkeypatch)
+    c = _client(monkeypatch)
+    r = c.get("/reports")
+    assert r.status_code == 200
+    assert r.json() is None
+    # 같은 상태에서 형제 endpoint 들은 200 + 빈 목록(일관성).
+    for path in ("/runs", "/metrics", "/accounts", "/catalog", "/cleanup-backlog"):
+        rr = c.get(path)
+        assert rr.status_code == 200, path
+        assert rr.json() == [], path
+
+
+@mock_aws
+def test_report_by_run_id_still_404s(monkeypatch):
+    """특정 run 을 지목한 조회는 여전히 404 — 그건 진짜 not-found 다(빈 상태와 구분)."""
+    _seed_env(monkeypatch); _seed_aws_no_runs(monkeypatch)
+    c = _client(monkeypatch)
+    assert c.get("/reports/run-20260101T000000Z-abcdef12").status_code == 404
+
+
+@mock_aws
+def test_latest_artifacts_ignore_in_progress_run(monkeypatch):
+    """진행 중 run 이 최신이어도 산출물 조회는 **직전 완료 run** 을 본다.
+
+    POST /runs 가 status="running" 레코드를 즉시 넣으므로(진행 상태 관측용), '최신 run'을 단순히
+    started_at 최댓값으로 잡으면 조회가 도는 수 분 동안 catalog·cleanup·accounts 가 비고
+    /reports 가 사라진다 — 이전 완료 결과가 멀쩡히 있는데도.
+    """
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    # run-001(succeeded) 보다 더 최신인 진행 중 run 을 삽입.
+    boto3.resource("dynamodb", region_name="us-west-2").Table(RUNS_TABLE).put_item(
+        Item={"run_id": "run-20261231T000000Z-99999999", "customer": CUSTOMER,
+              "started_at": "2026-12-31T00:00:00Z", "account_scope": 1, "status": "running"})
+    c = _client(monkeypatch)
+    latest = c.get("/reports").json()
+    assert latest is not None
+    assert latest["run_id"] == "run-001"  # 진행 중 run 이 아니라 직전 완료 run
+    assert len(c.get("/catalog").json()) == 1
+    assert len(c.get("/cleanup-backlog").json()) == 1
+    # 실행 이력에는 진행 중 run 이 그대로 보인다(관측 가능성은 유지).
+    assert c.get("/runs").json()[0]["status"] == "running"
 
 
 @mock_aws

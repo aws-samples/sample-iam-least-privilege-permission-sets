@@ -288,10 +288,28 @@ aws cloudformation describe-stacks --stack-name Lp2ps-acme-Auth \
    - **Username**: the login ID (e.g., `admin@acme.com`)
    - **Email address**: the email
    - **Password**: "Generate a password" or set it yourself (12+ characters, upper/lowercase, digits, special characters)
-5. **Create user** → the user is required to change the password at first login.
+5. **Create user**
 
-> ← This is also possible via the CLI, but for beginners the console is clearer. Confirm in the top-right of the
-> console that the region is the deployment region (us-west-2).
+### 8-3. Make the password permanent (required)
+
+A console-created user is left in `FORCE_CHANGE_PASSWORD` state, i.e. it must change the password at first
+login. The sign-in screen does not implement that challenge (`frontend/src/auth/cognito.ts`), so signing in
+would fail with *"Password reset required (contact your administrator)"*. Promote the password to permanent:
+
+```bash
+aws cognito-idp admin-set-user-password \
+  --user-pool-id us-west-2_XXXXXXXXX --username admin@acme.com \
+  --password '<the same password>' --permanent --region us-west-2
+
+# Verify: expect CONFIRMED
+aws cognito-idp admin-get-user --user-pool-id us-west-2_XXXXXXXXX \
+  --username admin@acme.com --region us-west-2 --query UserStatus --output text
+```
+
+> ← User creation is also possible via the CLI, but for beginners the console is clearer. Confirm in the
+> top-right of the console that the region is the deployment region (us-west-2) — the user pool exists only
+> in that region, so in any other region **User pools** looks empty and it is easy to start creating a *new*
+> pool by mistake. The `<prefix>-Auth` stack already created the pool; only add a user to it.
 
 ---
 
@@ -454,6 +472,19 @@ cd ..
 ```
 If you deployed a role to member accounts, also delete the `lp2ps-readonly` stack in those accounts.
 
+Teardown removes every resource these stacks created, including S3/DynamoDB data, the Cognito user pool (and
+therefore its users), and all CloudWatch log groups. It does **not** remove the shared CDK bootstrap stack
+(`CDKToolkit`) or the member-account roles.
+
+> ⚠ **Shared account**: API Gateway stores the IAM role used for API logging in an account- and Region-wide
+> setting (`AWS::ApiGateway::Account`, one per Region). This deployment sets that role and deletes it on
+> teardown, which leaves the setting pointing at a deleted role — any **other** REST API in that Region then
+> stops writing CloudWatch logs. That is correct for the dedicated tooling account LP2PS assumes. To deploy
+> into a shared account, first change `cloudWatchRoleRemovalPolicy` in `infra/lib/api-stack.ts` to
+> `cdk.RemovalPolicy.RETAIN`.
+
+See `docs/quick-deploy.md` §5 for the post-teardown verification commands.
+
 ---
 
 ## 16. Troubleshooting (common issues)
@@ -463,6 +494,8 @@ If you deployed a role to member accounts, also delete the `lp2ps-readonly` stac
 | `cdk` command not found | Run via `npx cdk ...` after `cd infra` (no global install needed). |
 | `not bootstrapped` during deploy | Step 5 `cdk bootstrap` was not run → run it. |
 | Permission denied during deploy | The sign-in role is not Admin → recheck Step 2, `aws sts get-caller-identity`. |
+| `Password reset required (contact your administrator).` at sign-in | The user is still in `FORCE_CHANGE_PASSWORD` → run the Step 8-3 `admin-set-user-password --permanent` command. |
+| **User pools** is empty in the Cognito console | The console region does not match `region:` → switch the region in the top right. Do not create a new pool. |
 | Blank screen / infinite loading after web login | (1) **The 9-3 CORS origin setting was skipped** — if you see CORS errors in the browser console (F12), set `LP2PS_WEB_ORIGIN` to the SiteUrl. (2) The web was built **before** the API was deployed → rebuild at 9-1, then redeploy at 9-2. |
 | Old screen on the web | Hard-refresh the browser (Cmd+Shift+R / Ctrl+Shift+R). CloudFront is invalidated automatically on deploy. |
 | Data is empty after analysis | The run was not executed or is still running → Step 10, confirm SUCCEEDED with `describe-execution`. |
@@ -482,7 +515,7 @@ If you deployed a role to member accounts, also delete the `lp2ps-readonly` stac
 [ ] 5. cd infra && npx cdk bootstrap aws://<account>/<region>
 [ ] 6. bash infra/scripts/build-engine-assets.sh
 [ ] 7. cdk deploy <prefix>-Data <prefix>-Auth <prefix>-Engine <prefix>-Api
-[ ] 8. Create a login user in the Cognito console
+[ ] 8. Create a login user in the Cognito console → admin-set-user-password --permanent (status CONFIRMED)
 [ ] 9. build-web.sh <prefix> → cdk deploy <prefix>-Web → open SiteUrl
 [ ] 10. Dashboard "Run full scan" (first run) → confirm SUCCEEDED
 [ ] 11. (Optional) Multi-account role / create · assign Permission Sets

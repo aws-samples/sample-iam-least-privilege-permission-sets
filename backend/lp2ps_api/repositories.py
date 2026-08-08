@@ -60,8 +60,20 @@ class Repositories:
         return runs
 
     def latest_run_id(self) -> str | None:
+        """산출물 조회의 기준이 되는 **최신 완료 run**. 진행 중 run 은 건너뛴다.
+
+        POST /runs 는 실행을 트리거한 즉시 status="running" 레코드를 넣는다(진행 상태를 관측
+        가능하게 만들기 위해 — routers/runs.py `_record_running`). 그 run 의 S3 산출물은 파이프라인이
+        끝날 때까지 존재하지 않으므로, '최신'을 단순히 started_at 최댓값으로 잡으면 조회가 도는
+        수 분 동안 catalog·cleanup·accounts 가 빈 목록이 되고 /reports 는 404 가 된다 — 이전 완료
+        결과가 멀쩡히 있는데도 화면에서 사라진다.
+
+        따라서 여기서는 종료 상태(succeeded/degraded/failed)인 run 만 후보로 본다. failed 도
+        포함하는데, 실패한 run 도 부분 산출물을 남기며 그게 그 시점의 최신 관측이기 때문이다
+        (진행 중 run 만 산출물이 아예 없다).
+        """
         runs = self.list_runs()
-        return runs[0].run_id if runs else None
+        return next((r.run_id for r in runs if r.status != "running"), None)
 
     # ---- metrics (DynamoDB) ----
     def list_metrics(self) -> list[MetricsPoint]:

@@ -33,6 +33,7 @@ If you used SSO, activate the profile: `export AWS_PROFILE=<profile-name>`
 ```bash
 git clone <repo URL> lp2ps && cd lp2ps
 cd infra && npm install && cd ..
+cd frontend && npm install && cd ..
 python3 -m venv engine/.venv && engine/.venv/bin/pip install -e 'engine[dev]'
 ```
 
@@ -93,13 +94,28 @@ When it finishes, it prints this at the end:
 
 ## 3. Create a web login user + sign in
 
-The web app requires login. Invite a user from the Cognito console:
+The web app requires login. Self sign-up is disabled, so an administrator invites the user.
+
+> ⚠ **Set the console region first.** In the top-right region selector, switch to the `region:` you deployed
+> to. The user pool only exists in that region — in any other region **User pools** looks empty, and it is easy
+> to start creating a *new* pool ("Define your application" → Traditional web application / SPA / …) by mistake.
+> **Do not create a new pool.** The `<prefix>-Auth` stack already created it; you are only adding a user to it.
 
 1. Search **"Cognito"** in the AWS console → **Amazon Cognito** → **User pools**
 2. Click the pool matching the **Cognito pool ID** from step 2 → **Users** tab → **Create user**
-3. Enter Username (email) and Password → **Create user**
-4. Open the **web dashboard URL** in a browser → sign in as this user
-5. Click **"Run full scan"** at the top of the dashboard → the first analysis starts (a few minutes) → once done, personas and reports are populated
+3. Enter Email address and Password (12+ chars, upper/lowercase, digit, symbol) → **Create user**
+4. **Make the password permanent** (required). A console-created user lands in `FORCE_CHANGE_PASSWORD`
+   state, and the sign-in screen does not implement the "new password required" challenge — it would fail with
+   *"Password reset required (contact your administrator)"*. Run:
+   ```bash
+   aws cognito-idp admin-set-user-password \
+     --user-pool-id <Cognito pool ID> --username <email> \
+     --password '<the same password>' --permanent --region <region>
+   ```
+   The user status becomes `CONFIRMED`; verify with
+   `aws cognito-idp admin-get-user --user-pool-id <pool> --username <email> --region <region> --query UserStatus`.
+5. Open the **web dashboard URL** in a browser → sign in as this user
+6. Click **"Run full scan"** at the top of the dashboard → the first analysis starts (a few minutes) → once done, personas and reports are populated
 
 ---
 
@@ -126,6 +142,35 @@ infra/scripts/destroy-all.sh config/acme.yaml
 This deletes the 5 stacks in reverse order (including S3/DynamoDB data). For member account roles, delete the
 `lp2ps-readonly` stack separately in each member account.
 
+> ⚠ **Shared-account caveat — read this before deploying into an account that runs other API Gateway APIs.**
+> API Gateway keeps the IAM role used for API logging in an **account- and Region-wide setting**
+> (`AWS::ApiGateway::Account`), of which there can be only one per Region. This deployment sets that role and
+> deletes it on teardown, so the account-level setting is left pointing at a role that no longer exists. Any
+> **other** REST API in the same Region then stops writing CloudWatch logs until the setting is repointed.
+>
+> LP2PS assumes a dedicated tooling account, where this is the desired behavior — teardown leaves nothing
+> behind. If you must deploy into a shared account, change `cloudWatchRoleRemovalPolicy` in
+> `infra/lib/api-stack.ts` to `cdk.RemovalPolicy.RETAIN` before deploying; teardown will then leave the role
+> and the account-level setting intact, and you delete the role by hand when no other API needs it.
+
+After teardown, confirm nothing was left behind (all five commands should print nothing):
+
+```bash
+REGION=us-east-1   # your config's region:
+PREFIX=Lp2ps-acme  # Lp2ps-<customer>
+aws cloudformation list-stacks --region "$REGION" \
+  --query "StackSummaries[?starts_with(StackName,'$PREFIX') && StackStatus!='DELETE_COMPLETE'].StackName" --output text
+aws s3api list-buckets --query "Buckets[?contains(Name,'lp2ps')].Name" --output text
+aws dynamodb list-tables --region "$REGION" --query "TableNames[?contains(@,'p2ps')]" --output text
+aws iam list-roles --query "Roles[?starts_with(RoleName,'$PREFIX')].RoleName" --output text
+aws logs describe-log-groups --region "$REGION" \
+  --query "logGroups[?contains(logGroupName,'$PREFIX')].logGroupName" --output text
+```
+
+The bootstrap stack (`CDKToolkit`) and its staging bucket are **not** removed — they are shared by every CDK
+app in the account. Remove them only if nothing else uses CDK there:
+`aws cloudformation delete-stack --stack-name CDKToolkit --region "$REGION"`.
+
 ---
 
 ## Troubleshooting (common issues)
@@ -135,6 +180,8 @@ This deletes the 5 stacks in reverse order (including S3/DynamoDB data). For mem
 | `aws login required` | Run `aws sso login --profile <profile>`, then retry |
 | `not bootstrapped` | Rerun with the `--bootstrap` option |
 | `config parse failed` | Check that `customer:` and `region:` are at the leftmost column of the file |
+| `Password reset required (contact your administrator).` at sign-in | The user is still in `FORCE_CHANGE_PASSWORD`. Run the `admin-set-user-password --permanent` command in step 3-4 |
+| **User pools** is empty in the Cognito console | Wrong region. Switch the console region (top right) to your `region:`. Do not create a new pool |
 | Infinite loading after web login | This script guarantees ordering automatically, so this is rare. If it happens, rerun `deploy-all.sh` |
 | Old screen in web | Hard-refresh the browser (Cmd+Shift+R / Ctrl+Shift+R) |
 | Permission denied | Verify your login role is Admin |

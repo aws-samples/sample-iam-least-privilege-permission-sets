@@ -21,15 +21,27 @@ _ACCOUNT_RE = re.compile(r"^\d{12}$")  # AWS account id 12자리
 
 
 @router.get("/reports")
-def get_latest_report(account: str | None = None) -> ReportRef:
+def get_latest_report(account: str | None = None) -> ReportRef | None:
     """최신 run 의 리포트. account 지정 시 그 계정 리포트, 없으면 전체 통합.
 
     (기존엔 프론트가 하드코딩된 run_id 를 넘겨 실 API 에서 404→무한로딩 됐다.)
+
+    **리포트가 아직 없으면 404 가 아니라 200 + null 이다.** 이 endpoint 는 특정 리소스 조회가
+    아니라 "지금 볼 수 있는 최신 리포트가 있나"를 묻는 질의이고, '아직 없음'은 갓 배포한 고객의
+    **정상 상태**다(형제 endpoint 인 /catalog·/cleanup-backlog·/accounts·/metrics 는 모두 이
+    상태에서 200 + 빈 목록을 준다 — 유일하게 여기만 404 를 던져 화면에 붉은 오류로 보였다).
+    특정 run 을 지목하는 GET /reports/{run_id} 는 그대로 404 다 — 그건 진짜 not-found 다.
+
+    null 이 되는 두 경우:
+      (a) 완료된 run 이 없다 — 아직 전체 조회를 한 번도 돌리지 않았다.
+      (b) 완료된 run 은 있는데 exec_summary.json 이 없다 — 예: collect 단계에서 실패해 산출물을
+          남기지 못한 run. 실패 자체는 실행 이력 화면의 status 로 드러나므로 여기서 오류로
+          위장하지 않는다.
     """
     repos = get_repos()
     run_id = repos.latest_run_id()
-    if not run_id:
-        raise HTTPException(status_code=404, detail="실행 이력이 없습니다.")
+    if not run_id or not repos.run_artifact_exists(run_id, "exec_summary.json"):
+        return None
     return _build_report(run_id, account)
 
 

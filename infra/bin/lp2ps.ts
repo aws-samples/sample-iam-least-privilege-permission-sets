@@ -11,6 +11,7 @@ import * as cdk from "aws-cdk-lib";
 import { Aspects, Tags } from "aws-cdk-lib";
 import { AwsSolutionsChecks } from "cdk-nag";
 import { loadConfig, stackPrefix } from "../lib/config-loader";
+import { applyProviderLogGroupHygiene } from "../lib/cdk-provider-log-groups";
 import { DataStack } from "../lib/data-stack";
 import { AuthStack } from "../lib/auth-stack";
 import { EngineStack } from "../lib/engine-stack";
@@ -60,6 +61,12 @@ api.addDependency(engine);
 // 별도로 빌드 후 배포한다. 다른 스택과 독립(dist 는 이미 실 env 로 빌드됨).
 const web = new WebStack(app, `${prefix}-Web`, { env, cfg, dataBucket: data.dataBucket });
 web.addDependency(data);
+
+// CDK 자체 생성 커스텀리소스 Lambda(S3 auto-delete, BucketDeployment)의 로그그룹을 스택 소유로
+// 만든다. 기본 동작은 Lambda 서비스가 첫 호출 때 로그그룹을 암시적으로 만드는 것인데, 그 그룹은
+// 어떤 스택도 소유하지 않아 destroy-all.sh 이후에도 계정에 남는다(무기한 보존 + 정리 대상 누락).
+// 사유·구현은 lib/cdk-provider-log-groups.ts, 회귀 가드는 test/teardown.test.ts.
+applyProviderLogGroupHygiene(app);
 
 // 사용자 요청: 콘솔 리소스에 auto-delete=no 태그(테스트 리소스 자동삭제 방지 표식).
 Tags.of(app).add("auto-delete", "no");

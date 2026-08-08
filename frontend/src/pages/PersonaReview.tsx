@@ -212,7 +212,9 @@ function fmtLastUsed(iso: string | null): string {
 
 function useDownload() {
   return (filename: string, content: string, mime = "text/plain") => {
-    const blob = new Blob([content], { type: mime });
+    // charset 을 명시한다. 내용에 한국어(설명·주석)가 섞이는데, 선언이 없으면 열는 쪽이 로컬
+    // 인코딩을 가정해 깨질 수 있다.
+    const blob = new Blob([content], { type: mime.includes("charset") ? mime : `${mime};charset=utf-8` });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;

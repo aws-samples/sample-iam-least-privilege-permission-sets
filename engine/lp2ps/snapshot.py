@@ -76,14 +76,21 @@ def _write_dynamodb(run_row: Run, point: MetricsPoint) -> None:
     # 재실행 멱등(같은 run_id 재기록)은 정상 흐름이 아니므로 조건 위반은 로그만 남기고 완주(파일이 SoT).
     if runs_table:
         try:
+            # 허용되는 두 경우만 쓴다:
+            #  (a) 레코드가 없다 — CLI/로컬 트리거처럼 API 를 거치지 않은 run.
+            #  (b) 레코드가 있고 status == "running" — API POST /runs 가 시작 시점에 먼저 넣어둔
+            #      진행 중 레코드를 이번 종료 상태로 갱신하는, 정상 흐름.
+            # 그 외(이미 종료 상태인 run_id 재기록)는 여전히 거부해 멱등 위반을 잡아낸다.
             ddb.Table(runs_table).put_item(
                 Item=_to_ddb(run_row.model_dump()),
-                ConditionExpression="attribute_not_exists(run_id)",
+                ConditionExpression="attribute_not_exists(run_id) OR #s = :running",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":running": "running"},
             )
         except ClientError as e:
             if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
                 logging.getLogger("lp2ps.engine").warning(
-                    "run_id 충돌(runs 테이블에 이미 존재) — 덮어쓰지 않음: %s", run_row.run_id
+                    "run_id 충돌(runs 테이블에 이미 종료 상태로 존재) — 덮어쓰지 않음: %s", run_row.run_id
                 )
             else:
                 raise

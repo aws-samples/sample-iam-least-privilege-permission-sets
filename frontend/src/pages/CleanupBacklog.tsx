@@ -138,7 +138,11 @@ function toCsv(items: CleanupItem[]): string {
 }
 
 function download(items: CleanupItem[], filename: string) {
-  const blob = new Blob([toCsv(items)], { type: "text/csv" });
+  // UTF-8 BOM + charset 선언. 셀 값에 한국어가 들어가는데(risk_reasons·recommendation 등), BOM 이
+  // 없으면 Windows Excel 이 CSV 를 로컬 코드페이지로 읽어 전부 깨진다(ko-KR 은 CP949). BOM 이
+  // 있으면 Excel·LibreOffice·Numbers 모두 UTF-8 로 인식한다. RFC 4180 파서는 BOM 을 무시하거나
+  // 첫 헤더에 포함시키는데, pandas·csv 모듈처럼 utf-8-sig 로 읽는 쪽에서는 문제가 없다.
+  const blob = new Blob(["\ufeff" + toCsv(items)], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;

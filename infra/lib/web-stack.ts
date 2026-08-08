@@ -9,6 +9,7 @@
  */
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
+import * as fs from "fs";
 import * as path from "path";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
@@ -24,6 +25,36 @@ export interface WebStackProps extends cdk.StackProps {
 }
 
 const DIST = path.join(__dirname, "..", "..", "frontend", "dist");
+
+/**
+ * Staging directory used in place of `frontend/dist` when it does not exist yet.
+ *
+ * CDK evaluates every stack in bin/lp2ps.ts on any command -- `deploy` of a single unrelated stack,
+ * `synth`, and `bootstrap` included -- so an unconditional `Source.asset(DIST)` makes a missing dist
+ * fail all of them. That is a deadlock on a fresh clone, because dist can only be built after Api and
+ * Auth are deployed (build-web.sh reads their stack outputs) and deploying them requires a synth.
+ *
+ * Resolution: fall back to a placeholder so unrelated commands synthesize. The web stack is only ever
+ * deployed by deploy-all.sh phase [4], which runs after build-web.sh has produced the real dist, so
+ * the placeholder is not what gets served on the scripted path. It is reachable by deploying the web
+ * stack by hand without building the frontend first, hence the warning.
+ */
+function resolveWebAssetDir(scope: Construct): string {
+  if (fs.existsSync(DIST)) return DIST;
+
+  const placeholder = path.join(cdk.Stage.of(scope)?.assetOutdir ?? ".", "lp2ps-web-placeholder");
+  fs.mkdirSync(placeholder, { recursive: true });
+  fs.writeFileSync(
+    path.join(placeholder, "index.html"),
+    "<!doctype html><title>LP2PS</title><p>Frontend not built. Run infra/scripts/build-web.sh.\n",
+  );
+  cdk.Annotations.of(scope).addWarning(
+    "frontend/dist not found -- the web stack will synthesize with a placeholder page. Build the " +
+      "frontend first (infra/scripts/build-web.sh <prefix>), or use infra/scripts/deploy-all.sh, " +
+      "which builds it in the correct order.",
+  );
+  return placeholder;
+}
 
 export class WebStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: WebStackProps) {
@@ -126,7 +157,7 @@ export class WebStack extends cdk.Stack {
     });
 
     new s3deploy.BucketDeployment(this, "DeployWeb", {
-      sources: [s3deploy.Source.asset(DIST)],
+      sources: [s3deploy.Source.asset(resolveWebAssetDir(this))],
       destinationBucket: siteBucket,
       distribution,
       distributionPaths: ["/*"], // 배포 시 CloudFront 캐시 무효화
