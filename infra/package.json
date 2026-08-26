@@ -15,15 +15,15 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "aws-cdk": "^2.160.0",
+    "aws-cdk": "^2.1138.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.5.0"
   },
   "dependencies": {
-    "aws-cdk-lib": "^2.160.0",
+    "@types/js-yaml": "^4.0.9",
+    "aws-cdk-lib": "^2.266.0",
     "cdk-nag": "^2.28.0",
     "constructs": "^10.3.0",
-    "js-yaml": "^4.3.1",
-    "@types/js-yaml": "^4.0.9"
+    "js-yaml": "^4.3.1"
   }
 }

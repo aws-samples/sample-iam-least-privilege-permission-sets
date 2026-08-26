@@ -4,7 +4,7 @@ LP2PS uses the open-source components listed below, each distributed under its o
 No copyleft dependency (GPL / LGPL / AGPL / SSPL) is present in any component, at runtime or
 at build time. CI enforces this.
 
-Measured 2026-08-05 on a clean checkout installed from public registries only
+Measured 2026-08-26 on a clean checkout installed from public registries only
 (`registry.npmjs.org`, `pypi.org`). To reproduce:
 
 ```
@@ -52,26 +52,26 @@ Production closure measured in a virtualenv installed without development extras
 
 ### JavaScript / TypeScript — frontend
 
-Production closure: 66 third-party packages — MIT 44, Apache-2.0 13, BSD-3-Clause 6,
+Production closure: 67 third-party packages — MIT 45, Apache-2.0 13, BSD-3-Clause 6,
 0BSD 2, BSD-2-Clause 1. Direct dependencies:
 
 | Component | Version | License |
 |---|---|---|
 | react | 18.3.1 | MIT |
 | react-dom | 18.3.1 | MIT |
-| react-router-dom | 6.30.4 | MIT |
+| react-router-dom | 7.18.2 | MIT |
 | @cloudscape-design/components | 3.0.1328 | Apache-2.0 |
 | @cloudscape-design/global-styles | 1.0.62 | Apache-2.0 |
 | amazon-cognito-identity-js | 6.3.20 | Apache-2.0 |
 
 ### JavaScript / TypeScript — infra (CDK)
 
-Production closure: 27 third-party packages — MIT 12, Apache-2.0 9, ISC 4, and the three
+Production closure: 27 third-party packages — MIT 12, Apache-2.0 9, ISC 3, and the three
 listed under "Build- and development-time only" below. Direct dependencies:
 
 | Component | Version | License |
 |---|---|---|
-| aws-cdk-lib | 2.261.0 | Apache-2.0 |
+| aws-cdk-lib | 2.266.0 | Apache-2.0 |
 | constructs | 10.6.0 | Apache-2.0 |
 | cdk-nag | 2.38.2 | Apache-2.0 |
 | js-yaml | 4.3.0 | MIT |
