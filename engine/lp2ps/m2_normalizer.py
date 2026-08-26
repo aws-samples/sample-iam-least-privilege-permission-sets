@@ -33,6 +33,37 @@ if TYPE_CHECKING:  # pragma: no cover
 
 _NO_DATE_SENTINELS = frozenset({"", "N/A", "no_information", "not_supported"})
 
+# AWS 가 소유·관리하는 역할 경로. 이 경로의 역할은 사람이 쓰는 신원이 아니라 서비스 실행 주체이므로
+# persona 군집 대상에서 제외한다(`is_exception=True`) — 섞이면 (a) 서비스 전용 action 이 사람용 정책에
+# 합성되고, (b) 서비스 역할 수가 min_members_for_persona 를 채워 실재하지 않는 persona 가 생긴다.
+# 제외는 M5 카탈로그에만 적용된다(M6 cleanup·스냅샷 지표는 `is_exception` 을 보지 않으므로 미사용
+# 서비스 역할도 계속 조치 대상으로 남는다).
+_SERVICE_LINKED_PATH = "/aws-service-role/"
+# IdC 가 PS 할당 시 자동 생성하는 역할. 사람의 실제 접근 기록이지만 직접 수정하면 IdC 동기화가
+# 덮어쓴다 → persona 대상이 아니다. (사용 실적을 PS 레코드로 귀속시키는 것은 후속 과제.)
+_IDC_RESERVED_PATH = "/aws-reserved/sso.amazonaws.com/"
+
+EXC_SERVICE_LINKED = "service_linked"
+EXC_IDC_RESERVED = "idc_reserved"
+# sso_ps 는 IAM principal 이 아니라 "PS 할당 1건"을 나타내는 합성 레코드다(principal 필드가 ARN 이 아닌
+# `sso_ps::<account>::<PS>::<id>` 키). persona 정책을 여기에 붙일 수는 없고, 같은 사람의 접근은 이미
+# AWSReservedSSO_* 역할로도 잡혀 있다 → persona 군집 대상에서 제외한다. PS 마이그레이션 비율
+# (`snapshot._metrics_for`)은 `is_exception` 을 보지 않으므로 분자로 계속 집계된다.
+EXC_SSO_PS = "sso_ps_synthetic"
+
+
+def _exception_type(arn: str) -> str | None:
+    """persona 대상에서 제외할 principal 이면 그 사유, 아니면 None.
+
+    ARN 경로로 판정한다 — credential_report 가 degraded 여도(인벤토리 밖 principal) 동일하게 판정되어야
+    하므로 수집된 `path` 대신 ARN 을 본다.
+    """
+    if _SERVICE_LINKED_PATH in arn:
+        return EXC_SERVICE_LINKED
+    if _IDC_RESERVED_PATH in arn:
+        return EXC_IDC_RESERVED
+    return None
+
 
 def normalize(storage: "Storage", run: "RunContext") -> list[PrincipalRecord]:
     """raw/** → PrincipalRecord[] (정렬됨) 를 만들고 normalized.parquet 로 기록."""
@@ -96,6 +127,7 @@ def _normalize_account(
 
         identity_type = p.get("identity_type", "role") if in_inventory else _identity_from_arn(arn)
         has_managed = bool(p.get("attached_policies")) if in_inventory else False
+        exc_type = _exception_type(arn)
 
         records.append(
             PrincipalRecord(
@@ -109,6 +141,8 @@ def _normalize_account(
                 console_login=_console_login(cred_row),
                 has_managed_policies=has_managed,
                 access_key_age_days=_access_key_age_days(cred_row, as_of),
+                is_exception=exc_type is not None,
+                exception_type=exc_type,
                 source=sorted(contributing),
                 run_id=run_id,
             )
@@ -116,12 +150,47 @@ def _normalize_account(
 
     # IdC Permission Set 할당 → sso_ps principal 레코드(PS 기반 사람 접근).
     # 마이그레이션 스냅샷 비율(사람 접근 중 PS 기반 비율) 산출에 쓰인다.
-    records.extend(_sso_ps_records(account_id, raw.get(IDC, {}), run_id))
+    # 같은 사람의 접근은 (a) 이 sso_ps 레코드와 (b) IdC 가 대상 계정에 만든 AWSReservedSSO_* 역할
+    # 두 곳에 나뉘어 있고, 실사용 action 은 (b) 에만 기록된다 → PS 별로 (b) 의 실사용을 귀속시킨다.
+    # 그래야 "이 PS 가 과다권한인가"를 granted−used 로 판정할 수 있다.
+    records.extend(_sso_ps_records(account_id, raw.get(IDC, {}), run_id, records))
     return records
 
 
-def _sso_ps_records(account_id: str, idc_raw: dict, run_id: str) -> list[PrincipalRecord]:
+def _reserved_sso_usage(records: list[PrincipalRecord]) -> dict[str, list[UsedAction]]:
+    """AWSReservedSSO_<PS이름>_<suffix> 역할의 실사용을 PS 이름별로 합친다.
+
+    역할명은 IdC 가 `AWSReservedSSO_{PermissionSetName}_{16자리hex}` 로 만든다. PS 이름 자체에 `_` 가
+    있을 수 있으므로 **마지막** `_` 를 기준으로 suffix 만 떼어낸다.
+    """
+    by_ps: dict[str, dict[str, UsedAction]] = {}
+    for r in records:
+        if _IDC_RESERVED_PATH not in r.principal or not r.used_actions:
+            continue
+        role_name = r.principal.rsplit("/", 1)[-1]
+        if not role_name.startswith("AWSReservedSSO_"):
+            continue
+        stem = role_name[len("AWSReservedSSO_") :]
+        ps_name = stem.rsplit("_", 1)[0] if "_" in stem else stem
+        if not ps_name:
+            continue
+        bucket = by_ps.setdefault(ps_name, {})
+        for u in r.used_actions:
+            prev = bucket.get(u.action)
+            if prev is None:
+                bucket[u.action] = u.model_copy()
+            else:
+                # 같은 action 이 여러 예약 역할에 있으면 호출수 합·최근 시각 채택(결정론).
+                prev.count_90d += u.count_90d
+                prev.last_used = max_ts(prev.last_used, u.last_used)
+    return {ps: sorted(b.values(), key=lambda u: u.action) for ps, b in by_ps.items()}
+
+
+def _sso_ps_records(
+    account_id: str, idc_raw: dict, run_id: str, iam_records: list[PrincipalRecord]
+) -> list[PrincipalRecord]:
     """IdC account assignment → identity_type='sso_ps' 레코드(할당 principal 당 1건, 중복 제거)."""
+    usage_by_ps = _reserved_sso_usage(iam_records)
     seen: set[str] = set()
     out: list[PrincipalRecord] = []
     for a in idc_raw.get("permission_set_assignments", []) or []:
@@ -139,6 +208,14 @@ def _sso_ps_records(account_id: str, idc_raw: dict, run_id: str) -> list[Princip
                 account_id=account_id,
                 principal=key,
                 identity_type="sso_ps",
+                # 이 PS 로 실제 호출된 action(대상 계정의 AWSReservedSSO_* 역할에서 귀속).
+                # granted 는 PS 정책 문서를 수집하지 않아 아직 비어 있다(후속) → 지금은 미사용 갭 계산
+                # 대상이 아니고, "이 PS 가 실제로 쓰이는지"까지만 판정한다.
+                used_actions=usage_by_ps.get(ps, []),
+                # used_actions 가 채워지면서 M5 의 active 필터(used_actions 존재)를 통과하게 됐다 →
+                # 합성 레코드가 persona 멤버로 군집되어 UI 가 PS 이름을 계정으로 오인한다. 명시적 제외.
+                is_exception=True,
+                exception_type=EXC_SSO_PS,
                 source=[IDC],
                 run_id=run_id,
             )

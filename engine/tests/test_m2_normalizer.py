@@ -228,3 +228,114 @@ def test_principal_survives_credential_report_degraded(tmp_path) -> None:
     assert "UnusedIAMRole" in r.unused_findings
     assert r.source == ["analyzer_unused"]  # credential_report 는 기여 안 함(인벤토리 없음)
     assert r.identity_type == "role"  # ARN 모양에서 추정
+
+
+# ---- 서비스 소유 역할은 persona 대상에서 제외(is_exception) ----
+
+_SLR = f"arn:aws:iam::{ACCOUNT}:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig"
+_SSO = f"arn:aws:iam::{ACCOUNT}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Admin_abc123"
+
+
+def _seed_principal(storage: LocalFSStorage, arn: str, path: str) -> None:
+    """arn 1건만 있는 최소 credential_report + 실사용 1건(persona 대상 조건 충족)."""
+    storage.write_raw(
+        ACCOUNT,
+        "credential_report",
+        {
+            "account_id": ACCOUNT,
+            "principals": [
+                {
+                    "principal": arn,
+                    "name": arn.rsplit("/", 1)[-1],
+                    "identity_type": "role",
+                    "inline_policies": [
+                        {
+                            "name": "inline",
+                            "document": {
+                                "Statement": [
+                                    {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}
+                                ]
+                            },
+                        }
+                    ],
+                    "attached_policies": [],
+                    "path": path,
+                }
+            ],
+            "credential_report": [],
+        },
+    )
+
+
+def test_service_linked_role_marked_exception(tmp_path) -> None:
+    """서비스 연결 역할 → is_exception=True(m5 카탈로그가 제외). 사람이 쓰는 신원이 아니다."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_principal(storage, _SLR, "/aws-service-role/config.amazonaws.com/")
+    r = normalize(storage, RUN)[0]
+    assert r.is_exception is True
+    assert r.exception_type == "service_linked"
+
+
+def test_idc_reserved_role_marked_exception(tmp_path) -> None:
+    """IdC 가 자동 생성한 AWSReservedSSO_* 역할 → is_exception=True(직접 수정 시 동기화가 덮어씀)."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_principal(storage, _SSO, "/aws-reserved/sso.amazonaws.com/")
+    r = normalize(storage, RUN)[0]
+    assert r.is_exception is True
+    assert r.exception_type == "idc_reserved"
+
+
+def test_ordinary_role_not_exception(tmp_path) -> None:
+    """대조군 — 일반 역할은 제외되지 않는다(위 두 테스트가 무조건 통과하는 게 아님을 보장)."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_principal(storage, ARN, "/")
+    r = normalize(storage, RUN)[0]
+    assert r.is_exception is False
+    assert r.exception_type is None
+
+
+def test_exception_detected_without_inventory(tmp_path) -> None:
+    """credential_report degraded(인벤토리 없음)여도 ARN 경로로 판정된다 — path 필드에 의존하지 않는다."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    storage.write_raw(ACCOUNT, "credential_report",
+                      {"account_id": ACCOUNT, "principals": [], "credential_report": []})
+    storage.write_raw(ACCOUNT, "analyzer_unused",
+                      {"account_id": ACCOUNT, "analyzer_arn": "arn:x",
+                       "findings": [{"id": "f1", "finding_type": "UnusedIAMRole",
+                                     "resource": _SLR, "resource_type": "AWS::IAM::Role",
+                                     "status": "ACTIVE"}]})
+    r = normalize(storage, RUN)[0]
+    assert r.is_exception is True
+    assert r.exception_type == "service_linked"
+
+
+def test_excluded_from_catalog_but_kept_in_cleanup(tmp_path) -> None:
+    """제외는 M5 카탈로그에만 적용 — 미사용 서비스 역할은 M6 조치 항목에 그대로 남아야 한다."""
+    from lp2ps.config import CatalogConfig
+    from lp2ps.m5_catalog import build_catalog
+    from lp2ps.m6_reporter import _cleanup_items
+    from lp2ps.models import UsedAction
+
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_principal(storage, _SLR, "/aws-service-role/config.amazonaws.com/")
+    records = normalize(storage, RUN)
+    # 실사용을 붙여 persona 후보 조건(used_actions 존재)을 만족시킨다.
+    records[0].used_actions = [UsedAction(action="s3:GetObject", last_used="2026-07-10T00:00:00Z")]
+    storage.write_normalized(records)
+
+    catalog = build_catalog(storage, RUN, CatalogConfig(min_members_for_persona=1))
+    members = [m for e in catalog for m in e.members]
+    assert _SLR not in members, "서비스 연결 역할이 persona 멤버로 남으면 안 됨"
+
+    # M6 은 is_exception 을 보지 않으므로 미사용 역할 조치 항목은 유지된다.
+    records[0].used_actions = []
+    items = _cleanup_items(records, _cfg_for_cleanup())
+    assert any(i.type == "unused_role" and i.principal == _SLR for i in items), \
+        "제외가 조치 항목까지 지우면 안 됨(미사용 서비스 역할도 정리 대상)"
+
+
+def _cfg_for_cleanup():
+    from lp2ps.config import Config
+    return Config.model_validate(
+        {"customer": "test", "region": "us-west-2", "cross_account": False, "accounts": ["self"]}
+    )
