@@ -9,6 +9,7 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import Button from "@cloudscape-design/components/button";
 import Badge from "@cloudscape-design/components/badge";
 import Popover from "@cloudscape-design/components/popover";
+import Input from "@cloudscape-design/components/input";
 import Toggle from "@cloudscape-design/components/toggle";
 import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import ExpandableSection from "@cloudscape-design/components/expandable-section";
@@ -106,16 +107,68 @@ function sourceMeta(s: string): SourceMeta {
   return SOURCE_META[s] ?? { label: s, color: "grey", desc: "" };
 }
 
-// persona 멤버 ARN(arn:aws:iam::<account>:...) → 계정별 멤버 수(계정 asc). 전체 뷰에서 persona 가
-// 어느 계정에 얼마나 걸쳐 있는지 보여준다.
+// 멤버 principal 에서 계정 ID 를 뽑는다. IAM ARN(arn:aws:iam::<account>:...) 의 5번째 필드가 계정이지만
+// 그 자리가 12자리 숫자가 아닌 문자열(엔진의 합성 레코드 등)이면 계정으로 쓰면 안 된다 — 그대로 넣으면
+// 계정 그룹핑에 존재하지 않는 "계정"이 생긴다. 판별 불가는 "?" 로 모은다.
+const ACCOUNT_ID = /^\d{12}$/;
+
+export function accountOf(principal: string): string {
+  const parts = principal.split(":");
+  const candidate = parts.length > 4 ? parts[4] : "";
+  return ACCOUNT_ID.test(candidate) ? candidate : "?";
+}
+
+// persona 멤버 → 계정별 멤버 수(계정 asc). 전체 뷰에서 persona 가 어느 계정에 얼마나 걸쳐 있는지 보여준다.
 function membersByAccount(members: string[]): { account: string; count: number }[] {
   const counts = new Map<string, number>();
   for (const m of members) {
-    const parts = m.split(":");
-    const acct = parts.length > 4 ? parts[4] : "?";
+    const acct = accountOf(m);
     counts.set(acct, (counts.get(acct) ?? 0) + 1);
   }
   return [...counts.entries()].map(([account, count]) => ({ account, count })).sort((a, b) => a.account.localeCompare(b.account));
+}
+
+// ---- 멤버 principal 표시 ----
+// 개수만 보여주면 "이 persona 정책을 누구에게 적용하나"에 답이 안 된다(IdC 미사용 환경에서는 이 ARN 이
+// 곧 적용 대상). ARN 은 100자를 넘어 표에 그대로 넣으면 레이아웃이 깨지므로 이름·계정을 주 표시로,
+// ARN 은 복사용으로 둔다(CLI·Terraform 적용에 필요).
+export interface MemberRef {
+  arn: string;
+  name: string;      // ARN 마지막 세그먼트(역할/사용자 이름)
+  account: string;
+  kind: "user" | "role";
+}
+
+export function parseMember(arn: string): MemberRef {
+  return {
+    arn,
+    name: arn.split("/").pop() || arn,
+    account: accountOf(arn),
+    kind: arn.includes(":user/") ? "user" : "role",
+  };
+}
+
+function MemberList({ members }: { members: string[] }) {
+  const refs = members.map(parseMember).sort((a, b) => a.name.localeCompare(b.name));
+  return (
+    <SpaceBetween size="xxs">
+      {refs.map((m) => (
+        <SpaceBetween key={m.arn} direction="horizontal" size="xxs">
+          <Box fontSize="body-s" fontWeight="bold">{m.name}</Box>
+          <Badge color={m.kind === "user" ? "red" : "grey"}>{m.kind === "user" ? "IAM 사용자" : "역할"}</Badge>
+          <Popover
+            dismissButton={false}
+            position="top"
+            size="large"
+            triggerType="text"
+            content={<Box fontSize="body-s">{m.arn}</Box>}
+          >
+            <Box fontSize="body-s" color="text-status-info">ARN</Box>
+          </Popover>
+        </SpaceBetween>
+      ))}
+    </SpaceBetween>
+  );
 }
 
 // persona 카탈로그 표의 컬럼 정의(전체 뷰·계정별 섹션 공통 재사용). selectedAccount 가 없고 persona 가
@@ -123,7 +176,7 @@ function membersByAccount(members: string[]): { account: string; count: number }
 function catalogColumns(selectedAccount: string, openEditor: (e: CatalogEntry) => void) {
   return [
     {
-      id: "persona", header: "Persona", minWidth: 180,
+      id: "persona", header: "Persona", minWidth: 150,
       cell: (e: CatalogEntry) => (
         <SpaceBetween direction="horizontal" size="xs">
           <Box fontWeight="bold">{e.persona}</Box>
@@ -131,26 +184,36 @@ function catalogColumns(selectedAccount: string, openEditor: (e: CatalogEntry) =
         </SpaceBetween>
       ),
     },
-    { id: "desc", header: "설명", cell: (e: CatalogEntry) => e.description },
+    // minWidth 없이 두면 멤버 컬럼(260)에 밀려 설명이 한 글자씩 세로로 접힌다.
+    { id: "desc", header: "설명", minWidth: 160, cell: (e: CatalogEntry) => e.description },
     {
-      id: "members", header: "멤버(principal)", minWidth: 160,
+      id: "members", header: "멤버(principal)", minWidth: 200,
       cell: (e: CatalogEntry) => {
         const byAcct = membersByAccount(e.members);
-        if (!selectedAccount && byAcct.length > 1) {
-          return (
+        // 여러 계정에 걸친 persona 는 계정별 분해를 먼저 보여준 뒤 접이식으로 principal 목록.
+        const header = !selectedAccount && byAcct.length > 1
+          ? (
             <SpaceBetween size="xxs">
               <Box fontWeight="bold">{e.member_count.toLocaleString()} (전체)</Box>
               {byAcct.map((b) => (
                 <Box key={b.account} fontSize="body-s" color="text-body-secondary">{b.account}: {b.count.toLocaleString()}</Box>
               ))}
             </SpaceBetween>
-          );
-        }
-        return e.member_count.toLocaleString();
+          )
+          : <Box fontWeight="bold">{e.member_count.toLocaleString()}</Box>;
+        if (e.members.length === 0) return header;
+        return (
+          <SpaceBetween size="xxs">
+            {header}
+            <ExpandableSection headerText="적용 대상 보기" variant="footer">
+              <MemberList members={e.members} />
+            </ExpandableSection>
+          </SpaceBetween>
+        );
       },
     },
     {
-      id: "source", header: "합성 소스", minWidth: 200,
+      id: "source", header: "합성 소스", minWidth: 160,
       cell: (e: CatalogEntry) => {
         const srcs = e.contributing_sources ?? [];
         const highConf = e.synthesis_source === "access_analyzer";
@@ -176,7 +239,7 @@ function catalogColumns(selectedAccount: string, openEditor: (e: CatalogEntry) =
         );
       },
     },
-    { id: "status", header: "상태", width: 100, cell: (e: CatalogEntry) => statusIndicator(e.approval_status) },
+    { id: "status", header: "상태", width: 90, minWidth: 90, cell: (e: CatalogEntry) => statusIndicator(e.approval_status) },
     { id: "action", header: "", width: 130, minWidth: 130, cell: (e: CatalogEntry) => <Button onClick={() => openEditor(e)}><span style={{ whiteSpace: "nowrap" }}>정책 편집</span></Button> },
   ];
 }
@@ -210,6 +273,102 @@ function fmtLastUsed(iso: string | null): string {
   return iso.slice(0, 10); // YYYY-MM-DD
 }
 
+// ---- principal → persona 역방향 조회 ----
+// 운영자는 "이 역할에 무엇을 적용하나"로 접근한다(persona 목록에서 사람을 찾는 방향이 아니다).
+// 한 principal 은 정확히 하나의 persona 에 속한다(m5_catalog 가 배타적으로 군집) → 1:1 로 표시.
+export interface ReverseHit {
+  member: MemberRef;
+  persona: CatalogEntry;
+}
+
+export function reverseIndex(catalog: CatalogEntry[], query: string): ReverseHit[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  const hits: ReverseHit[] = [];
+  for (const persona of catalog) {
+    for (const arn of persona.members) {
+      const member = parseMember(arn);
+      if (member.arn.toLowerCase().includes(q) || member.name.toLowerCase().includes(q)) {
+        hits.push({ member, persona });
+      }
+    }
+  }
+  return hits.sort((a, b) => a.member.name.localeCompare(b.member.name));
+}
+
+function PrincipalLookup({ catalog, onOpen }: { catalog: CatalogEntry[]; onOpen: (e: CatalogEntry) => void }) {
+  const [query, setQuery] = useState("");
+  const hits = useMemo(() => reverseIndex(catalog, query), [catalog, query]);
+  const searched = query.trim().length > 0;
+  return (
+    <Container
+      header={
+        <Header
+          variant="h2"
+          description="역할·사용자 이름으로 검색해 어떤 persona 정책을 적용할지 찾습니다."
+        >
+          적용 대상 조회 (principal → persona)
+        </Header>
+      }
+    >
+      <SpaceBetween size="s">
+        <Input
+          value={query}
+          onChange={(e) => setQuery(e.detail.value)}
+          placeholder="역할 이름 또는 ARN 일부 (예: data-eng)"
+          type="search"
+        />
+        {searched && hits.length === 0 && (
+          <Alert type="info" header="이 이름으로 카탈로그에 등록된 principal 이 없습니다">
+            persona 카탈로그는 <b>90일간 실사용 기록이 있는 principal</b> 만 담습니다. 검색 결과가 없다면
+            추천이 없다는 뜻이 아니라, 대개 다음 중 하나입니다.
+            <ul>
+              <li><b>미사용</b> — 적용 대상이 아니라 회수 대상입니다. <b>조치 필요 항목</b> 화면에서 확인하세요.</li>
+              <li><b>서비스 소유 역할</b> — 서비스 연결 역할·IdC 예약 역할은 사람이 쓰는 신원이 아니라 제외됩니다.</li>
+              <li>이름 오타 또는 다른 계정의 principal(계정 선택기 확인)</li>
+            </ul>
+          </Alert>
+        )}
+        {hits.length > 0 && (
+          <Table
+            variant="embedded"
+            wrapLines
+            items={hits}
+            columnDefinitions={[
+              {
+                id: "principal", header: "Principal", minWidth: 220,
+                cell: (h: ReverseHit) => (
+                  <SpaceBetween direction="horizontal" size="xxs">
+                    <Box fontWeight="bold">{h.member.name}</Box>
+                    <Badge color={h.member.kind === "user" ? "red" : "grey"}>
+                      {h.member.kind === "user" ? "IAM 사용자" : "역할"}
+                    </Badge>
+                  </SpaceBetween>
+                ),
+              },
+              { id: "account", header: "계정", cell: (h: ReverseHit) => h.member.account },
+              {
+                id: "persona", header: "추천 persona", minWidth: 180,
+                cell: (h: ReverseHit) => <Box fontWeight="bold">{h.persona.persona}</Box>,
+              },
+              {
+                id: "status", header: "승인 상태",
+                cell: (h: ReverseHit) => statusIndicator(h.persona.approval_status),
+              },
+              {
+                id: "act", header: "", minWidth: 110,
+                cell: (h: ReverseHit) => (
+                  <Button variant="inline-link" onClick={() => onOpen(h.persona)}>정책 보기</Button>
+                ),
+              },
+            ]}
+          />
+        )}
+      </SpaceBetween>
+    </Container>
+  );
+}
+
 function useDownload() {
   return (filename: string, content: string, mime = "text/plain") => {
     // charset 을 명시한다. 내용에 한국어(설명·주석)가 섞이는데, 선언이 없으면 열는 쪽이 로컬
@@ -235,7 +394,7 @@ export default function PersonaReview() {
     if (!selectedAccount) return allCatalog;
     return allCatalog
       .map((e) => {
-        const members = e.members.filter((m) => m.includes(`:${selectedAccount}:`));
+        const members = e.members.filter((m) => accountOf(m) === selectedAccount);
         return { ...e, members, member_count: members.length };
       })
       .filter((e) => e.members.length > 0);
@@ -354,15 +513,15 @@ export default function PersonaReview() {
     );
   } else {
     // members ARN 으로 계정 추출 → 계정별 persona 묶음(persona 가 여러 계정에 걸치면 각 계정 섹션에 등장).
-    const accts = [...new Set(catalog.flatMap((e) => e.members.map((m) => m.split(":")[4] || "?")))].sort();
+    const accts = [...new Set(catalog.flatMap((e) => e.members.map(accountOf)))].sort();
     catalogView = (
       <SpaceBetween size="s">
         <Box variant="h2">Persona 카탈로그 · 전체 계정 ({accts.length}개 계정)</Box>
         {accts.map((acct) => {
           const rows = catalog
-            .filter((e) => e.members.some((m) => m.includes(`:${acct}:`)))
+            .filter((e) => e.members.some((m) => accountOf(m) === acct))
             .map((e) => {
-              const members = e.members.filter((m) => m.includes(`:${acct}:`));
+              const members = e.members.filter((m) => accountOf(m) === acct);
               return { ...e, members, member_count: members.length };
             });
           return (
@@ -379,6 +538,7 @@ export default function PersonaReview() {
   return (
     <ContentLayout header={<Header variant="h1" description={`실사용 기반 bottom-up persona 카탈로그. ${selectedAccount ? `계정 ${selectedAccount}` : "전체 계정 — 계정별로 구분"}`}>Persona 검토</Header>}>
       <SpaceBetween size="l">
+        <PrincipalLookup catalog={catalog} onOpen={openEditor} />
         {catalogView}
 
         {selected && (
