@@ -8,7 +8,9 @@ import Spinner from "@cloudscape-design/components/spinner";
 import Box from "@cloudscape-design/components/box";
 import { USING_MOCKS } from "@/api/client";
 import { cognitoConfigured, getIdToken, signOut } from "@/auth/cognito";
+import SplitPanel from "@cloudscape-design/components/split-panel";
 import { AccountProvider, useAccounts } from "@/AccountContext";
+import { SplitPanelProvider, useSplitPanel } from "@/SplitPanelContext";
 import Login from "@/auth/Login";
 
 import Dashboard from "@/pages/Dashboard";
@@ -62,7 +64,9 @@ export default function App() {
   }
   return (
     <AccountProvider>
-      <Shell onSignOut={() => { signOut(); setAuthed(false); }} />
+      <SplitPanelProvider>
+        <Shell onSignOut={() => { signOut(); setAuthed(false); }} />
+      </SplitPanelProvider>
     </AccountProvider>
   );
 }
@@ -71,6 +75,7 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
   const navigate = useNavigate();
   const location = useLocation();
   const { accounts, selected, setSelected } = useAccounts();
+  const panel = useSplitPanel();
 
   // 계정 선택기: "전체 계정"(통합) + 계정별. 관제 계정을 골라도 전체가 기본이므로 "전체"가 첫 항목.
   // Cloudscape menu-dropdown 은 빈 문자열 id 를 안정적으로 전달하지 못하므로 "__all__" 센티넬 사용.
@@ -120,6 +125,35 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
       <AppLayout
         headerSelector="#top-nav"
         toolsHide
+        // 우측 슬라이드 패널. 페이지가 SplitPanelContext 로 내용을 등록하면 여기서 렌더된다.
+        // content 가 null 이면 prop 을 아예 넘기지 않는다 — 넘기면 내용이 없는데도 하단에 빈
+        // 패널 토글 바가 남는다.
+        splitPanelOpen={panel.open}
+        onSplitPanelToggle={(e) => panel.setOpen(e.detail.open)}
+        // position="side" 고정: 아래(bottom)에 붙으면 "하단에 나와서 불편하다"는 원래 문제로 돌아간다.
+        splitPanelPreferences={{ position: "side" }}
+        splitPanel={
+          panel.content ? (
+            <SplitPanel
+              header={panel.header}
+              hidePreferencesButton
+              i18nStrings={{
+                closeButtonAriaLabel: "패널 닫기",
+                openButtonAriaLabel: "패널 열기",
+                resizeHandleAriaLabel: "패널 크기 조절",
+                preferencesTitle: "분할 패널 설정",
+                preferencesPositionLabel: "패널 위치",
+                preferencesPositionDescription: "패널을 화면 아래 또는 옆에 배치합니다.",
+                preferencesPositionSide: "옆",
+                preferencesPositionBottom: "아래",
+                preferencesConfirm: "확인",
+                preferencesCancel: "취소",
+              }}
+            >
+              {panel.content}
+            </SplitPanel>
+          ) : undefined
+        }
         navigation={
           <SideNavigation
             activeHref={location.pathname}

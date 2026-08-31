@@ -1,9 +1,8 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import ContentLayout from "@cloudscape-design/components/content-layout";
 import Header from "@cloudscape-design/components/header";
 import Container from "@cloudscape-design/components/container";
 import Table from "@cloudscape-design/components/table";
-import Grid from "@cloudscape-design/components/grid";
 import Box from "@cloudscape-design/components/box";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Button from "@cloudscape-design/components/button";
@@ -18,10 +17,15 @@ import Modal from "@cloudscape-design/components/modal";
 import Spinner from "@cloudscape-design/components/spinner";
 import Alert from "@cloudscape-design/components/alert";
 import Textarea from "@cloudscape-design/components/textarea";
+import Tabs from "@cloudscape-design/components/tabs";
 import { api } from "@/api/client";
 import { useAsync } from "@/api/useAsync";
 import { useAccounts } from "@/AccountContext";
-import type { CatalogEntry, PolicyAction, TerraformArtifact } from "@/api/types";
+import { useSplitPanel } from "@/SplitPanelContext";
+import type { CatalogEntry, PolicyAction, PrincipalKind, TerraformArtifact } from "@/api/types";
+
+/** 우측 패널 탭. 슬롯이 하나라 두 화면을 탭으로 합친다. */
+type PanelTab = "policy" | "targets";
 
 function statusIndicator(s: CatalogEntry["approval_status"]) {
   if (s === "approved") return <StatusIndicator type="success">승인</StatusIndicator>;
@@ -148,32 +152,9 @@ export function parseMember(arn: string): MemberRef {
   };
 }
 
-function MemberList({ members }: { members: string[] }) {
-  const refs = members.map(parseMember).sort((a, b) => a.name.localeCompare(b.name));
-  return (
-    <SpaceBetween size="xxs">
-      {refs.map((m) => (
-        <SpaceBetween key={m.arn} direction="horizontal" size="xxs">
-          <Box fontSize="body-s" fontWeight="bold">{m.name}</Box>
-          <Badge color={m.kind === "user" ? "red" : "grey"}>{m.kind === "user" ? "IAM 사용자" : "역할"}</Badge>
-          <Popover
-            dismissButton={false}
-            position="top"
-            size="large"
-            triggerType="text"
-            content={<Box fontSize="body-s">{m.arn}</Box>}
-          >
-            <Box fontSize="body-s" color="text-status-info">ARN</Box>
-          </Popover>
-        </SpaceBetween>
-      ))}
-    </SpaceBetween>
-  );
-}
-
 // persona 카탈로그 표의 컬럼 정의(전체 뷰·계정별 섹션 공통 재사용). selectedAccount 가 없고 persona 가
 // 여러 계정에 걸치면 멤버 컬럼에 계정별 분해를 보여준다.
-function catalogColumns(selectedAccount: string, openEditor: (e: CatalogEntry) => void) {
+function catalogColumns(selectedAccount: string, openPanel: (e: CatalogEntry, tab: PanelTab) => void) {
   return [
     {
       id: "persona", header: "Persona", minWidth: 150,
@@ -202,12 +183,14 @@ function catalogColumns(selectedAccount: string, openEditor: (e: CatalogEntry) =
           )
           : <Box fontWeight="bold">{e.member_count.toLocaleString()}</Box>;
         if (e.members.length === 0) return header;
+        // 표 안에 목록을 펼치지 않는다 — 멤버가 많으면(실측 47개) 행이 화면을 넘겨 표를 못 쓴다.
+        // 우측 패널에서 검색·필터·CSV 로 다룬다.
         return (
           <SpaceBetween size="xxs">
             {header}
-            <ExpandableSection headerText="적용 대상 보기" variant="footer">
-              <MemberList members={e.members} />
-            </ExpandableSection>
+            <Button variant="inline-link" onClick={() => openPanel(e, "targets")}>
+              적용 대상 {e.member_count.toLocaleString()}개 보기
+            </Button>
           </SpaceBetween>
         );
       },
@@ -240,7 +223,7 @@ function catalogColumns(selectedAccount: string, openEditor: (e: CatalogEntry) =
       },
     },
     { id: "status", header: "상태", width: 90, minWidth: 90, cell: (e: CatalogEntry) => statusIndicator(e.approval_status) },
-    { id: "action", header: "", width: 130, minWidth: 130, cell: (e: CatalogEntry) => <Button onClick={() => openEditor(e)}><span style={{ whiteSpace: "nowrap" }}>정책 편집</span></Button> },
+    { id: "action", header: "", width: 130, minWidth: 130, cell: (e: CatalogEntry) => <Button onClick={() => openPanel(e, "policy")}><span style={{ whiteSpace: "nowrap" }}>정책 편집</span></Button> },
   ];
 }
 
@@ -382,25 +365,184 @@ function useDownload() {
     URL.revokeObjectURL(url);
   };
 }
+// ---- 적용 대상 판별 근거 표시 ----
+// 신뢰정책(engine m2_normalizer)이 내려준 값을 그대로 보여준다. 사람의 분류를 저장하지 않으므로
+// 여기엔 어떤 상태도 없다 — 매 run 의 소스가 곧 표시다.
+const KIND_META: Record<PrincipalKind, { label: string; color: "green" | "blue" | "grey"; desc: string }> = {
+  human: {
+    label: "사람", color: "green",
+    desc: "IAM 사용자이거나 신뢰정책이 SAML/OIDC 연합입니다 — 사람이 로그인해 씁니다. persona 정책 적용 대상.",
+  },
+  service: {
+    label: "서비스", color: "blue",
+    desc: "신뢰정책 주체가 AWS 서비스(Lambda·EC2·SSM 등)입니다 — 사람이 로그인할 수 없습니다. 기본적으로 persona 대상에서 제외됩니다.",
+  },
+  unknown: {
+    label: "판별 불가", color: "grey",
+    desc: "신뢰정책에 계정/역할(Principal.AWS)만 있어 사람인지 자동화인지 신뢰정책만으로는 갈릴 수 없습니다. 아래 신뢰 주체를 보고 소유 팀에 확인하세요.",
+  },
+};
+
+// AWS 서비스 principal → 짧은 표시명. 접미(`.amazonaws.com` / `.aws.internal`)를 떼고 첫 라벨만
+// 남긴다. 실측에 `orchestrator.alpo.aws.internal` 처럼 `.amazonaws.com` 이 아닌 것도 있으므로
+// 특정 도메인을 가정하지 않는다.
+function trustLabel(principal: string): { text: string; color: "red" | "green" | "blue" | "grey" } {
+  if (principal === "*") return { text: "모든 주체(*)", color: "red" };
+  if (principal.includes(":saml-provider/")) return { text: `SAML: ${principal.split("/").pop()}`, color: "green" };
+  if (principal.includes(":oidc-provider/")) return { text: `OIDC: ${principal.split("/").pop()}`, color: "green" };
+  if (principal.endsWith(":root")) return { text: `계정 신뢰: ${accountOf(principal)}`, color: "grey" };
+  if (principal.includes(":role/")) return { text: `역할 신뢰: ${principal.split("/").pop()}`, color: "grey" };
+  if (principal.includes(":user/")) return { text: `사용자 신뢰: ${principal.split("/").pop()}`, color: "grey" };
+  if (principal.includes(".")) {
+    const first = principal.split(".")[0];
+    return { text: first.charAt(0).toUpperCase() + first.slice(1), color: "blue" };
+  }
+  return { text: principal, color: "grey" };
+}
+
+/** 적용 대상 1건(표 행) — ARN 파싱 결과 + 신뢰정책 근거. */
+interface TargetRow extends MemberRef {
+  kindMeta: (typeof KIND_META)[PrincipalKind];
+  principalKind: PrincipalKind;
+  trustPrincipals: string[];
+  tags: Record<string, string>;
+}
+
+/** members + member_details → 표 행. member_details 가 비어도(구 run 산출물) ARN 정보만으로 동작한다. */
+export function targetRows(entry: CatalogEntry): TargetRow[] {
+  const byArn = new Map((entry.member_details ?? []).map((d) => [d.principal, d]));
+  return entry.members
+    .map((arn) => {
+      const ref = parseMember(arn);
+      const d = byArn.get(arn);
+      // IAM 사용자는 신뢰정책이 없다 — 엔진이 identity_type 으로 human 을 준다. detail 이 없으면
+      // ARN 형태로 같은 결론을 낸다(추측이 아니라 같은 규칙).
+      const kind: PrincipalKind = d?.principal_kind ?? (ref.kind === "user" ? "human" : "unknown");
+      return {
+        ...ref,
+        principalKind: kind,
+        kindMeta: KIND_META[kind],
+        trustPrincipals: d?.trust_principals ?? [],
+        tags: d?.tags ?? {},
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** 계정 선택 시 persona 를 그 계정 멤버로 좁힌다. members 와 member_details 를 **함께** 좁혀야 한다. */
+export function narrowToAccount(entry: CatalogEntry, account: string): CatalogEntry {
+  const members = entry.members.filter((m) => accountOf(m) === account);
+  const member_details = (entry.member_details ?? []).filter((d) => accountOf(d.principal) === account);
+  return { ...entry, members, member_details, member_count: members.length };
+}
 
 export default function PersonaReview() {
   const { data: allCatalog, loading } = useAsync<CatalogEntry[]>(() => api.getCatalog());
   const { selected: selectedAccount } = useAccounts();
+  // 🔴 컨텍스트 객체(panel) 자체를 의존성에 넣으면 안 된다 — 패널 state 가 바뀔 때마다 새 객체가 되어
+  // 등록 effect 가 재실행되고 무한 루프가 된다(실측: "Maximum update depth exceeded").
+  // setter 두 개만 꺼내 쓴다. 둘은 provider 에서 렌더 간 참조가 고정돼 있다.
+  const { setPanel, setOpen } = useSplitPanel();
+
   // 선택 계정으로 persona 필터 — CatalogEntry 에 account_id 가 없어 members ARN 에서 계정 파싱
-  // (arn:aws:iam::<account>:...). 전체("")면 그대로. 특정 계정이면 그 계정 principal 을 멤버로
-  // 가진 persona 만(멤버 목록도 해당 계정 것으로 좁힘 — member_count 근사).
+  // (arn:aws:iam::<account>:...). 전체("")면 그대로.
   const catalog = useMemo(() => {
     if (!allCatalog) return allCatalog;
     if (!selectedAccount) return allCatalog;
-    return allCatalog
-      .map((e) => {
-        const members = e.members.filter((m) => accountOf(m) === selectedAccount);
-        return { ...e, members, member_count: members.length };
-      })
-      .filter((e) => e.members.length > 0);
+    return allCatalog.map((e) => narrowToAccount(e, selectedAccount)).filter((e) => e.members.length > 0);
   }, [allCatalog, selectedAccount]);
-  const [selected, setSelected] = useState<CatalogEntry | null>(null);
-  const [editActions, setEditActions] = useState<PolicyAction[]>([]);
+
+  // 우측 패널에 무엇을 띄울지. persona + 최초 탭. 편집기 내부 상태는 PersonaEditorPanel 이 소유한다
+  // (여기서 들고 있으면 패널을 재등록하는 useEffect 의 의존성이 폭발해 닫힘·초기화 버그가 난다).
+  const [target, setTarget] = useState<{ entry: CatalogEntry; tab: PanelTab } | null>(null);
+
+  const openPanel = useCallback(
+    (entry: CatalogEntry, tab: PanelTab) => {
+      setTarget({ entry, tab });
+      setOpen(true);
+    },
+    [setOpen],
+  );
+  const closePanel = useCallback(() => {
+    setTarget(null);
+    setPanel(null);
+  }, [setPanel]);
+
+  // 패널 등록. 의존성은 target/closePanel/setPanel 뿐 — 편집기 상태가 바뀌거나 패널 state 가
+  // 갱신될 때 재등록하지 않는다(재등록하면 편집 중인 내용이 초기화되고 루프가 된다).
+  useEffect(() => {
+    if (!target) return;
+    setPanel({
+      header: target.entry.persona,
+      content: (
+        <PersonaEditorPanel
+          key={`${target.entry.persona}:${target.tab}`}
+          entry={target.entry}
+          defaultTab={target.tab}
+          onClose={closePanel}
+        />
+      ),
+    });
+  }, [target, closePanel, setPanel]);
+
+  if (loading || !catalog) {
+    return <Box padding="xxl" textAlign="center"><Spinner size="large" /></Box>;
+  }
+
+  const columnDefs = catalogColumns(selectedAccount, openPanel);
+  // 전체 뷰: 계정별 ExpandableSection 으로 먼저 구분(각 섹션에 그 계정 persona). 개별 계정: 표 하나.
+  let catalogView: React.ReactNode;
+  if (selectedAccount) {
+    catalogView = (
+      <Table variant="container" wrapLines
+        header={<Header variant="h2" counter={`(${catalog.length})`}>Persona 카탈로그 · 계정 {selectedAccount}</Header>}
+        columnDefinitions={columnDefs} items={catalog} />
+    );
+  } else {
+    // members ARN 으로 계정 추출 → 계정별 persona 묶음(persona 가 여러 계정에 걸치면 각 계정 섹션에 등장).
+    const accts = [...new Set(catalog.flatMap((e) => e.members.map(accountOf)))].sort();
+    catalogView = (
+      <SpaceBetween size="s">
+        <Box variant="h2">Persona 카탈로그 · 전체 계정 ({accts.length}개 계정)</Box>
+        {accts.map((acct) => {
+          const rows = catalog
+            .filter((e) => e.members.some((m) => accountOf(m) === acct))
+            .map((e) => narrowToAccount(e, acct));
+          return (
+            <ExpandableSection key={acct} variant="container" defaultExpanded
+              headerText={`계정 ${acct}`} headerCounter={`(${rows.length} personas)`}>
+              <Table variant="embedded" wrapLines columnDefinitions={columnDefs} items={rows} />
+            </ExpandableSection>
+          );
+        })}
+      </SpaceBetween>
+    );
+  }
+
+  return (
+    <ContentLayout header={<Header variant="h1" description={`실사용 기반 bottom-up persona 카탈로그. ${selectedAccount ? `계정 ${selectedAccount}` : "전체 계정 — 계정별로 구분"}`}>Persona 검토</Header>}>
+      <SpaceBetween size="l">
+        <PrincipalLookup catalog={catalog} onOpen={(e) => openPanel(e, "policy")} />
+        {catalogView}
+      </SpaceBetween>
+    </ContentLayout>
+  );
+}
+
+// ---- 우측 패널: 정책 편집 + 적용 대상 ----
+// AppLayout 의 SplitPanel 슬롯은 하나뿐이라 두 화면을 각각 띄울 수 없다 → 한 패널 안 Tabs.
+// 편집기 상태 전부를 이 컴포넌트가 소유한다(부모가 들고 있으면 패널 재등록마다 초기화된다).
+function PersonaEditorPanel({
+  entry,
+  defaultTab,
+  onClose,
+}: {
+  entry: CatalogEntry;
+  defaultTab: PanelTab;
+  onClose: () => void;
+}) {
+  const [tab, setTab] = useState<PanelTab>(defaultTab);
+  const [editActions, setEditActions] = useState<PolicyAction[]>(() => entry.actions.map((a) => ({ ...a })));
 
   // 권한 표시: 그룹 기준(서비스/동작) + 미사용 숨김(스크롤 감소)
   const [groupBy, setGroupBy] = useState<"service" | "access">("service");
@@ -420,13 +562,10 @@ export default function PersonaReview() {
   const download = useDownload();
 
   // 좌측 체크리스트에서 생성한 JSON (편집 모드가 아닐 때 표시)
-  const generatedJson = useMemo(
-    () => (selected ? buildPolicy(selected.persona, editActions) : ""),
-    [selected, editActions],
-  );
+  const generatedJson = useMemo(() => buildPolicy(entry.persona, editActions), [entry.persona, editActions]);
   const effectiveJson = jsonEditing ? jsonDraft : generatedJson;
 
-  // 표시용 그룹: 미사용 숨김 필터 적용 후 서비스/동작으로 묶음. (early-return 이전에 둬야 hooks 순서 고정)
+  // 표시용 그룹: 미사용 숨김 필터 적용 후 서비스/동작으로 묶음.
   const visibleGroups = useMemo(() => {
     const base = hideUnused ? editActions.filter((a) => a.used) : editActions;
     return groupActions(base, groupBy).filter((g) => g.items.length > 0);
@@ -438,20 +577,11 @@ export default function PersonaReview() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jsonEditing]);
 
-  function openEditor(entry: CatalogEntry) {
-    setSelected(entry);
-    setEditActions(entry.actions.map((a) => ({ ...a })));
-    setJsonEditing(false);
-    setJsonError(null);
-    setApprovedMsg(null);
-    setFlow("idle");
-  }
-
   function toggle(action: string, included: boolean) {
     setEditActions((prev) => prev.map((a) => (a.action === action ? { ...a, included } : a)));
   }
 
-  // 편집된 JSON 을 검증하고 좌측 체크리스트에 동기화
+  // 편집된 JSON 을 검증하고 체크리스트에 동기화
   function applyJsonEdits() {
     const acts = extractActions(jsonDraft);
     if (!acts) {
@@ -461,7 +591,7 @@ export default function PersonaReview() {
     setJsonError(null);
     setEditActions((prev) => {
       const known = new Map(prev.map((a) => [a.action, a]));
-      // JSON 에 있는 action = 포함. 좌측에 없던 action(범위 밖 수동 추가)은 신규 행으로.
+      // JSON 에 있는 action = 포함. 목록에 없던 action(범위 밖 수동 추가)은 신규 행으로.
       const next: PolicyAction[] = [];
       for (const a of prev) next.push({ ...a, included: acts.includes(a.action) });
       for (const act of acts) {
@@ -473,8 +603,7 @@ export default function PersonaReview() {
   }
 
   async function doApprove() {
-    if (!selected) return;
-    const res = await api.approvePersona(selected.persona, effectiveJson);
+    const res = await api.approvePersona(entry.persona, effectiveJson);
     setTerraform(res.terraform);
     setApprovedMsg(`${res.entry.persona} 정책이 승인되었습니다.`);
     setFlow("terraform");
@@ -495,182 +624,151 @@ export default function PersonaReview() {
     }
   }
 
-  if (loading || !catalog) {
-    return <Box padding="xxl" textAlign="center"><Spinner size="large" /></Box>;
-  }
-
   const includedCount = editActions.filter((a) => a.included).length;
   const unusedCount = editActions.filter((a) => !a.used).length;
-
-  const columnDefs = catalogColumns(selectedAccount, openEditor);
-  // 전체 뷰: 계정별 ExpandableSection 으로 먼저 구분(각 섹션에 그 계정 persona). 개별 계정: 표 하나.
-  let catalogView: React.ReactNode;
-  if (selectedAccount) {
-    catalogView = (
-      <Table variant="container" wrapLines
-        header={<Header variant="h2" counter={`(${catalog.length})`}>Persona 카탈로그 · 계정 {selectedAccount}</Header>}
-        columnDefinitions={columnDefs} items={catalog} />
-    );
-  } else {
-    // members ARN 으로 계정 추출 → 계정별 persona 묶음(persona 가 여러 계정에 걸치면 각 계정 섹션에 등장).
-    const accts = [...new Set(catalog.flatMap((e) => e.members.map(accountOf)))].sort();
-    catalogView = (
-      <SpaceBetween size="s">
-        <Box variant="h2">Persona 카탈로그 · 전체 계정 ({accts.length}개 계정)</Box>
-        {accts.map((acct) => {
-          const rows = catalog
-            .filter((e) => e.members.some((m) => accountOf(m) === acct))
-            .map((e) => {
-              const members = e.members.filter((m) => accountOf(m) === acct);
-              return { ...e, members, member_count: members.length };
-            });
-          return (
-            <ExpandableSection key={acct} variant="container" defaultExpanded
-              headerText={`계정 ${acct}`} headerCounter={`(${rows.length} personas)`}>
-              <Table variant="embedded" wrapLines columnDefinitions={columnDefs} items={rows} />
-            </ExpandableSection>
-          );
-        })}
-      </SpaceBetween>
-    );
-  }
+  const rows = useMemo(() => targetRows(entry), [entry]);
 
   return (
-    <ContentLayout header={<Header variant="h1" description={`실사용 기반 bottom-up persona 카탈로그. ${selectedAccount ? `계정 ${selectedAccount}` : "전체 계정 — 계정별로 구분"}`}>Persona 검토</Header>}>
-      <SpaceBetween size="l">
-        <PrincipalLookup catalog={catalog} onOpen={openEditor} />
-        {catalogView}
-
-        {selected && (
-          <Container header={<Header variant="h2" description="좌측 토글 또는 우측 JSON 직접 편집. 편집 시 좌↔우 동기화됩니다.">정책 편집기 — {selected.persona}</Header>}>
-            <SpaceBetween size="m">
-              {approvedMsg && <Alert type="success" dismissible onDismiss={() => setApprovedMsg(null)}>{approvedMsg}</Alert>}
-              <Grid gridDefinition={[{ colspan: 6 }, { colspan: 6 }]}>
-                {/* 좌: action 체크리스트 — 서비스/동작 기준 카테고리화, 미사용 숨김 */}
-                <SpaceBetween size="s">
-                  <Header
-                    variant="h3"
-                    description="실사용 권한=기본 포함 · 미사용 권한(부여됐으나 90일 미사용)=기본 제외, 검토 후 판단 · 토글로 최종 포함/제외"
-                    actions={
-                      <SpaceBetween direction="horizontal" size="xs">
-                        <SegmentedControl
-                          selectedId={groupBy}
-                          onChange={(e) => setGroupBy(e.detail.selectedId as "service" | "access")}
-                          label="그룹 기준"
-                          options={[
-                            { id: "service", text: "서비스별" },
-                            { id: "access", text: "동작별" },
-                          ]}
-                        />
-                        <Toggle checked={hideUnused} onChange={(e) => setHideUnused(e.detail.checked)}>
-                          미사용 권한 숨기기{unusedCount > 0 ? ` (${unusedCount})` : ""}
-                        </Toggle>
-                      </SpaceBetween>
-                    }
-                  >
-                    Action ({includedCount}/{editActions.length})
-                  </Header>
-                  <div style={{ maxHeight: 440, overflow: "auto" }}>
-                    <SpaceBetween size="xs">
-                      {visibleGroups.map((g) => {
-                        const groupIncluded = g.items.filter((a) => a.included).length;
-                        return (
-                          <ExpandableSection
-                            key={g.key}
-                            variant="container"
-                            headerText={g.label}
-                            headerCounter={`(${groupIncluded}/${g.items.length})`}
-                          >
-                            <Table
-                              variant="embedded"
-                              columnDefinitions={[
-                                {
-                                  id: "toggle", header: "포함", width: 70,
-                                  cell: (a: PolicyAction) => <Toggle checked={a.included} onChange={(e) => toggle(a.action, e.detail.checked)} />,
-                                },
-                                {
-                                  id: "action", header: "Action", cell: (a: PolicyAction) => (
-                                    <SpaceBetween direction="horizontal" size="xxs">
-                                      <Box fontWeight={a.used ? "normal" : "bold"}>{a.action}</Box>
-                                      {!a.used && <Badge color="blue">미사용 · 검토</Badge>}
-                                      {groupBy === "service" && (
-                                        <Badge color={accessKindOf(a.action) === "write" ? "red" : "grey"}>
-                                          {accessKindOf(a.action) === "write" ? "쓰기" : "읽기"}
-                                        </Badge>
-                                      )}
-                                    </SpaceBetween>
-                                  ),
-                                },
-                                {
-                                  id: "usage", header: "최근 사용", cell: (a: PolicyAction) =>
-                                    a.used ? (
-                                      <StatusIndicator type="success">{fmtLastUsed(a.last_used)}</StatusIndicator>
-                                    ) : (
-                                      <StatusIndicator type="stopped">90일간 미사용</StatusIndicator>
-                                    ),
-                                },
-                                {
-                                  id: "count", header: "횟수(90d)", width: 110, cell: (a: PolicyAction) =>
-                                    a.count_90d > 0 ? (
-                                      <Box>{a.count_90d.toLocaleString()}회</Box>
-                                    ) : a.used ? (
-                                      <Box color="text-status-inactive" fontSize="body-s">집계 없음</Box>
-                                    ) : (
-                                      <Box color="text-status-inactive">—</Box>
-                                    ),
-                                },
-                              ]}
-                              items={g.items}
-                            />
-                          </ExpandableSection>
-                        );
-                      })}
-                      {visibleGroups.length === 0 && (
-                        <Box color="text-status-inactive" padding="s">표시할 권한이 없습니다.</Box>
-                      )}
+    <>
+      <Tabs
+        activeTabId={tab}
+        onChange={(e) => setTab(e.detail.activeTabId as PanelTab)}
+        tabs={[
+          {
+            id: "policy",
+            label: "정책 편집",
+            content: (
+              <SpaceBetween size="m">
+                {approvedMsg && <Alert type="success" dismissible onDismiss={() => setApprovedMsg(null)}>{approvedMsg}</Alert>}
+                <Header
+                  variant="h3"
+                  description="실사용 권한=기본 포함 · 미사용 권한(부여됐으나 90일 미사용)=기본 제외, 검토 후 판단"
+                  actions={
+                    <SpaceBetween direction="horizontal" size="xs">
+                      <SegmentedControl
+                        selectedId={groupBy}
+                        onChange={(e) => setGroupBy(e.detail.selectedId as "service" | "access")}
+                        label="그룹 기준"
+                        options={[
+                          { id: "service", text: "서비스별" },
+                          { id: "access", text: "동작별" },
+                        ]}
+                      />
+                      <Toggle checked={hideUnused} onChange={(e) => setHideUnused(e.detail.checked)}>
+                        미사용 숨기기{unusedCount > 0 ? ` (${unusedCount})` : ""}
+                      </Toggle>
                     </SpaceBetween>
-                  </div>
-                </SpaceBetween>
-                {/* 우: 정책 JSON (보기/편집 전환) */}
-                <SpaceBetween size="s">
-                  <Header
-                    variant="h3"
-                    actions={
-                      jsonEditing ? (
-                        <SpaceBetween direction="horizontal" size="xs">
-                          <Button onClick={() => { setJsonEditing(false); setJsonError(null); }}>취소</Button>
-                          <Button variant="primary" onClick={applyJsonEdits}>적용</Button>
-                        </SpaceBetween>
-                      ) : (
-                        <Button iconName="edit" onClick={() => setJsonEditing(true)}>JSON 편집</Button>
-                      )
-                    }
-                  >
-                    정책 JSON {jsonEditing ? "(편집 중)" : "(실시간)"}
-                  </Header>
-                  {jsonError && <Alert type="error">{jsonError}</Alert>}
-                  {jsonEditing ? (
-                    <>
-                      <Alert type="info">좌측 action 범위 밖 권한이 필요하면 여기서 직접 추가하세요. 적용 시 좌측 목록에 반영됩니다.</Alert>
-                      <Textarea value={jsonDraft} onChange={(e) => setJsonDraft(e.detail.value)} rows={18} spellcheck={false} />
-                    </>
-                  ) : (
-                    <Box variant="code">
-                      <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "Monaco, Menlo, monospace", fontSize: 12, lineHeight: 1.5, maxHeight: 420, overflow: "auto" }}>
-                        {effectiveJson}
-                      </pre>
-                    </Box>
-                  )}
-                  <SpaceBetween direction="horizontal" size="xs">
-                    <Button variant="primary" disabled={jsonEditing} onClick={() => setFlow("confirmApprove")}>이 정책으로 승인</Button>
-                    <Button onClick={() => setSelected(null)}>닫기</Button>
+                  }
+                >
+                  Action ({includedCount}/{editActions.length})
+                </Header>
+                {/* 패널 폭이 좁아 좌/우 2단은 못 쓴다 → 체크리스트를 먼저, JSON 은 접이식으로 아래. */}
+                <div style={{ maxHeight: 420, overflow: "auto" }}>
+                  <SpaceBetween size="xs">
+                    {visibleGroups.map((g) => {
+                      const groupIncluded = g.items.filter((a) => a.included).length;
+                      return (
+                        <ExpandableSection
+                          key={g.key}
+                          variant="container"
+                          headerText={g.label}
+                          headerCounter={`(${groupIncluded}/${g.items.length})`}
+                        >
+                          <Table
+                            variant="embedded"
+                            columnDefinitions={[
+                              {
+                                id: "toggle", header: "포함", width: 70,
+                                cell: (a: PolicyAction) => <Toggle checked={a.included} onChange={(e) => toggle(a.action, e.detail.checked)} />,
+                              },
+                              {
+                                id: "action", header: "Action", minWidth: 200, cell: (a: PolicyAction) => (
+                                  <SpaceBetween direction="horizontal" size="xxs">
+                                    <Box fontWeight={a.used ? "normal" : "bold"}>{a.action}</Box>
+                                    {!a.used && <Badge color="blue">미사용 · 검토</Badge>}
+                                    {groupBy === "service" && (
+                                      <Badge color={accessKindOf(a.action) === "write" ? "red" : "grey"}>
+                                        {accessKindOf(a.action) === "write" ? "쓰기" : "읽기"}
+                                      </Badge>
+                                    )}
+                                  </SpaceBetween>
+                                ),
+                              },
+                              {
+                                id: "usage", header: "최근 사용", cell: (a: PolicyAction) =>
+                                  a.used ? (
+                                    <StatusIndicator type="success">{fmtLastUsed(a.last_used)}</StatusIndicator>
+                                  ) : (
+                                    <StatusIndicator type="stopped">90일간 미사용</StatusIndicator>
+                                  ),
+                              },
+                              {
+                                id: "count", header: "횟수(90d)", width: 110, cell: (a: PolicyAction) =>
+                                  a.count_90d > 0 ? (
+                                    <Box>{a.count_90d.toLocaleString()}회</Box>
+                                  ) : a.used ? (
+                                    <Box color="text-status-inactive" fontSize="body-s">집계 없음</Box>
+                                  ) : (
+                                    <Box color="text-status-inactive">—</Box>
+                                  ),
+                              },
+                            ]}
+                            items={g.items}
+                          />
+                        </ExpandableSection>
+                      );
+                    })}
+                    {visibleGroups.length === 0 && (
+                      <Box color="text-status-inactive" padding="s">표시할 권한이 없습니다.</Box>
+                    )}
                   </SpaceBetween>
+                </div>
+
+                <ExpandableSection
+                  variant="container"
+                  headerText={`정책 JSON ${jsonEditing ? "(편집 중)" : "(실시간)"}`}
+                  headerActions={
+                    jsonEditing ? (
+                      <SpaceBetween direction="horizontal" size="xs">
+                        <Button onClick={() => { setJsonEditing(false); setJsonError(null); }}>취소</Button>
+                        <Button variant="primary" onClick={applyJsonEdits}>적용</Button>
+                      </SpaceBetween>
+                    ) : (
+                      <Button iconName="edit" onClick={() => setJsonEditing(true)}>JSON 편집</Button>
+                    )
+                  }
+                >
+                  <SpaceBetween size="s">
+                    {jsonError && <Alert type="error">{jsonError}</Alert>}
+                    {jsonEditing ? (
+                      <>
+                        <Alert type="info">위 목록 범위 밖 권한이 필요하면 여기서 직접 추가하세요. 적용 시 목록에 반영됩니다.</Alert>
+                        <Textarea value={jsonDraft} onChange={(e) => setJsonDraft(e.detail.value)} rows={16} spellcheck={false} />
+                      </>
+                    ) : (
+                      <Box variant="code">
+                        <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "Monaco, Menlo, monospace", fontSize: 12, lineHeight: 1.5, maxHeight: 320, overflow: "auto" }}>
+                          {effectiveJson}
+                        </pre>
+                      </Box>
+                    )}
+                  </SpaceBetween>
+                </ExpandableSection>
+
+                <SpaceBetween direction="horizontal" size="xs">
+                  <Button variant="primary" disabled={jsonEditing} onClick={() => setFlow("confirmApprove")}>이 정책으로 승인</Button>
+                  <Button onClick={onClose}>닫기</Button>
                 </SpaceBetween>
-              </Grid>
-            </SpaceBetween>
-          </Container>
-        )}
-      </SpaceBetween>
+              </SpaceBetween>
+            ),
+          },
+          {
+            id: "targets",
+            label: `적용 대상 (${rows.length})`,
+            content: <TargetsTab persona={entry.persona} rows={rows} download={download} />,
+          },
+        ]}
+      />
 
       {/* 1) 승인 확인 */}
       <Modal
@@ -686,12 +784,10 @@ export default function PersonaReview() {
           </Box>
         }
       >
-        {selected && (
-          <SpaceBetween size="s">
-            <Box>{selected.persona} 를 {includedCount}개 action 으로 승인합니다. 승인 후 Permission Set Terraform 이 생성됩니다.</Box>
-            {selected.ai_suggested && <Alert type="warning">AI 제안 persona 입니다 — 승인 시 사람 검증(human-in-the-loop)으로 기록됩니다.</Alert>}
-          </SpaceBetween>
-        )}
+        <SpaceBetween size="s">
+          <Box>{entry.persona} 를 {includedCount}개 action 으로 승인합니다. 승인 후 Permission Set Terraform 이 생성됩니다.</Box>
+          {entry.ai_suggested && <Alert type="warning">AI 제안 persona 입니다 — 승인 시 사람 검증(human-in-the-loop)으로 기록됩니다.</Alert>}
+        </SpaceBetween>
       </Modal>
 
       {/* 2) Terraform 팝업 (다운로드 + PS 생성 진입) */}
@@ -762,6 +858,157 @@ export default function PersonaReview() {
           <Alert type="info">account assignment 은 생성하지 않았습니다. IdC 콘솔에서 필요한 계정·그룹에 수동으로 할당하세요.</Alert>
         </SpaceBetween>
       </Modal>
-    </ContentLayout>
+    </>
+  );
+}
+
+// ---- 적용 대상 탭 ----
+// 고객 피드백: 멤버가 많으면 표 아래 접이식 목록으로는 못 쓴다. 검색·필터·CSV 가 필요하고,
+// "이게 사람인가 서비스인가"에 근거와 함께 답해야 한다.
+type KindFilter = "all" | PrincipalKind;
+
+function TargetsTab({
+  persona,
+  rows,
+  download,
+}: {
+  persona: string;
+  rows: TargetRow[];
+  download: (filename: string, content: string, mime?: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [kind, setKind] = useState<KindFilter>("all");
+
+  const counts = useMemo(() => {
+    const c: Record<PrincipalKind, number> = { human: 0, service: 0, unknown: 0 };
+    for (const r of rows) c[r.principalKind] += 1;
+    return c;
+  }, [rows]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return rows.filter(
+      (r) =>
+        (kind === "all" || r.principalKind === kind) &&
+        (!q || r.name.toLowerCase().includes(q) || r.arn.toLowerCase().includes(q)),
+    );
+  }, [rows, query, kind]);
+
+  function exportCsv() {
+    // 필터된 것만 내보낸다(화면에 보이는 것과 파일이 달라지면 안 된다). ARN·이름에 쉼표가 들어갈 수
+    // 있어 전 필드를 인용하고 내부 " 는 "" 로 이스케이프한다.
+    const esc = (v: string) => `"${v.replace(/"/g, '""')}"`;
+    const header = ["persona", "principal_arn", "name", "account", "kind", "trust_principals", "tags"];
+    const body = filtered.map((r) =>
+      [
+        persona,
+        r.arn,
+        r.name,
+        r.account,
+        r.kindMeta.label,
+        r.trustPrincipals.join(" | "),
+        Object.entries(r.tags).map(([k, v]) => `${k}=${v}`).join(" | "),
+      ].map(esc).join(","),
+    );
+    download(`${persona}-적용대상.csv`, [header.map(esc).join(","), ...body].join("\n"), "text/csv");
+  }
+
+  return (
+    <SpaceBetween size="s">
+      <Alert type="info">
+        이 목록은 <b>{persona} 정책을 적용할 대상</b>입니다. 각 대상의 과거 90일 실사용 이력을 합집합으로
+        모은 것이 이 persona 의 정책이므로, 개별 대상 입장에서는 <b>필요 이상일 수 있어도 부족하지는 않습니다</b>.
+      </Alert>
+      <SegmentedControl
+        selectedId={kind}
+        onChange={(e) => setKind(e.detail.selectedId as KindFilter)}
+        label="사용 주체 필터"
+        options={[
+          { id: "all", text: `전체 (${rows.length})` },
+          { id: "human", text: `사람 (${counts.human})` },
+          { id: "service", text: `서비스 (${counts.service})` },
+          { id: "unknown", text: `판별 불가 (${counts.unknown})` },
+        ]}
+      />
+      <Input
+        value={query}
+        onChange={(e) => setQuery(e.detail.value)}
+        placeholder="이름 또는 ARN 일부로 검색"
+        type="search"
+      />
+      <Table
+        variant="embedded"
+        wrapLines
+        items={filtered}
+        empty={<Box color="text-status-inactive" padding="s">조건에 맞는 적용 대상이 없습니다.</Box>}
+        header={
+          <Header
+            counter={`(${filtered.length}/${rows.length})`}
+            actions={<Button iconName="download" onClick={exportCsv} disabled={filtered.length === 0}>CSV</Button>}
+          >
+            적용 대상
+          </Header>
+        }
+        columnDefinitions={[
+          {
+            id: "name", header: "이름", minWidth: 160,
+            cell: (r: TargetRow) => (
+              <SpaceBetween size="xxs">
+                <Box fontWeight="bold">{r.name}</Box>
+                <Popover dismissButton={false} position="top" size="large" triggerType="text"
+                  content={<Box fontSize="body-s">{r.arn}</Box>}>
+                  <Box fontSize="body-s" color="text-status-info">ARN</Box>
+                </Popover>
+              </SpaceBetween>
+            ),
+          },
+          {
+            id: "kind", header: "사용 주체", minWidth: 120,
+            cell: (r: TargetRow) => (
+              <Popover dismissButton={false} position="top" size="medium" triggerType="custom"
+                header={r.kindMeta.label} content={r.kindMeta.desc}>
+                <span style={{ cursor: "help" }}><Badge color={r.kindMeta.color}>{r.kindMeta.label}</Badge></span>
+              </Popover>
+            ),
+          },
+          {
+            id: "trust", header: "신뢰 주체(근거)", minWidth: 180,
+            cell: (r: TargetRow) => {
+              if (r.kind === "user") return <Badge color="green">IAM 사용자</Badge>;
+              if (r.trustPrincipals.length === 0) {
+                return <Box fontSize="body-s" color="text-status-inactive">신뢰정책 미수집</Box>;
+              }
+              return (
+                <SpaceBetween direction="horizontal" size="xxs">
+                  {r.trustPrincipals.map((p) => {
+                    const l = trustLabel(p);
+                    return (
+                      <Popover key={p} dismissButton={false} position="top" size="large" triggerType="custom" content={<Box fontSize="body-s">{p}</Box>}>
+                        <span style={{ cursor: "help" }}><Badge color={l.color}>{l.text}</Badge></span>
+                      </Popover>
+                    );
+                  })}
+                </SpaceBetween>
+              );
+            },
+          },
+          {
+            id: "tags", header: "태그(소유자 추정)", minWidth: 140,
+            cell: (r: TargetRow) => {
+              const entries = Object.entries(r.tags);
+              if (entries.length === 0) return <Box fontSize="body-s" color="text-status-inactive">없음</Box>;
+              return (
+                <SpaceBetween size="xxs">
+                  {entries.map(([k, v]) => (
+                    <Box key={k} fontSize="body-s">{k}: {v}</Box>
+                  ))}
+                </SpaceBetween>
+              );
+            },
+          },
+          { id: "account", header: "계정", width: 130, cell: (r: TargetRow) => r.account },
+        ]}
+      />
+    </SpaceBetween>
   );
 }

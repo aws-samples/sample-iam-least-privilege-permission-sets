@@ -85,6 +85,17 @@ export const CATALOG: CatalogEntry[] = [
     // 여러 계정에 걸친 persona(전체 뷰에서 계정별 분해 데모).
     members: ["arn:aws:iam::111122223333:role/data-eng-batch", "arn:aws:iam::111122223333:role/glue-job",
               "arn:aws:iam::444455556666:role/data-eng-batch", "arn:aws:iam::444455556666:role/glue-job"],
+    // 사용 주체 3종을 모두 담는다 — 배지·필터·CSV 를 목데이터로 실제 확인할 수 있어야 한다.
+    member_details: [
+      { principal: "arn:aws:iam::111122223333:role/data-eng-batch", principal_kind: "unknown",
+        trust_principals: ["arn:aws:iam::111122223333:root"], tags: { Team: "data", Owner: "data-platform" } },
+      { principal: "arn:aws:iam::111122223333:role/glue-job", principal_kind: "service",
+        trust_principals: ["glue.amazonaws.com"], tags: { Team: "data" } },
+      { principal: "arn:aws:iam::444455556666:role/data-eng-batch", principal_kind: "human",
+        trust_principals: ["arn:aws:iam::444455556666:saml-provider/Okta"], tags: {} },
+      { principal: "arn:aws:iam::444455556666:role/glue-job", principal_kind: "service",
+        trust_principals: ["glue.amazonaws.com"], tags: {} },
+    ],
     member_count: 4,
     policy_ref: "policies/DataEngineer.json",
     approval_status: "review",
@@ -106,6 +117,10 @@ export const CATALOG: CatalogEntry[] = [
     persona: "ReadOnlyAuditor",
     description: "규정 감사용 전역 read-only. 쓰기 action 0.",
     members: ["arn:aws:iam::111122223333:role/auditor"],
+    member_details: [
+      { principal: "arn:aws:iam::111122223333:role/auditor", principal_kind: "human",
+        trust_principals: ["arn:aws:iam::111122223333:saml-provider/Okta"], tags: { Team: "grc" } },
+    ],
     member_count: 88,
     policy_ref: "policies/ReadOnlyAuditor.json",
     approval_status: "approved",
@@ -125,6 +140,10 @@ export const CATALOG: CatalogEntry[] = [
     persona: "PlatformAdmin",
     description: "플랫폼 인프라 운영. 상승 경로 존재 → 검토 필요.",
     members: ["arn:aws:iam::444455556666:role/platform-admin"],
+    member_details: [
+      { principal: "arn:aws:iam::444455556666:role/platform-admin", principal_kind: "unknown",
+        trust_principals: ["arn:aws:iam::444455556666:root"], tags: {} },
+    ],
     member_count: 24,
     policy_ref: "policies/PlatformAdmin.json",
     approval_status: "review",
@@ -144,6 +163,10 @@ export const CATALOG: CatalogEntry[] = [
     persona: "CICDDeployer",
     description: "배포 파이프라인 역할. 실사용 좁은 write 스코프.",
     members: ["arn:aws:iam::444455556666:role/cicd-deploy"],
+    member_details: [
+      { principal: "arn:aws:iam::444455556666:role/cicd-deploy", principal_kind: "service",
+        trust_principals: ["codebuild.amazonaws.com", "arn:aws:iam::444455556666:root"], tags: { Pipeline: "main" } },
+    ],
     member_count: 51,
     policy_ref: "policies/CICDDeployer.json",
     approval_status: "draft",

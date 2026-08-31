@@ -4,6 +4,9 @@
 // ============================================================================
 
 export type IdentityType = "role" | "user" | "service" | "sso_ps";
+// 신뢰정책 기반 사용 주체 구분(models.py PrincipalKind 와 1:1).
+//  human=사람(IAM 사용자·Federated) / service=AWS 서비스 실행 역할 / unknown=Principal.AWS 만(판별 불가)
+export type PrincipalKind = "human" | "service" | "unknown";
 export type RiskLevel = "critical" | "high" | "medium" | "low";
 export type ApprovalStatus = "draft" | "review" | "approved";
 export type RunStatus = "running" | "succeeded" | "failed" | "degraded";
@@ -25,6 +28,9 @@ export interface PrincipalRecord {
   account_id: string;
   principal: string; // ARN
   identity_type: IdentityType;
+  principal_kind: PrincipalKind;
+  trust_principals: string[]; // 신뢰정책 principal 원문(배지 근거)
+  tags: Record<string, string>;
   granted_actions: string[];
   used_actions: UsedAction[];
   unused_findings: string[];
@@ -106,10 +112,20 @@ export interface PolicyAction {
   count_90d: number;
 }
 
+// persona 적용 대상 1건의 판별 근거(models.py MemberDetail 과 1:1).
+// ARN 만으로는 "사람이냐 서비스냐, 근거가 뭐냐"에 답할 수 없어 배지·필터의 소스로 함께 내려온다.
+export interface MemberDetail {
+  principal: string;
+  principal_kind: PrincipalKind;
+  trust_principals: string[]; // 신뢰정책 principal 원문
+  tags: Record<string, string>; // 소유자 귀속 표시용
+}
+
 export interface CatalogEntry {
   persona: string;
   description: string;
   members: string[]; // principal ARN 목록
+  member_details: MemberDetail[]; // members 와 동일 순서(principal asc)
   member_count: number;
   policy_ref: string; // s3 key or id
   approval_status: ApprovalStatus;
