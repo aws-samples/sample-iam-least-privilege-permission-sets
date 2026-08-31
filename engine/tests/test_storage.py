@@ -60,6 +60,34 @@ def test_parquet_roundtrip_and_determinism(tmp_path) -> None:
     assert rows[0]["used_actions"][0]["action"] == "s3:GetObject"
 
 
+def test_parquet_schema_covers_every_model_field() -> None:
+    """parquet 스키마는 allowlist 다 — 모델 필드가 빠지면 조용히 버려진다(에러 없음).
+
+    실제로 principal_kind/trust_principals/tags 를 추가했을 때 스키마를 안 늘려서 쓰기는 되는데
+    읽으면 기본값으로 되돌아오는 일이 있었다. 필드 추가를 스키마가 강제하도록 대조한다.
+    """
+    from lp2ps.models import PrincipalRecord
+    from lp2ps.storage import _parquet_schema
+
+    missing = set(PrincipalRecord.model_fields) - set(_parquet_schema().names)
+    assert not missing, f"parquet 스키마에 빠진 PrincipalRecord 필드: {sorted(missing)}"
+
+
+def test_normalized_roundtrip_preserves_kind_and_tags(tmp_path) -> None:
+    """신뢰정책 파생 필드와 태그가 parquet 왕복에서 살아남아야 한다."""
+    st = LocalFSStorage(tmp_path, "acme", "run-1")
+    rec = _rec("111122223333", "arn:a")
+    rec.principal_kind = "service"
+    rec.trust_principals = ["lambda.amazonaws.com"]
+    rec.tags = {"Team": "data", "Env": "prod"}
+    st.write_normalized([rec])
+
+    got = st.read_normalized()[0]
+    assert got.principal_kind == "service"
+    assert got.trust_principals == ["lambda.amazonaws.com"]
+    assert got.tags == {"Team": "data", "Env": "prod"}
+
+
 def test_write_read_normalized(tmp_path) -> None:
     st = LocalFSStorage(tmp_path, "acme", "run-1")
     st.write_normalized([_rec("111122223333", "arn:a")])

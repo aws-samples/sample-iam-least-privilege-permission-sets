@@ -71,6 +71,35 @@ class CatalogConfig(BaseModel):
 
     # fingerprint = 사용 action 의 서비스 접두 집합. 이 최소 인원 미만 군집은 개별(기타)로.
     min_members_for_persona: int = 2
+    # 신뢰정책이 AWS 서비스인 역할(Lambda/EC2/SSM 실행 역할 등)을 persona 군집에서 제외한다.
+    # persona 는 **사람** 접근의 표준화 단위이고, 서비스 역할은 사람이 로그인할 수 없어 Permission Set
+    # 대상이 아니다. 섞이면 (a) 서비스 전용 action 이 사람용 정책에 합성되고, (b) 서비스 역할 수가
+    # min_members_for_persona 를 채워 실재하지 않는 persona 가 생긴다.
+    # false 로 되돌리면 종전(서비스 역할 포함) 동작 — persona 수·멤버 수가 크게 늘어난다.
+    exclude_service_roles: bool = True
+    # IaC 도구가 만든 **배포 전용 역할**을 persona 군집에서 이름 패턴으로 제외한다(fnmatch, 대소문자 구분).
+    #
+    # 왜 필요한가: CDK bootstrap 의 deploy/file-publishing/lookup 역할은 신뢰정책이 `Principal.AWS`
+    # (배포 계정 root)뿐이라 `principal_kind`=unknown 으로 남아 위 서비스 역할 제외를 통과한다. 그리고
+    # 리전마다 3개씩 생기므로 스스로 `min_members_for_persona` 를 채워 **실재하지 않는 persona** 를
+    # 만든다(실측: InfraReadOnlyPersona 3/3, InfraWritePersona 4/4 가 전부 배포 역할이었다).
+    #
+    # 왜 이름 패턴인가: CFN 스택 역추적(`cloudformation:ListStacks`/`ListStackResources`)은 멤버 role
+    # 정책 확장 → **고객 재배포**를 요구하는데, 그래도 Terraform 이 만든 역할은 못 잡는다. 패턴은
+    # config 만으로 되고 어느 IaC 든 명명 규약만 알면 잡힌다.
+    #
+    # 기본값은 **AWS 도구의 공개 명명 규약**만 담는다(특정 고객 값이 아니다 — 불변식 ④). 고객 사내
+    # 배포 역할 규약은 yaml 에서 덧붙인다.
+    # 매칭 대상 = 이름(ARN 마지막 세그먼트)과 전체 ARN 둘 다. persona 에서 빠져도 조치 필요 항목
+    # (미사용 역할·장기 키·MFA)에는 그대로 남는다 — 제외는 "사람 표준화 대상 아님"이지 "무해"가 아니다.
+    exclude_principal_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "cdk-*-deploy-role-*",
+            "cdk-*-file-publishing-role-*",
+            "cdk-*-image-publishing-role-*",
+            "cdk-*-lookup-role-*",
+        ]
+    )
     # persona 신뢰도: CloudTrail(고신뢰) 기반이면 높게, fallback 이면 낮게.
     confidence_access_analyzer: float = 0.9
     confidence_fallback: float = 0.5

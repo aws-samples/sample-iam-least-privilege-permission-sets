@@ -41,6 +41,14 @@ risk_rules:
 
 catalog:
   min_members_for_persona: 2
+  # persona 군집에서 제외할 principal 이름/ARN 패턴(fnmatch, 대소문자 구분).
+  # 기본값 = CDK bootstrap 배포 역할. 사내 IaC 배포 역할 명명 규약이 있으면 여기에 덧붙인다
+  # (예: "tf-*-deploy", "*-cicd-role"). 제외돼도 조치 필요 항목에는 그대로 남는다.
+  exclude_principal_patterns:
+    - "cdk-*-deploy-role-*"
+    - "cdk-*-file-publishing-role-*"
+    - "cdk-*-image-publishing-role-*"
+    - "cdk-*-lookup-role-*"
   confidence_access_analyzer: 0.9
   confidence_fallback: 0.5
 

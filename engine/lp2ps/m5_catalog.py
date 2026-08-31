@@ -22,9 +22,10 @@ AI 하네스(`lp2ps.ai`)에서 순수 가산(결정론 코어는 lp2ps.ai 를 im
 from __future__ import annotations
 
 import re
+from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING
 
-from .models import CatalogEntry, PolicyAction, PrincipalRecord, SynthesisSource
+from .models import CatalogEntry, MemberDetail, PolicyAction, PrincipalRecord, SynthesisSource
 from .timeutil import max_ts
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -92,6 +93,14 @@ def build_catalog(storage: "Storage", run: "RunContext", cfg: "CatalogConfig") -
 
     # 예외/미사용 principal 은 persona 대상에서 제외(사용 실태 기반 최소권한 카탈로그).
     active = [r for r in records if r.used_actions and not r.is_exception]
+    # 서비스 실행 역할 제외(기본 켜짐) — 신뢰정책 근거. `unknown`(Principal.AWS 만)은 남긴다:
+    # 신뢰정책만으로 갈릴 수 없으므로 추측으로 버리지 않고 사람이 볼 수 있게 카탈로그에 둔다.
+    if cfg.exclude_service_roles:
+        active = [r for r in active if r.principal_kind != "service"]
+    # IaC 배포 전용 역할 제외(이름 패턴). 신뢰정책이 `Principal.AWS` 뿐이라 위 필터를 통과하는
+    # CDK/Terraform 배포 역할을 걸러낸다 — 사람이 assume 하는 역할이 아니므로 persona 대상이 아니다.
+    if cfg.exclude_principal_patterns:
+        active = [r for r in active if not _matches_pattern(r.principal, cfg.exclude_principal_patterns)]
 
     # 군집 키(도메인×성격) → principal 목록.
     clusters: dict[str, list[PrincipalRecord]] = {}
@@ -117,6 +126,17 @@ def build_catalog(storage: "Storage", run: "RunContext", cfg: "CatalogConfig") -
     entries.sort(key=lambda e: e.persona)
     _write_catalog(storage, entries)
     return entries
+
+
+def _matches_pattern(arn: str, patterns: list[str]) -> bool:
+    """ARN 이 제외 패턴에 걸리는가. 이름(마지막 세그먼트)과 전체 ARN 둘 다 대조한다.
+
+    `fnmatchcase` 를 쓴다 — `fnmatch` 는 플랫폼 파일시스템 규칙을 따라 macOS 에서 대소문자를 무시하고
+    Linux 에서는 구분한다. 그러면 같은 config 가 로컬과 Lambda 에서 다른 결과를 내 불변식 ②(결정론)가
+    깨진다. 명시적으로 대소문자를 구분한다.
+    """
+    name = arn.rsplit("/", 1)[-1]
+    return any(fnmatchcase(name, p) or fnmatchcase(arn, p) for p in patterns)
 
 
 def _domain_of(service: str) -> str:
@@ -187,7 +207,19 @@ _PROFILE_DESC = {
 
 def _entry_for(key: str, members: list[PrincipalRecord], cfg: "CatalogConfig") -> CatalogEntry:
     persona = f"{key}Persona"
-    member_arns = sorted(r.principal for r in members)
+    by_arn = {r.principal: r for r in members}
+    member_arns = sorted(by_arn)
+    # 판별 근거를 members 와 동일 순서로 실어 보낸다(UI 배지·사람/서비스 필터용). 사람의 분류를
+    # 저장하지 않고 매 run 신뢰정책에서 다시 판정하므로 여기서 파생값을 복사하는 것으로 충분하다.
+    member_details = [
+        MemberDetail(
+            principal=arn,
+            principal_kind=by_arn[arn].principal_kind,
+            trust_principals=list(by_arn[arn].trust_principals),
+            tags=dict(by_arn[arn].tags),
+        )
+        for arn in member_arns
+    ]
 
     # synthesis_source: 멤버 중 하나라도 CloudTrail/analyzer 고신뢰면 access_analyzer, 아니면 fallback.
     high_conf = any("access_advisor" in r.source or "analyzer_unused" in r.source for r in members)
@@ -203,6 +235,7 @@ def _entry_for(key: str, members: list[PrincipalRecord], cfg: "CatalogConfig") -
         persona=persona,
         description=description,
         members=member_arns,
+        member_details=member_details,
         member_count=len(member_arns),
         policy_ref=f"policies/{persona}.json",
         approval_status="draft",

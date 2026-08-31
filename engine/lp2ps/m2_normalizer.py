@@ -5,6 +5,8 @@ M1 수집 raw JSON 을 계정 단위로 읽어 principal 단위 `PrincipalRecord
 - used_actions   ← access_advisor(action-level) ∪ cloudtrail(event → action 근사)
 - unused_findings ← analyzer_unused findings + (granted − used) 계산 갭
 - mfa / access_key_age_days ← credential report CSV
+- principal_kind / trust_principals ← role 신뢰정책(AssumeRolePolicyDocument)
+- tags            ← role/user 태그
 - source          ← 이 principal 에 기여한 수집 소스 목록
 
 불변식 ②(결정론): as_of(run.started_at) 기준으로만 시간 계산, 안정 정렬, wall-clock 미사용.
@@ -24,7 +26,7 @@ from .collectors.analyzer_unused import SOURCE as ANALYZER
 from .collectors.cloudtrail import SOURCE as CLOUDTRAIL
 from .collectors.credential_report import SOURCE as CRED_REPORT
 from .collectors.idc_permission_sets import SOURCE as IDC
-from .models import PrincipalRecord, UsedAction
+from .models import PrincipalKind, PrincipalRecord, UsedAction
 from .timeutil import max_ts
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -63,6 +65,57 @@ def _exception_type(arn: str) -> str | None:
     if _IDC_RESERVED_PATH in arn:
         return EXC_IDC_RESERVED
     return None
+
+
+# ---- 신뢰정책 → 사용 주체 구분 ----
+# 실측 근거(188 계정 role 398개): Service 353 / AWS 만 38 / AWS+Service 5 / Federated 2.
+# 혼합(AWS+Service)은 1.3% 이고 전부 "서비스 + 배포 계정 root" 패턴이었다 → Service 가 있으면
+# 서비스 실행 역할로 본다. 서비스 principal 이 `*.amazonaws.com` 이 아닌 경우도 있으므로
+# (`*.aws.internal` 실측 2건) 도메인 접미가 아니라 **Principal 의 키**로 판정한다.
+_TRUST_SERVICE = "Service"
+_TRUST_FEDERATED = "Federated"
+_TRUST_AWS = "AWS"
+
+
+def _trust_principals(trust_policy: dict) -> tuple[set[str], list[str]]:
+    """신뢰정책 → (Principal 키 집합, principal 원문 목록 정렬).
+
+    Allow statement 만 본다(Deny 는 신뢰를 부여하지 않는다). `Principal: "*"` 처럼 문자열인
+    경우도 있어 dict/str 양쪽을 처리한다.
+    """
+    keys: set[str] = set()
+    values: set[str] = set()
+    statements = trust_policy.get("Statement", []) if isinstance(trust_policy, dict) else []
+    if isinstance(statements, dict):
+        statements = [statements]
+    for stmt in statements:
+        if not isinstance(stmt, dict) or stmt.get("Effect") != "Allow":
+            continue
+        principal = stmt.get("Principal")
+        if isinstance(principal, str):
+            keys.add(_TRUST_AWS)
+            values.add(principal)
+            continue
+        if not isinstance(principal, dict):
+            continue
+        for key, val in principal.items():
+            keys.add(key)
+            values.update(v for v in ([val] if isinstance(val, str) else val or []) if isinstance(v, str))
+    return keys, sorted(values)
+
+
+def _principal_kind(identity_type: str, trust_keys: set[str]) -> PrincipalKind:
+    """사용 주체 구분. IAM 사용자는 신뢰정책이 없으므로 identity_type 으로 즉시 판정."""
+    if identity_type == "user":
+        return "human"
+    if identity_type == "sso_ps":
+        return "human"  # PS 할당 = 사람 접근 1건(합성 레코드).
+    if _TRUST_FEDERATED in trust_keys:
+        return "human"  # SAML/OIDC → 사람이 IdP 로 로그인해 assume.
+    if _TRUST_SERVICE in trust_keys:
+        return "service"
+    # Principal.AWS 만 있거나 신뢰정책 미수집 → 신뢰정책만으로는 갈릴 수 없다.
+    return "unknown"
 
 
 def normalize(storage: "Storage", run: "RunContext") -> list[PrincipalRecord]:
@@ -129,11 +182,19 @@ def _normalize_account(
         has_managed = bool(p.get("attached_policies")) if in_inventory else False
         exc_type = _exception_type(arn)
 
+        # 신뢰정책 → 사용 주체. 인벤토리 밖 principal(credential_report degraded 등)은 신뢰정책이
+        # 없어 'unknown' 이 된다 — 추측하지 않고 모른다고 남긴다.
+        trust_keys, trust_values = _trust_principals(p.get("trust_policy") or {} if in_inventory else {})
+        kind = _principal_kind(identity_type, trust_keys)
+
         records.append(
             PrincipalRecord(
                 account_id=account_id,
                 principal=arn,
                 identity_type=identity_type,
+                principal_kind=kind,
+                trust_principals=trust_values,
+                tags=dict(p.get("tags") or {}) if in_inventory else {},
                 granted_actions=sorted(set(granted)),
                 used_actions=used,
                 unused_findings=unused_findings,
@@ -208,6 +269,7 @@ def _sso_ps_records(
                 account_id=account_id,
                 principal=key,
                 identity_type="sso_ps",
+                principal_kind="human",  # PS 할당은 사람 접근이다.
                 # 이 PS 로 실제 호출된 action(대상 계정의 AWSReservedSSO_* 역할에서 귀속).
                 # granted 는 PS 정책 문서를 수집하지 않아 아직 비어 있다(후속) → 지금은 미사용 갭 계산
                 # 대상이 아니고, "이 PS 가 실제로 쓰이는지"까지만 판정한다.

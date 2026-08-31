@@ -50,8 +50,9 @@ class CredentialReportCollector(Collector):
 def _account_authorization_details(iam) -> list[dict]:
     """role + user 인벤토리(정책 포함)를 결정론 순서로 수집.
 
-    반환 각 항목: {principal(ARN), name, identity_type, inline_policies[], attached_policies[]}.
-    granted actions 추출은 M2(normalizer)에서 정책 문서를 파싱해 수행한다.
+    반환 각 항목: {principal(ARN), name, identity_type, inline_policies[], attached_policies[],
+    path, tags{}, (role 만)trust_policy{}}.
+    granted actions 추출과 신뢰정책 해석은 M2(normalizer)에서 수행한다.
     """
     principals: list[dict] = []
     paginator = iam.get_paginator("get_account_authorization_details")
@@ -66,6 +67,9 @@ def _account_authorization_details(iam) -> list[dict]:
 
 
 def _role_record(role: dict) -> dict:
+    # trust_policy/tags 는 같은 GetAccountAuthorizationDetails 응답에 이미 들어 있다 —
+    # 추가 API 호출도 추가 IAM 권한도 없다. botocore 가 AssumeRolePolicyDocument 를 dict 로
+    # 디코드해 주므로(URL 인코딩 해제) 그대로 저장한다. M2 가 사용 주체(사람/서비스)를 가르는 근거.
     return {
         "principal": role["Arn"],
         "name": role["RoleName"],
@@ -73,6 +77,8 @@ def _role_record(role: dict) -> dict:
         "inline_policies": _inline(role.get("RolePolicyList", [])),
         "attached_policies": _attached(role.get("AttachedManagedPolicies", [])),
         "path": role.get("Path", "/"),
+        "trust_policy": role.get("AssumeRolePolicyDocument") or {},
+        "tags": _tags(role.get("Tags", [])),
     }
 
 
@@ -84,7 +90,14 @@ def _user_record(user: dict) -> dict:
         "inline_policies": _inline(user.get("UserPolicyList", [])),
         "attached_policies": _attached(user.get("AttachedManagedPolicies", [])),
         "path": user.get("Path", "/"),
+        # user 는 신뢰정책이 없다(자기 자격으로 직접 로그인) → trust_policy 없음.
+        "tags": _tags(user.get("Tags", [])),
     }
+
+
+def _tags(tag_list: list[dict]) -> dict[str, str]:
+    """IAM Tags([{Key,Value}]) → {키: 값}. 키 정렬로 결정론 유지(불변식 ②)."""
+    return {t["Key"]: t.get("Value", "") for t in sorted(tag_list, key=lambda t: t.get("Key", "")) if t.get("Key")}
 
 
 def _inline(policy_list: list[dict]) -> list[dict]:

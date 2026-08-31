@@ -325,7 +325,7 @@ def records_to_parquet_bytes(records: "list[PrincipalRecord]") -> bytes:
     import pyarrow.parquet as pq
 
     ordered = sorted(records, key=lambda r: (r.account_id, r.principal))
-    rows = [r.model_dump() for r in ordered]
+    rows = [_encode_row(r.model_dump()) for r in ordered]
 
     table = pa.Table.from_pylist(rows, schema=_parquet_schema())
     sink = io.BytesIO()
@@ -344,7 +344,30 @@ def parquet_bytes_to_rows(data: bytes) -> list[dict]:
     import pyarrow.parquet as pq
 
     table = pq.read_table(io.BytesIO(data))
-    return table.to_pylist()
+    return [_decode_row(r) for r in table.to_pylist()]
+
+
+# tags(dict[str,str])는 parquet map 타입으로 왕복시키면 to_pylist() 가 [(k,v)] 튜플 목록을 돌려줘
+# pydantic dict 검증에 실패한다. 이 모듈의 다른 중첩 값과 같은 방침으로 **정렬된 JSON 문자열** 컬럼에
+# 담는다(sort_keys → 바이트 안정, 불변식 ②).
+_JSON_COLUMNS = ("tags",)
+
+
+def _encode_row(row: dict) -> dict:
+    for col in _JSON_COLUMNS:
+        row[col] = json.dumps(row.get(col) or {}, sort_keys=True, ensure_ascii=False)
+    return row
+
+
+def _decode_row(row: dict) -> dict:
+    for col in _JSON_COLUMNS:
+        raw = row.get(col)
+        if isinstance(raw, str):
+            try:
+                row[col] = json.loads(raw) if raw else {}
+            except ValueError:
+                row[col] = {}
+    return row
 
 
 def _parquet_schema():
@@ -352,6 +375,10 @@ def _parquet_schema():
 
     스키마를 명시해 pyarrow 의 타입 추론(빈 리스트·None 컬럼에서 흔들림)을 제거한다 →
     같은 입력이면 같은 스키마·같은 바이트.
+
+    🔴 이 스키마는 **allowlist** 다. `PrincipalRecord` 에 필드를 추가하고 여기 컬럼을 추가하지 않으면
+    `from_pylist` 가 그 키를 조용히 버려, 쓰기는 되는데 읽으면 기본값으로 되돌아온다(에러 없음).
+    모델에 필드를 더할 때는 반드시 이 목록도 함께 늘리고 왕복 테스트로 확인할 것.
     """
     import pyarrow as pa
 
@@ -374,6 +401,9 @@ def _parquet_schema():
             ("account_id", pa.string()),
             ("principal", pa.string()),
             ("identity_type", pa.string()),
+            ("principal_kind", pa.string()),
+            ("trust_principals", pa.list_(pa.string())),
+            ("tags", pa.string()),  # 정렬된 JSON 문자열(_JSON_COLUMNS)
             ("granted_actions", pa.list_(pa.string())),
             ("used_actions", pa.list_(used_action)),
             ("unused_findings", pa.list_(pa.string())),

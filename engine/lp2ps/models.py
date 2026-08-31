@@ -15,6 +15,11 @@ from pydantic import BaseModel, Field
 
 # ---- 리터럴 타입 (types.ts 와 동일) ----
 IdentityType = Literal["role", "user", "service", "sso_ps"]
+# 신뢰정책(AssumeRolePolicyDocument) 기반 사용 주체 구분 — persona 대상 여부를 가른다.
+#  human   : IAM 사용자, 또는 Federated(SAML/OIDC) 신뢰 역할 → 사람이 로그인해 쓴다.
+#  service : Principal.Service 가 있는 역할 → AWS 서비스가 실행 주체(사람이 로그인 불가).
+#  unknown : Principal.AWS 만(계정/역할 신뢰) → 신뢰정책만으로는 갈리지 않는다. 다른 근거 필요.
+PrincipalKind = Literal["human", "service", "unknown"]
 RiskLevel = Literal["critical", "high", "medium", "low"]
 ApprovalStatus = Literal["draft", "review", "approved"]
 RunStatus = Literal["running", "succeeded", "failed", "degraded"]
@@ -40,6 +45,13 @@ class PrincipalRecord(BaseModel):
     account_id: str
     principal: str  # ARN
     identity_type: IdentityType
+    # 신뢰정책 기반 구분(M2 가 채운다). 서비스 역할을 persona 군집에서 분리하는 근거.
+    principal_kind: PrincipalKind = "unknown"
+    # 신뢰정책에 적힌 principal 원문(정렬). UI 배지의 근거를 그대로 노출한다 —
+    # 예: ["lambda.amazonaws.com"] → 배지 "Lambda", ["arn:…:root"] → "계정 신뢰".
+    trust_principals: list[str] = Field(default_factory=list)
+    # role/user 태그(키→값). 소유자 귀속 시도용 표시 정보이며 분류 입력으로는 쓰지 않는다.
+    tags: dict[str, str] = Field(default_factory=dict)
     granted_actions: list[str] = Field(default_factory=list)
     used_actions: list[UsedAction] = Field(default_factory=list)
     unused_findings: list[str] = Field(default_factory=list)
@@ -104,10 +116,27 @@ class PolicyAction(BaseModel):
     count_90d: int = 0
 
 
+class MemberDetail(BaseModel):
+    """persona 적용 대상 1건의 판별 근거.
+
+    `members`(ARN 문자열 목록)만으로는 "이 대상이 사람이냐 서비스냐, 근거가 뭐냐"에 답할 수 없어
+    운영자가 목록을 보고도 판단을 못 한다. 신뢰정책 파생 값(`m2_normalizer` 산출)을 그대로 실어
+    UI 가 배지·필터로 보여준다 — 사람의 분류를 저장하지 않고 매 run 소스에서 다시 판정한다.
+    """
+
+    principal: str
+    principal_kind: PrincipalKind = "unknown"
+    trust_principals: list[str] = Field(default_factory=list)
+    tags: dict[str, str] = Field(default_factory=dict)  # 소유자 귀속 표시용(분류 입력 아님)
+
+
 class CatalogEntry(BaseModel):
     persona: str
     description: str
     members: list[str] = Field(default_factory=list)  # principal ARN 목록
+    # members 와 **같은 순서**(principal asc)의 판별 근거. members 를 지우지 않는 이유: 승인
+    # member_hash·Terraform 생성이 이미 이 필드를 계약으로 쓴다.
+    member_details: list[MemberDetail] = Field(default_factory=list)
     member_count: int = 0
     policy_ref: str  # s3 key or id
     approval_status: ApprovalStatus = "draft"
