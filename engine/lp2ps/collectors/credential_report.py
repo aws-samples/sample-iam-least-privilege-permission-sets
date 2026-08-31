@@ -42,7 +42,11 @@ class CredentialReportCollector(Collector):
             "principals": principals,
             "credential_report": cred_rows,
         }
-        status = "ok" if principals else "degraded"
+        # credential report 가 비면 MFA·장기 액세스키 근거가 **전부** 사라진다 — 그런데 인벤토리는
+        # 살아 있으니 예전엔 ok 로 보고했다. 그 결과 대시보드는 "장기 액세스키 0" 을 보여주는데,
+        # 그건 0건이라는 뜻이 아니라 근거가 없었다는 뜻이다(575 첫 실행에서 실제로 그랬다). 실패는
+        # 실패로 말한다 → degraded.
+        status = "ok" if principals and not cred_note else "degraded"
         note = cred_note if cred_note else ("" if principals else "principal 인벤토리가 비어 있음")
         return CollectorResult(source=SOURCE, status=status, data=data, note=note)
 
@@ -117,11 +121,34 @@ def _attached(managed: list[dict]) -> list[dict]:
     return out
 
 
+# credential report 생성은 **비동기**다. 그 계정에서 처음 만드는(또는 만료된) 경우
+# GetCredentialReport 가 즉시 ReportInProgress 로 실패한다 — 575 첫 실행에서 실제로 그랬고,
+# MFA·액세스키 근거가 통째로 빠진 채 run 은 '성공' 으로 보였다. 생성은 보통 수 초라 짧게 기다린다.
+_REPORT_WAIT_SECONDS = (2, 3, 5, 5, 5, 5, 5)  # 누적 30초
+
+
 def _credential_report(iam) -> tuple[list[dict], str]:
     """credential report CSV → user 별 dict 목록(안정 정렬). 실패 시 ([], note)."""
+    import time
+
     try:
         iam.generate_credential_report()  # 비동기 생성 트리거 (계정 미변경)
-        resp = iam.get_credential_report()
+        resp = None
+        for i, wait in enumerate((0, *_REPORT_WAIT_SECONDS)):
+            if wait:
+                time.sleep(wait)  # 대기는 시간 소모일 뿐 산출물에 wall-clock 을 남기지 않는다(불변식②)
+            try:
+                resp = iam.get_credential_report()
+                break
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "Unknown")
+                if code not in ("ReportInProgress", "ReportNotPresent"):
+                    raise
+                if i == len(_REPORT_WAIT_SECONDS):
+                    return [], (f"credential report 생성 대기 시간 초과({code}) — MFA·액세스키 근거 없음"
+                                f"(다음 실행에서 채워집니다)")
+        if resp is None:  # pragma: no cover - 방어(루프는 위에서 반드시 반환/탈출한다)
+            return [], "credential report 조회 실패: Unknown"
     except ClientError as e:  # 권한 부족 등 — 완주 위해 degraded
         return [], f"credential report 조회 실패: {e.response.get('Error', {}).get('Code', 'Unknown')}"
 
