@@ -29,6 +29,13 @@ provisioning:
   #                   instance, and idc_region above may be left empty.
   uses_identity_center: true
 
+# Collection budget — see config/example.yaml for the reasoning. Five accounts share one 15-minute
+# Lambda and each LookupEvents page costs ~0.5 s, so ~900 / (0.5 * 5) = 360 pages is the ceiling;
+# 300 leaves headroom for throttle backoff. Events arrive newest-first, so a lower cap narrows the
+# CloudTrail window rather than dropping events at random, and each run reports the window it covered.
+collection:
+  cloudtrail_max_pages: 300
+
 risk_rules:
   long_lived_key_days: 90
   unused_action_days: 90

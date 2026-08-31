@@ -56,7 +56,12 @@ def collect(
 
     for account in sessions:
         # collector 간 공유 컨텍스트. as_of = run.started_at → 90일 창 결정론.
-        context: dict = {"as_of": run.started_at, "idc_region": idc_region}
+        context: dict = {
+            "as_of": run.started_at,
+            "idc_region": idc_region,
+            # 수집 예산(계정 수에 맞춰 고객이 조정) — collector 가 코드 상수 대신 이 값을 쓴다.
+            "cloudtrail_max_pages": config.collection.cloudtrail_max_pages,
+        }
         source_entries: list[dict] = []
 
         for collector in all_collectors():

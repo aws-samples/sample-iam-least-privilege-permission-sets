@@ -26,6 +26,24 @@ def test_load_self() -> None:
     assert cfg.readonly_role_name == "lp2ps-readonly"
 
 
+# ---- 수집 예산(불변식 ④) ----
+#
+# LookupEvents 페이지 상한은 고객의 계정 수·활동량에 달렸다. 코드 상수로 두면 계정이 3개인
+# 고객과 200개인 고객이 같은 예산으로 15분 Lambda 를 나눠 쓴다.
+
+
+def test_collection_budget_defaults_and_is_overridable() -> None:
+    assert Config.model_validate({"customer": "c"}).collection.cloudtrail_max_pages == 200
+    # 계정이 많은 템플릿은 더 낮은/조정된 예산을 명시한다(예시 자체가 근거 문서다).
+    assert load_config(CONFIG_DIR / "multi.yaml").collection.cloudtrail_max_pages == 300
+
+
+def test_collection_budget_rejects_zero() -> None:
+    """0 이면 CloudTrail 을 아예 안 읽는데 산출물은 '수집됨'으로 보인다 → 조용한 오해를 막는다."""
+    with pytest.raises(ValueError):
+        Config.model_validate({"customer": "c", "collection": {"cloudtrail_max_pages": 0}})
+
+
 def test_single_account_requires_self_accounts() -> None:
     # cross_account=false(기본) 인데 실제 계정 ID → 거부.
     with pytest.raises(ValueError):

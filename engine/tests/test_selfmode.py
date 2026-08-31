@@ -151,6 +151,34 @@ def test_skipped_only_is_succeeded(tmp_path, monkeypatch) -> None:
     assert manifest["status_summary"]["has_skipped"] is True
 
 
+@mock_aws
+def test_collection_budget_reaches_collectors(tmp_path, monkeypatch) -> None:
+    """config.collection 의 예산이 collector context 로 실제로 전달된다.
+
+    collector 는 context 에 값이 없으면 모듈 기본값으로 조용히 폴백하므로, 배선이 끊겨도
+    수집은 성공한다 — 즉 이 어설션 없이는 배선 손상이 어떤 테스트에도 안 잡힌다.
+    """
+    _seed_iam()
+    cfg = Config.model_validate({"customer": "test", "region": "us-west-2",
+                                 "cross_account": False, "accounts": ["self"],
+                                 "collection": {"cloudtrail_max_pages": 7}})
+    seen: list[dict] = []
+
+    def _spy(self, account, context):  # noqa: ANN001
+        seen.append(dict(context))
+        from lp2ps.collectors import CollectorResult
+        return CollectorResult(source=self.source, status="ok",
+                               data={"account_id": account.account_id}, note="")
+
+    import lp2ps.m1_collector as m1
+    for c in m1.all_collectors():
+        monkeypatch.setattr(type(c), "collect", _spy, raising=True)
+
+    collect(cfg, LocalFSStorage(tmp_path, "test", "run-fixed"), _run())
+    assert seen, "collector 가 한 번도 호출되지 않았다(대조 전제)"
+    assert all(ctx["cloudtrail_max_pages"] == 7 for ctx in seen)
+
+
 def test_sec012_014_exception_note_no_leak() -> None:
     """collector 예외 시 manifest note 에 예외 메시지·traceback 을 넣지 않는다
     (예외 타입명만). 민감정보(계정ID·ARN 등)가 섞인 예외 텍스트의 고객 노출 방지."""

@@ -30,10 +30,14 @@ if TYPE_CHECKING:  # pragma: no cover
 SOURCE = "cloudtrail"
 
 _WINDOW_DAYS = 90
-# LookupEvents 페이지 상한(계정당). 1페이지=최대 50개 → 최대 1만 이벤트/계정. LookupEvents 는 초당
-# 요청 제한이 빡빡해(≈2회/초) 상한을 크게 잡으면 throttle·시간초과가 난다. 200 은 90일 관리 이벤트를
-# 대부분 커버하면서 throttle backoff·Lambda 15분 안에 완주 가능한 현실적 값. 상한 도달해도 ok
-# (LookupEvents 는 원래 관리 이벤트만 주는 부분 소스이고 Access Advisor 가 보완 — '가능한 만큼=정상').
+# 페이지 상한 기본값(계정·리전당). 실제 값은 `config.collection.cloudtrail_max_pages` 에서 오고
+# 이 상수는 context 에 값이 없을 때의 폴백일 뿐이다(불변식 ④ — 임계치는 config).
+#
+# 상한을 올려도 90일을 덮을 수 없다(실측): 페이지당 최대 50건·≈0.5초라 활동이 많은 계정은
+# 1,200페이지(60,000건, 약 10분)로도 며칠분밖에 못 읽는다. 90일 완주엔 수만 페이지·수 시간이
+# 필요해 15분 Lambda 와 양립하지 않는다. 그래서 이 값은 "받아낼 양"이 아니라 "쓸 시간"의 상한이고,
+# 상한 도달은 결함이 아니라 정상(부분 소스)이다 — 미사용 판정의 근거는 90일 이상을 보는 Access
+# Advisor 이며 CloudTrail 은 그 위에 최근 사용을 덧붙이는 역할이다.
 _LOOKUP_MAX_PAGES = 200
 # throttle 재시도: 실시간 불필요하므로 backoff 로 천천히 넘긴다(수집 지연만, 산출물 불변식② 영향 없음).
 _THROTTLE_CODES = {"ThrottlingException", "Throttling", "RequestLimitExceeded", "TooManyRequestsException"}
@@ -45,10 +49,11 @@ class CloudTrailCollector(Collector):
 
     def collect(self, account: "AccountSession", context: dict) -> CollectorResult:
         as_of = _parse_as_of(context.get("as_of"))
+        max_pages = int(context.get("cloudtrail_max_pages") or _LOOKUP_MAX_PAGES)
 
         try:
             ct = account.client("cloudtrail")
-            events, truncated = _lookup_events(ct, as_of)
+            events, truncated, coverage_start = _lookup_events(ct, as_of, max_pages)
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "Unknown")
             return CollectorResult(
@@ -62,12 +67,21 @@ class CloudTrailCollector(Collector):
         # 보완하므로 '가능한 만큼=정상'. 상한 도달(truncated)은 note 로만 알림(상태는 ok).
         note = "LookupEvents(90d) 관리 이벤트 기반. 데이터 이벤트는 미포함(Access Advisor 로 보완)."
         if truncated:
-            note += f" 페이지 상한({_LOOKUP_MAX_PAGES}) 도달로 더 과거 일부는 미수집."
+            # 실제로 덮은 기간을 말한다 — "일부 미수집" 만으로는 그게 89일인지 하루인지 알 수 없고,
+            # 활동이 많은 계정에서는 실제로 하루 수준이 된다. 최신순 수집이라 잘린 쪽은 과거다.
+            span = _coverage_span(coverage_start, as_of)
+            note += (f" 페이지 상한({max_pages}) 도달 — 이 계정의 CloudTrail 근거는 {span}이다"
+                     f"(90일 미사용 판정은 Access Advisor 가 담당).")
         return CollectorResult(
             source=SOURCE,
             status="ok",
             data={"account_id": account.account_id, "mode": "lookup_events",
-                  "truncated": truncated, "usage": events},
+                  "truncated": truncated,
+                  # 관측한 가장 오래된 이벤트 시각. 이벤트에서 파생된 값이라 wall-clock 이 아니다
+                  # (불변식 ②). 소비자는 이걸로 CloudTrail 근거의 유효 창을 알 수 있다.
+                  "coverage_start": coverage_start,
+                  "max_pages": max_pages,
+                  "usage": events},
             note=note,
         )
 
@@ -89,8 +103,26 @@ def _window_start(as_of: datetime | None) -> datetime | None:
     return as_of - timedelta(days=_WINDOW_DAYS)
 
 
-def _lookup_events(ct, as_of: datetime | None) -> tuple[list[dict], bool]:
-    """LookupEvents — (집계 행 목록, 페이지 상한 도달 여부) 반환.
+def _coverage_span(coverage_start: str | None, as_of: datetime | None) -> str:
+    """근거 창의 실제 길이를 사람이 읽는 문구로.
+
+    일 단위로만 쓰면 활동이 아주 많은 계정에서 "최근 0일분" 이 나온다 — 실측에서 실제로 그랬다
+    (200페이지가 반나절도 못 덮는 계정). 24시간 미만은 시간으로 말한다.
+    """
+    if not coverage_start or as_of is None:
+        return "일부 기간만"
+    try:
+        start = datetime.fromisoformat(coverage_start.replace("Z", "+00:00"))
+    except ValueError:
+        return "일부 기간만"
+    hours = max((as_of - start).total_seconds() / 3600, 0)
+    if hours < 24:
+        return f"최근 {hours:.0f}시간분"
+    return f"최근 {int(hours // 24)}일분"
+
+
+def _lookup_events(ct, as_of: datetime | None, max_pages: int) -> tuple[list[dict], bool, str | None]:
+    """LookupEvents — (집계 행 목록, 페이지 상한 도달 여부, 관측 최고(最古) 시각) 반환.
 
     (principal, event_name) 별 카운트/최근시각 집계.
 
@@ -113,6 +145,9 @@ def _lookup_events(ct, as_of: datetime | None) -> tuple[list[dict], bool]:
     next_token = None
     pages = 0
     truncated = False
+    # 커버 기간은 '훑은 범위'이므로 principal 을 못 뽑은 이벤트(AWSService 등)도 포함해 잰다 —
+    # 집계 대상만 보면 근거 창을 실제보다 짧게 말하게 된다.
+    coverage_start: str | None = None
     while True:
         page_kwargs = dict(kwargs)
         if next_token:
@@ -126,10 +161,13 @@ def _lookup_events(ct, as_of: datetime | None) -> tuple[list[dict], bool]:
         for ev in page.get("Events", []):
             src = ev.get("EventSource", "")
             name = ev.get("EventName", "")
+            event_time = ev.get("EventTime")
+            ev_iso = _iso(event_time)
+            if ev_iso and (coverage_start is None or ev_iso < coverage_start):
+                coverage_start = ev_iso
             principal = _principal_from_event(ev.get("CloudTrailEvent"))
             if not principal:
                 continue  # AWSService 등 IAM principal 없는 이벤트는 사용실태 대상 아님
-            event_time = ev.get("EventTime")
             key = (principal, src, name)
             rec = agg.setdefault(
                 key,
@@ -142,20 +180,19 @@ def _lookup_events(ct, as_of: datetime | None) -> tuple[list[dict], bool]:
                 },
             )
             rec["count"] += 1
-            iso = _iso(event_time)
-            if iso and (rec["last_used"] is None or iso > rec["last_used"]):
-                rec["last_used"] = iso
+            if ev_iso and (rec["last_used"] is None or ev_iso > rec["last_used"]):
+                rec["last_used"] = ev_iso
         pages += 1
         next_token = page.get("NextToken")
         if not next_token:
             break  # 마지막 페이지 — 90일 창 전체 수집 완료.
-        if pages >= _LOOKUP_MAX_PAGES:
+        if pages >= max_pages:
             truncated = True  # 상한 도달, 후속 토큰 남음 → 더 과거 일부 미수집.
             break
 
     rows = list(agg.values())
     rows.sort(key=lambda r: (r["principal"], r["event_source"], r["event_name"]))
-    return rows, truncated
+    return rows, truncated, coverage_start
 
 
 class _ThrottleExhausted(Exception):

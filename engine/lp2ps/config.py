@@ -50,6 +50,35 @@ class ProvisioningConfig(BaseModel):
     uses_identity_center: bool = True
 
 
+class CollectionConfig(BaseModel):
+    """M1 수집 예산 — 고객 환경(계정 수·API 활동량)에 따라 조정해야 하는 값들.
+
+    왜 config 인가: 이 상한은 고객의 계정 수와 활동량에 달렸고, 코드에 박으면 계정이 3개인
+    고객과 200개인 고객이 같은 예산을 쓴다(불변식 ④ — 임계치는 config 에만).
+
+    **왜 상한이 아예 필요한가:** LookupEvents 는 페이지당 최대 50건인데 초당 ≈2회로 제한돼
+    페이지당 약 0.5초가 든다. 활동이 많은 계정의 90일 관리 이벤트를 끝까지 훑으려면 수만
+    페이지(수 시간)가 필요해 어떤 상한을 골라도 90일 완주는 불가능하다 — 상한은 "얼마나
+    받아낼 것인가"가 아니라 "정해진 시간 안에 끝낼 것인가"의 문제다. collect 단계는 전 계정을
+    한 Lambda 에서 순차 처리하며 타임아웃이 15분이므로(`infra/lib/engine-stack.ts`), 안전한
+    예산은 대략 `900초 / (0.5초 × 계정수)` 페이지다.
+
+    LookupEvents 는 **최신순**이라 상한에 걸려 버려지는 것은 가장 오래된 이벤트다. 따라서
+    상한을 낮게 두면 산출물의 CloudTrail 근거가 최근 며칠로 좁아지는 것이지, 무작위로
+    누락되는 것이 아니다. 실제로 덮은 기간은 raw 의 `coverage_start` 로 기록된다.
+    """
+
+    # 계정·리전당 LookupEvents 페이지 상한. 페이지 **수**여야 한다(초 단위 예산으로 바꾸면
+    # 실행 속도에 따라 절단 지점이 달라져 불변식 ②(결정론)가 깨진다).
+    cloudtrail_max_pages: int = 200
+
+    @model_validator(mode="after")
+    def _check_budget(self) -> "CollectionConfig":
+        if self.cloudtrail_max_pages < 1:
+            raise ValueError("collection.cloudtrail_max_pages 는 1 이상이어야 합니다.")
+        return self
+
+
 class RiskRules(BaseModel):
     """M4 위험 점수 규칙 — 임계치 + 가중치(0-100 스케일로 합산 후 클램프).
 
@@ -141,6 +170,7 @@ class Config(BaseModel):
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     ai: AiConfig = Field(default_factory=AiConfig)
     provisioning: ProvisioningConfig = Field(default_factory=ProvisioningConfig)
+    collection: CollectionConfig = Field(default_factory=CollectionConfig)
     risk_rules: RiskRules = Field(default_factory=RiskRules)
     catalog: CatalogConfig = Field(default_factory=CatalogConfig)
     permission_sets: PermissionSetConfig = Field(default_factory=PermissionSetConfig)

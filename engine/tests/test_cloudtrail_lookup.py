@@ -95,9 +95,11 @@ def test_lookup_events_aggregates_by_real_arn() -> None:
         _event(ASSUMED_ROLE, "s3.amazonaws.com", "GetObject", "2026-07-11T00:00:00+00:00"),
         _event(AWS_SERVICE, "kms.amazonaws.com", "GenerateDataKey", "2026-07-09T00:00:00+00:00"),
     ]
-    rows, truncated = _lookup_events(_FakeCT(events), AS_OF)
+    rows, truncated, coverage_start = _lookup_events(_FakeCT(events), AS_OF, 200)
 
     assert truncated is False  # 단일 페이지 → 상한 미도달
+    # 커버 기간은 훑은 범위 — principal 없는 AWSService 이벤트(7/9)가 가장 오래된 것이다.
+    assert coverage_start.startswith("2026-07-09")
     # AWSService 이벤트는 principal 없음 → 제외. AssumedRole 2건은 같은 IAM ARN 으로 집계.
     assert len(rows) == 1
     r = rows[0]

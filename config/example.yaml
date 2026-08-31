@@ -34,6 +34,19 @@ ai:
 provisioning:
   idc_region: ""  # IdC region (empty = use config.region). The PS-creation gate is enforced at runtime.
 
+# Collection budget. The collect stage processes every account sequentially in a single Lambda with a
+# 15-minute timeout, and CloudTrail LookupEvents is rate-limited to roughly two requests per second
+# (~0.5 s per 50-event page). So a safe budget is about `900 / (0.5 * number_of_accounts)` pages:
+# ~90 for the two accounts above, and far lower for a large organization.
+#
+# Raising this does not buy 90-day coverage. A busy account produces tens of thousands of management
+# events per day, so finishing the 90-day window would take tens of thousands of pages (hours). Events
+# come back newest-first, so the cap trims the oldest ones and each run records the window it actually
+# covered (`coverage_start` in the raw payload, and the run's CloudTrail note). The 90-day unused
+# verdict comes from Access Advisor, which is not paginated this way.
+collection:
+  cloudtrail_max_pages: 200
+
 # Risk-scoring rule thresholds (tunable per customer; never hardcode in code).
 risk_rules:
   long_lived_key_days: 90
