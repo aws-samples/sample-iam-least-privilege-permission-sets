@@ -243,6 +243,49 @@ assert(
   "the API role may Scan the findings table (status merge on GET /cleanup-backlog)",
 );
 
+// ---- catalog override spill: the API's only S3 write, and it must stay narrow ----
+//
+// Overrides carry the full action list and the edited policy document, which measured ~350KB on a
+// live account -- close enough to DynamoDB's 400KB item limit that approving a large persona fails.
+// The API therefore spills those bodies to `<customer>/overrides/` in the tool-owned bucket. That
+// is the only S3 write the API has, so widening it (a bare `s3:*`, a bucket-wide resource, or
+// PutObject over the engine's run artifacts) has to fail here rather than in review.
+const s3Writes = statements.filter((s) => {
+  const acts = (Array.isArray(s.Action) ? s.Action : [s.Action ?? ""]) as string[];
+  return acts.some((a) => /^s3:(Put|Delete|\*)/.test(a));
+});
+assert(s3Writes.length === 1, `the API role has exactly one S3 write statement (found ${s3Writes.length})`);
+const spill = s3Writes[0] ?? { Action: [], Resource: [] };
+const spillActions = (Array.isArray(spill.Action) ? spill.Action : [spill.Action ?? ""]) as string[];
+assert(
+  spillActions.length === 1 && spillActions[0] === "s3:PutObject",
+  "the S3 write is PutObject only (no DeleteObject -- override history stays auditable)",
+);
+const spillResource = JSON.stringify(spill.Resource ?? "");
+assert(
+  spillResource.includes(`/${CFG.customer}/overrides/*`),
+  "the S3 write is scoped to <customer>/overrides/* (engine run artifacts stay read-only)",
+);
+// A bucket-wide grant synthesizes as the bucket ARN joined with the literal "/*"; the scoped one
+// joins "/<customer>/overrides/*". So the tell is a standalone "/*" element, not a trailing "*".
+assert(
+  !/"\*"/.test(spillResource) && !/"\/\*"/.test(spillResource),
+  "the S3 write has no bucket-wide or bare '*' resource",
+);
+// SSE-KMS buckets reject PutObject without data-key permissions, so a scoped write that forgets
+// the key grant fails at runtime on the first large approval.
+//
+// Measured caveat, so nobody reads more into this than it says: removing the bucket's grantEncrypt
+// does NOT make this assertion fail today, because the bucket and the DynamoDB tables share one
+// CMK and catalogTable.grantReadWriteData already hands over GenerateDataKey. This is therefore a
+// coverage assertion (the role can encrypt at all), not a proof that the bucket grant is
+// load-bearing. It still fires if a refactor drops both grants.
+const kmsEncrypt = statements.filter((s) => {
+  const acts = (Array.isArray(s.Action) ? s.Action : [s.Action ?? ""]) as string[];
+  return acts.some((a) => a === "kms:GenerateDataKey*" || a === "kms:Encrypt");
+});
+assert(kmsEncrypt.length >= 1, "the API role may generate a data key (SSE-KMS PutObject needs it)");
+
 if (process.exitCode && process.exitCode !== 0) {
   console.error("\n일부 어설션 실패");
 } else {

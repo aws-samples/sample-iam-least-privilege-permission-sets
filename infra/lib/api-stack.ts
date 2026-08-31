@@ -208,6 +208,22 @@ export class ApiStack extends cdk.Stack {
       }),
     );
     catalogTable.grantReadWriteData(apiFn); // PATCH/approve 는 catalog 조정(도구 DynamoDB만)
+    // catalog override 의 큰 본문(actions/policy_doc)은 DynamoDB 400KB 항목 상한을 넘길 수 있어
+    // 도구 소유 버킷의 `<customer>/overrides/` 로 스필한다(repositories._spill_large_fields).
+    // 쓰기 범위는 **이 접두사 하나**로 못 박는다 — run 산출물(엔진이 쓰는 원본)은 여전히 읽기 전용.
+    apiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "WriteCatalogOverrideSpill",
+        actions: ["s3:PutObject"],
+        resources: [`${dataBucket.bucketArn}/${cfg.customer}/overrides/*`],
+      }),
+    );
+    // SSE-KMS 버킷이라 put 에는 데이터키 발급 권한이 필요하다(grantRead 는 Decrypt·DescribeKey 만
+    // 준다). 지금 토폴로지에선 버킷과 DynamoDB 테이블이 **같은 CMK**(data-stack DataKey)를 쓰고
+    // catalogTable.grantReadWriteData 가 이미 GenerateDataKey 를 주므로 이 줄 없이도 동작한다 —
+    // 그 우연에 기대지 않기 위해 S3 쓰기 자체의 권한으로 명시한다(버킷이 별도 키를 갖게 되면
+    // 이 줄만이 put 을 살린다).
+    dataBucket.encryptionKey?.grantEncrypt(apiFn);
     findingsTable.grantReadWriteData(apiFn); // 조치 상태 표시(도구 DynamoDB만 — 대상 계정 무관)
     stateMachine.grantStartExecution(apiFn); // POST /runs 트리거
 

@@ -17,6 +17,7 @@ from mangum import Mangum
 from pydantic import ValidationError
 
 from .auth import require_auth
+from .repositories import OverridePayloadUnavailable
 from .routers import accounts, assistant, catalog, cleanup, iac, metrics, reports, runs, schedule, settings
 
 # 감사·앱 로거 레벨을 엔트리포인트에서 명시한다.
@@ -55,6 +56,16 @@ async def _on_request_validation_error(_: Request, __: RequestValidationError) -
 @app.exception_handler(ValidationError)
 async def _on_validation_error(_: Request, __: ValidationError) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": "요청 형식이 올바르지 않습니다."})
+
+
+# catalog override 의 S3 스필 본문을 못 읽은 경우. 200 으로 "override 없음" 을 돌려주면 사람이
+# 편집·승인한 정책이 합성 원본으로 되돌아간 것처럼 보여 유실과 구분이 안 된다 → 503 으로 알린다.
+@app.exception_handler(OverridePayloadUnavailable)
+async def _on_override_payload_unavailable(_: Request, __: OverridePayloadUnavailable) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "저장된 persona 조정 내용을 읽지 못했습니다. 잠시 후 다시 시도하세요."},
+    )
 
 # CORS: API GW Lambda proxy 통합은 응답 헤더를 그대로 통과시키므로, 실제 응답(GET 등)의
 # Access-Control-Allow-Origin 을 여기서 붙여야 브라우저가 응답을 읽는다(preflight 는 API GW

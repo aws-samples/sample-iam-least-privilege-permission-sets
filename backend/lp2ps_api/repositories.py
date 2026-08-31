@@ -24,10 +24,31 @@ class CatalogConflict(Exception):
     """catalog override 낙관적 락 충돌(동시 쓰기) — 라우터가 409 로 변환."""
 
 
+class OverridePayloadUnavailable(Exception):
+    """catalog override 의 S3 스필 본문을 못 읽었다 — 라우터가 503 으로 변환.
+
+    스필된 `actions`/`policy_doc` 를 조용히 "override 없음" 으로 떨구면 운영자가 편집·승인한 정책이
+    화면에서 **원본 합성값으로 되돌아간 것처럼** 보인다(유실과 구분이 안 된다). 실패로 알린다."""
+
+
 class FindingsUnavailable(Exception):
     """조치 상태 테이블이 배선되지 않음(env 누락) — 라우터가 503 으로 변환.
 
     조용히 성공으로 응답하면 운영자는 표시했다고 믿는데 새로고침하면 사라진다. 실패로 알린다."""
+
+
+def _safe_persona_segment(persona: str) -> str:
+    """persona 명 → S3 키 세그먼트 1개. 라우터가 이미 이름을 검증하지만, 이 값이 키에 들어가는
+    유일한 사용자 입력이므로 여기서도 좁힌다(`../`·`/`·유니코드로 키를 벗어나지 못하게).
+
+    영숫자·`-`·`_` 만 남기고, 잘려서 서로 충돌하지 않도록 원본 해시 12자를 붙인다.
+    """
+    import hashlib
+    import re
+
+    slug = re.sub(r"[^A-Za-z0-9_-]", "_", persona)[:64] or "persona"
+    digest = hashlib.sha256(persona.encode("utf-8")).hexdigest()[:12]
+    return f"{slug}-{digest}"
 
 
 def _member_hash(members: list[str]) -> str:
@@ -121,14 +142,88 @@ class Repositories:
         return entries
 
     def _catalog_overrides(self) -> dict[str, dict]:
-        """도구 소유 DynamoDB catalog 테이블의 persona별 조정 override."""
+        """도구 소유 DynamoDB catalog 테이블의 persona별 조정 override(스필 본문 해소 포함)."""
         if not self.s.catalog_table:
             return {}
         try:
             items = self._scan(self.s.catalog_table)
         except Exception:  # noqa: BLE001 — 테이블 비었거나 접근 불가면 override 없음
             return {}
-        return {i["persona"]: _from_ddb(i) for i in items if "persona" in i}
+        return {
+            i["persona"]: self._resolve_spills(_from_ddb(i))
+            for i in items if "persona" in i
+        }
+
+    # ---- catalog override 의 큰 본문은 S3 로 스필한다 ----
+    #
+    # DynamoDB 항목 상한은 **400KB**(속성명+값 전체)다. override 에는 persona 의 action 전체 목록과
+    # 편집된 policy_doc 이 들어가는데, 실측(575 라이브)에서 action 총합 33,241건·최대 persona 약
+    # 350KB 로 상한에 붙어 있었다. 넘으면 승인/편집 저장이 ValidationException 으로 **실패**한다 —
+    # 그것도 사람이 정책을 다 다듬은 마지막 순간에.
+    #
+    # 그래서 임계치를 넘는 필드만 도구 소유 S3(고객 레벨, run 무관)에 쓰고 DynamoDB 에는 참조만
+    # 남긴다. 병합 의미는 그대로다(읽을 때 참조를 풀어 원래 값 자리에 넣는다).
+    _SPILL_FIELDS = ("actions", "policy_doc")
+    _SPILL_BYTES = 64 * 1024  # 상한(400KB)에서 크게 물러선 값 — 여러 필드가 겹쳐도 안전.
+    _SPILL_SUFFIX = "_s3_ref"
+
+    def _shared_storage(self) -> S3Storage:
+        """고객 레벨(run 무관) 경로 전용 storage. override 는 run 을 넘어 살아남아야 한다."""
+        # shared_* 메서드는 run_prefix 를 쓰지 않으므로 run_id 자리값은 키에 영향이 없다.
+        return S3Storage(f"s3://{self.s.data_bucket}", self.s.customer, "_overrides")
+
+    def _spill_relpath(self, persona: str, field: str, version: int) -> str:
+        """스필 객체 경로. **버전마다 새 키**를 쓴다 — 덮어쓰면 낙관적 락이 실패한 요청이
+        이미 성공한 요청의 본문을 망가뜨리고, 읽는 중인 요청이 반쯤 바뀐 본문을 볼 수 있다."""
+        safe = _safe_persona_segment(persona)
+        return f"overrides/{safe}/{field}-v{version}.json"
+
+    def _resolve_spills(self, item: dict[str, Any]) -> dict[str, Any]:
+        """`<field>_s3_ref` 를 실제 값으로 되돌린다. 못 읽으면 예외(조용한 유실 금지)."""
+        refs = [f for f in self._SPILL_FIELDS if item.get(f + self._SPILL_SUFFIX)]
+        if not refs:
+            return item
+        storage = self._shared_storage()
+        out = dict(item)
+        for field in refs:
+            relpath = str(out.pop(field + self._SPILL_SUFFIX))
+            try:
+                out[field] = storage.read_shared_json(relpath)
+            except Exception as e:  # noqa: BLE001 — 원인 무관: 참조가 있는데 못 읽으면 실패다
+                raise OverridePayloadUnavailable(
+                    f"override 본문을 읽지 못했습니다: {relpath}"
+                ) from e
+        return out
+
+    def _spill_large_fields(self, persona: str, fields: dict, version: int) -> tuple[dict, list[str]]:
+        """임계치 초과 필드를 S3 에 쓰고 참조로 치환. 반환 = (DynamoDB SET 값, REMOVE 할 속성명).
+
+        S3 를 **먼저** 쓴다. 뒤이은 DynamoDB 조건부 갱신이 실패하면 객체는 참조되지 않은 채 남을
+        뿐이다(무해). 순서를 뒤집으면 존재하지 않는 객체를 가리키는 참조가 남는다.
+
+        REMOVE 가 필요한 이유: update_item 은 SET 병합이라 **옛 속성이 지워지지 않는다**. 이번에
+        스필했으면 옛 인라인 값을, 이번에 인라인으로 넣었으면 옛 참조를 지워야 한다. 안 지우면
+        큰 정책을 저장한 뒤 작게 줄여 저장했을 때 읽기가 옛 스필본을 되살려 **되돌린 편집이
+        되살아난다**(참조 해소가 인라인 값을 덮는다).
+        """
+        import json
+
+        out = dict(fields)
+        remove: list[str] = []
+        storage: S3Storage | None = None
+        for field in self._SPILL_FIELDS:
+            if field not in out or not out[field]:
+                continue
+            if len(json.dumps(out[field], ensure_ascii=False).encode("utf-8")) <= self._SPILL_BYTES:
+                remove.append(field + self._SPILL_SUFFIX)  # 인라인으로 저장 → 옛 참조 제거
+                continue
+            if storage is None:
+                storage = self._shared_storage()
+            relpath = self._spill_relpath(persona, field, version)
+            storage.write_shared_json(relpath, out.pop(field))
+            out[field + self._SPILL_SUFFIX] = relpath
+            remove.append(field)  # 참조로 저장 → 옛 인라인 값 제거
+        return out, remove
 
     def put_catalog_override(self, persona: str, fields: dict, *, expected_version: int | None = None) -> int:
         """persona 조정 저장(approve/PATCH) — 속성 병합 + 낙관적 락.
@@ -149,7 +244,9 @@ class Repositories:
             expected_version = int(existing.get("version", 0))
         new_version = expected_version + 1
 
-        ddb_fields = _to_ddb_item(fields)
+        # 400KB 항목 상한을 넘길 큰 본문(actions/policy_doc)은 S3 로 스필하고 참조만 남긴다.
+        spilled, remove_attrs = self._spill_large_fields(persona, fields, new_version)
+        ddb_fields = _to_ddb_item(spilled)
         # SET 절 구성 — 넘어온 속성만 병합(나머지 기존 속성 보존).
         set_parts = ["#v = :newv"]
         names: dict[str, str] = {"#v": "version"}
@@ -159,6 +256,12 @@ class Repositories:
             names[f"#f{i}"] = k
             values[f":f{i}"] = val
         update_expr = "SET " + ", ".join(set_parts)
+        if remove_attrs:
+            remove_parts = []
+            for j, name in enumerate(remove_attrs):
+                names[f"#r{j}"] = name
+                remove_parts.append(f"#r{j}")
+            update_expr += " REMOVE " + ", ".join(remove_parts)
         # 조건: 항목이 없거나(version 없음) version 이 기대값과 일치할 때만.
         cond = Attr("version").not_exists() | Attr("version").eq(expected_version)
         try:

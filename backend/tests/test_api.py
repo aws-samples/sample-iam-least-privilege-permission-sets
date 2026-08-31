@@ -1069,3 +1069,170 @@ def test_audit_logger_level_allows_info_in_lambda_text_format():
 
     assert logging.getLogger("lp2ps.audit").isEnabledFor(logging.INFO)
     assert logging.getLogger("lp2ps.api").isEnabledFor(logging.INFO)
+
+
+# ---- catalog override 의 400KB 절벽: 큰 본문은 S3 로 스필한다 ----
+#
+# override 항목에는 persona 의 action 전체 목록과 편집된 policy_doc 이 들어간다. 실측(575 라이브)에서
+# action 총합 33,241건, 최대 persona 약 350KB 로 DynamoDB 항목 상한(400KB)에 붙어 있었다. 넘으면
+# 사람이 정책을 다 다듬어 승인을 누른 **마지막 순간에** ValidationException 으로 실패한다.
+
+def _big_actions(n: int) -> list[dict]:
+    """대략 n 건의 PolicyAction dump. action 이름을 길게 해 실제 정책 크기에 가깝게 만든다."""
+    return [
+        {"action": f"service{i % 40}:VeryLongOperationNameForSizing{i}", "used": i % 3 == 0,
+         "included": i % 2 == 0, "undetermined": i % 7 == 0, "last_used": None,
+         "count_observed": i}
+        for i in range(n)
+    ]
+
+
+def _ddb_item(persona: str = "DataPersona") -> dict:
+    return boto3.resource("dynamodb", region_name="us-west-2").Table("catalog").get_item(
+        Key={"persona": persona}).get("Item") or {}
+
+
+def _repos(monkeypatch):
+    _client(monkeypatch)  # settings/repos 캐시 초기화
+    from lp2ps_api.deps import get_settings
+    from lp2ps_api.repositories import Repositories
+
+    return Repositories(get_settings())
+
+
+@mock_aws
+def test_large_override_spills_to_s3_and_round_trips(monkeypatch):
+    """400KB 를 넘을 actions 는 S3 로 나가고 항목엔 참조만 남는다 — 그리고 값이 그대로 돌아온다."""
+    import json as _json
+
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    repos = _repos(monkeypatch)
+    actions = _big_actions(3500)
+    inline_bytes = len(_json.dumps(actions).encode())
+    assert inline_bytes > 400 * 1024, f"대조 전제: 인라인이면 상한 초과여야 함(현재 {inline_bytes}B)"
+
+    repos.put_catalog_override("DataPersona", {"actions": actions})
+
+    item = _ddb_item()
+    assert "actions" not in item, "큰 본문이 DynamoDB 항목에 남아 있으면 상한을 넘긴다"
+    assert item["actions_s3_ref"].startswith("overrides/"), item.get("actions_s3_ref")
+    # 항목 전체가 상한에서 크게 물러났는지(단순 이동이 아니라 실제로 작아졌는지).
+    assert len(_json.dumps(_from_ddb_for_size(item)).encode()) < 4096
+
+    # 값 왕복 — 스키마에 컬럼이 있는지가 아니라 **값이 살아 돌아오는지**를 본다.
+    merged = repos._catalog_overrides()["DataPersona"]
+    assert len(merged["actions"]) == 3500
+    assert merged["actions"][7]["action"] == actions[7]["action"]
+    assert merged["actions"][7]["count_observed"] == 7
+
+
+def _from_ddb_for_size(item: dict) -> dict:
+    """Decimal 을 포함한 DynamoDB 항목을 크기 측정용으로 직렬화 가능하게 바꾼다."""
+    from lp2ps_api.repositories import _from_ddb
+
+    return _from_ddb(item)
+
+
+@mock_aws
+def test_small_override_stays_inline(monkeypatch):
+    """대조군 — 작은 본문은 S3 로 나가지 않는다. 이게 없으면 '전부 스필' 로 바꿔도 위 테스트가 통과한다."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    repos = _repos(monkeypatch)
+    repos.put_catalog_override("DataPersona", {"actions": _big_actions(3)})
+    item = _ddb_item()
+    assert "actions_s3_ref" not in item
+    assert len(item["actions"]) == 3
+
+
+@mock_aws
+def test_shrinking_override_drops_stale_spill_ref(monkeypatch):
+    """큰 정책을 저장한 뒤 작게 줄여 저장하면 **줄인 것이 보여야** 한다.
+
+    update_item 은 SET 병합이라 옛 참조를 지우지 않으면, 읽을 때 참조 해소가 새 인라인 값을 덮어
+    되돌린 편집이 되살아난다(운영자가 뺀 권한이 정책에 남는다).
+    """
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    repos = _repos(monkeypatch)
+    repos.put_catalog_override("DataPersona", {"actions": _big_actions(3500)})
+    assert "actions_s3_ref" in _ddb_item(), "대조 전제: 1차는 스필돼야 함"
+
+    repos.put_catalog_override("DataPersona", {"actions": _big_actions(2)})
+    item = _ddb_item()
+    assert "actions_s3_ref" not in item, "옛 참조가 남으면 옛 본문이 되살아난다"
+    assert len(repos._catalog_overrides()["DataPersona"]["actions"]) == 2
+
+
+@mock_aws
+def test_growing_override_drops_stale_inline_value(monkeypatch):
+    """역방향 — 작게 저장한 뒤 크게 저장하면 옛 인라인 값이 남지 않는다(항목 크기 회귀 방지)."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    repos = _repos(monkeypatch)
+    repos.put_catalog_override("DataPersona", {"actions": _big_actions(2)})
+    repos.put_catalog_override("DataPersona", {"actions": _big_actions(3500)})
+    item = _ddb_item()
+    assert "actions" not in item, "옛 인라인 값이 남으면 스필해도 항목이 계속 크다"
+    assert len(repos._catalog_overrides()["DataPersona"]["actions"]) == 3500
+
+
+@mock_aws
+def test_policy_doc_also_spills_and_approve_reads_it_back(monkeypatch):
+    """policy_doc 도 스필 대상이다 — 승인 경로(get_policy_doc)가 스필본을 읽어야 한다."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    repos = _repos(monkeypatch)
+    big_doc = {"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Resource": "*",
+        "Action": [f"service{i % 40}:VeryLongOperationNameForSizing{i}" for i in range(9000)]}]}
+    repos.put_catalog_override("DataPersona", {"policy_doc": big_doc})
+    item = _ddb_item()
+    assert "policy_doc" not in item and item["policy_doc_s3_ref"].startswith("overrides/")
+    doc = repos.get_policy_doc("DataPersona")
+    assert doc is not None and len(doc["Statement"][0]["Action"]) == 9000
+
+
+@mock_aws
+def test_missing_spill_object_fails_loudly_503(monkeypatch):
+    """스필 본문을 못 읽으면 조용히 'override 없음' 이 아니라 503 이다.
+
+    200 + 합성 원본을 돌려주면 운영자는 편집이 유실된 것과 구분할 수 없다(새로고침하니 사라졌다).
+    """
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    c = _client(monkeypatch)
+    repos = _repos(monkeypatch)
+    repos.put_catalog_override("DataPersona", {"actions": _big_actions(3500)})
+    ref = _ddb_item()["actions_s3_ref"]
+    # 스필 객체를 지운다(수명주기 정책·잘못된 삭제로 실제 일어날 수 있는 상태).
+    boto3.client("s3", region_name="us-west-2").delete_object(
+        Bucket=BUCKET, Key=f"{CUSTOMER}/{ref}")
+    r = c.get("/catalog")
+    assert r.status_code == 503, r.status_code
+    assert "읽지 못했" in r.json()["detail"]
+
+
+@mock_aws
+def test_spill_key_confined_to_overrides_prefix(monkeypatch):
+    """persona 명이 키에 들어가는 유일한 사용자 입력 — 경로를 벗어나지 못한다."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    repos = _repos(monkeypatch)
+    evil = "../../../../etc/passwd"
+    relpath = repos._spill_relpath(evil, "actions", 1)
+    assert relpath.startswith("overrides/")
+    assert ".." not in relpath and relpath.count("/") == 2, relpath
+    # 서로 다른 persona 가 같은 세그먼트로 뭉치지 않는다(슬러그가 같아도 해시가 다르다).
+    a = repos._spill_relpath("Team/Admin", "actions", 1)
+    b = repos._spill_relpath("Team:Admin", "actions", 1)
+    assert a != b, "슬러그만 쓰면 다른 persona 가 같은 객체를 덮어쓴다"
+
+
+@mock_aws
+def test_spill_versioned_key_does_not_overwrite_previous(monkeypatch):
+    """버전마다 새 키를 쓴다 — 실패한 동시 쓰기가 성공본을 덮지 않는다."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    repos = _repos(monkeypatch)
+    repos.put_catalog_override("DataPersona", {"actions": _big_actions(3500)})
+    first = _ddb_item()["actions_s3_ref"]
+    repos.put_catalog_override("DataPersona", {"actions": _big_actions(3600)})
+    second = _ddb_item()["actions_s3_ref"]
+    assert first != second, "같은 키를 덮어쓰면 읽는 중인 요청이 반쯤 바뀐 본문을 본다"
+    # 옛 객체는 그대로 남아 있다(참조가 살아있는 요청이 계속 읽을 수 있다).
+    s3 = boto3.client("s3", region_name="us-west-2")
+    assert s3.head_object(Bucket=BUCKET, Key=f"{CUSTOMER}/{first}")["ContentLength"] > 0
