@@ -130,7 +130,15 @@ export default function Reports() {
             <SpaceBetween direction="horizontal" size="s">
               <Button iconName="external" onClick={() => window.open(data.report_html_url, "_blank")}>리포트 HTML 보기</Button>
               <Button iconName="download" onClick={() => handleDownload(data.report_html_url, `report_${data.run_id}${selected ? "_" + selected : ""}.html`)}>HTML 다운로드</Button>
-              <Button iconName="download" onClick={() => handleDownload(data.iac_zip_url, `permission_sets_${data.run_id}.tf`)}>Terraform 다운로드</Button>
+              {/* 이 run 에 IaC 산출물이 없으면(빈 URL) 눌러도 실패하므로 비활성화한다. IdC 미사용
+                  고객의 run 은 permission_sets.tf 가 없고 iam_policies.tf 를 받으므로 파일명도 고정하지 않는다. */}
+              <Button
+                iconName="download"
+                disabled={!data.iac_zip_url}
+                onClick={() => handleDownload(data.iac_zip_url, `lp2ps_iac_${data.run_id}.tf`)}
+              >
+                Terraform 다운로드
+              </Button>
             </SpaceBetween>
             {downloadError && (
               <Alert type="error" dismissible onDismiss={() => setDownloadError(null)}

@@ -208,6 +208,26 @@ export interface TerraformArtifact {
   hcl: string; // 실제 .tf 내용
 }
 
+// 승인된 persona 정책을 **무엇으로 반영할지**. IdC 를 쓰지 않는 고객은 permission_set 을 쓸 수 없어
+// IAM 산출물이 필요하다(engine/lp2ps/models.py ExportTarget 과 1:1).
+//  policy_json       : 정책 문서 원문(콘솔 붙여넣기·기존 정책 교체용)
+//  iam_policy_tf     : 관리형 IAM 정책 1개(attach 는 하지 않음)
+//  iam_role_tf       : 역할까지 새로 만들 경우(신뢰정책은 Terraform 변수)
+//  permission_set_tf : IdC Permission Set. `uses_identity_center=false` 면 목록에 없다.
+export type ExportTarget = "policy_json" | "iam_policy_tf" | "iam_role_tf" | "permission_set_tf";
+
+// 승인된 persona 정책의 반영 산출물 1건 (engine/lp2ps/models.py PolicyArtifact 와 1:1)
+export interface PolicyArtifact {
+  persona: string;
+  target: ExportTarget;
+  label: string; // UI 탭 제목
+  filename: string;
+  content: string;
+  language: "json" | "hcl";
+  // 사람이 반드시 읽어야 하는 제약. 파일 주석에도 있지만 다운로드만 하는 경로가 있어 UI 에도 띄운다.
+  notes: string[];
+}
+
 // tooling 계정 IdC 에 PS 정의 생성 결과 (opt-in + 2차 확인 후)
 export interface ProvisionResult {
   persona: string;

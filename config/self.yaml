@@ -28,6 +28,11 @@ ai:
 provisioning:
   # The IdC may live in a different region than config.region. Region used for IdC read/write.
   idc_region: us-east-1
+  # Does this customer use IAM Identity Center? This decides *what artifacts are produced*.
+  #  true  (default): Permission Set .tf + managed IAM policy/role .tf
+  #  false          : managed IAM policy/role .tf only — a PS .tf cannot be applied without an IdC
+  #                   instance, and idc_region above may be left empty.
+  uses_identity_center: true
 
 risk_rules:
   long_lived_key_days: 90

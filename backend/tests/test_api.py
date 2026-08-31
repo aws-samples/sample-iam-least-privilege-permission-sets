@@ -227,6 +227,76 @@ def test_approve_returns_terraform(monkeypatch):
     body = r.json()
     assert body["entry"]["approval_status"] == "approved"
     assert body["terraform"]["persona"] == "DataPersona"
+    # 승인 응답만으로 반영까지 갈 수 있어야 한다(별도 GET 없이).
+    assert [a["target"] for a in body["artifacts"]] == [
+        "iam_policy_tf", "policy_json", "iam_role_tf", "permission_set_tf"
+    ]
+
+
+@mock_aws
+def test_artifacts_endpoint(monkeypatch):
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    c = _client(monkeypatch)
+    arts = c.get("/catalog/DataPersona/artifacts").json()
+    by_target = {a["target"]: a for a in arts}
+    assert 'resource "aws_iam_policy"' in by_target["iam_policy_tf"]["content"]
+    assert "s3:GetObject" in by_target["iam_policy_tf"]["content"]
+    # 다운로드만 하는 사람에게도 Resource "*" 제약이 보여야 한다.
+    assert any('Resource 는 "*"' in n for n in by_target["policy_json"]["notes"])
+
+
+@mock_aws
+def test_artifacts_omit_permission_set_without_identity_center(monkeypatch):
+    """IdC 미사용 고객: PS 산출물을 주면 apply 할 IdC 가 없다. 대신 IAM 산출물은 그대로 있어야 한다."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    monkeypatch.setenv("LP2PS_CONFIG_INLINE", json.dumps({"provisioning": {"uses_identity_center": False}}))
+    c = _client(monkeypatch)
+    targets = {a["target"] for a in c.get("/catalog/DataPersona/artifacts").json()}
+    assert targets == {"iam_policy_tf", "policy_json", "iam_role_tf"}
+
+
+@mock_aws
+def test_artifacts_unknown_persona_404(monkeypatch):
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    c = _client(monkeypatch)
+    assert c.get("/catalog/NoSuchPersona/artifacts").status_code == 404
+
+
+@mock_aws
+def test_terraform_uses_configured_session_duration(monkeypatch):
+    """세션 유지시간은 config 를 따른다 — 예전엔 백엔드가 PT8H 를 하드코딩해 M7 산출물과 달랐다."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    monkeypatch.setenv("LP2PS_CONFIG_INLINE", json.dumps({"permission_sets": {"session_duration": "PT2H"}}))
+    c = _client(monkeypatch)
+    assert 'session_duration = "PT2H"' in c.get("/catalog/DataPersona/terraform").json()["hcl"]
+
+
+@mock_aws
+def test_iac_download_falls_back_to_iam_policies(monkeypatch):
+    """IdC 미사용 run 에는 permission_sets.tf 가 없다 — 그때 iam_policies.tf 를 내려준다(404 금지)."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    import boto3
+    boto3.client("s3", region_name="us-west-2").delete_object(
+        Bucket=BUCKET, Key=f"{CUSTOMER}/run-001/iac/permission_sets.tf"
+    )
+    from lp2ps.storage import S3Storage
+    S3Storage(f"s3://{BUCKET}", CUSTOMER, "run-001").write_text("iac/iam_policies.tf", "# iam")
+    c = _client(monkeypatch)
+    r = c.get("/iac/run-001/download")
+    assert r.status_code == 200
+    assert "iam_policies.tf" in r.json()["url"]
+
+
+@mock_aws
+def test_iac_download_404_when_no_artifact(monkeypatch):
+    """대조군: 두 후보 모두 없으면 404. (폴백이 무조건 200 을 주는 게 아니라는 증거)"""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    import boto3
+    boto3.client("s3", region_name="us-west-2").delete_object(
+        Bucket=BUCKET, Key=f"{CUSTOMER}/run-001/iac/permission_sets.tf"
+    )
+    c = _client(monkeypatch)
+    assert c.get("/iac/run-001/download").status_code == 404
 
 
 @mock_aws

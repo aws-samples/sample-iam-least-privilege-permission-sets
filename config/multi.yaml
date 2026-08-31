@@ -23,6 +23,11 @@ ai:
 
 provisioning:
   idc_region: ""  # IdC region (empty = use config.region). The PS-creation gate is enforced at runtime.
+  # Does this customer use IAM Identity Center? This decides *what artifacts are produced*.
+  #  true  (default): Permission Set .tf + managed IAM policy/role .tf
+  #  false          : managed IAM policy/role .tf only — a PS .tf cannot be applied without an IdC
+  #                   instance, and idc_region above may be left empty.
+  uses_identity_center: true
 
 risk_rules:
   long_lived_key_days: 90

@@ -3,7 +3,8 @@
 LP2PS is a **read-only** tool that collects and analyzes multi-account AWS IAM usage and produces three outputs:
 
 1. **Per-persona least-privilege catalog** — derived bottom-up from actual usage
-2. **IAM Identity Center Permission Set Terraform** — infrastructure-as-code output
+2. **Terraform you can apply** — a managed IAM policy and role per persona, plus the raw policy JSON, and an
+   IAM Identity Center Permission Set definition when you use IdC (`provisioning.uses_identity_center`)
 3. **Cleanup backlog** — unused permissions, long-lived access keys, missing MFA, and privilege-escalation paths
 
 It is not built for any specific customer — it is a reusable sample you can deploy repeatedly across environments. Reuse = swap `config/<name>.yaml` and deploy; **no application code changes required**.
@@ -37,7 +38,7 @@ config/<name>.yaml
   └─────┬─────┘                 │ (untouched)   │
         │ outputs (deterministic)└──────────────┘
         ▼
-  Catalog (JSON) · Permission Set Terraform · cleanup backlog (CSV) · reports (HTML)
+  Catalog (JSON) · IAM policy/role + Permission Set Terraform · cleanup backlog (CSV) · reports (HTML)
         │  (S3 + DynamoDB, tool-owned)
         ▼
   API (FastAPI/Cognito) ─▶ Frontend (CloudFront) ─(approval)─▶ create PS definition in tooling IdC

@@ -40,6 +40,15 @@ class ProvisioningConfig(BaseModel):
     # 분석=us-west-2). IdC 조회·PS 생성에 쓸 리전. 비우면 config.region 사용.
     idc_region: str = ""
 
+    # 이 고객이 IAM Identity Center 를 쓰는가. **산출물의 종류를 가른다** — false 면 Permission Set
+    # 은 만들 수 없으므로(IdC 인스턴스가 없다) 관리형 IAM 정책/역할 Terraform 만 낸다. true(기본)면
+    # 기존 동작 그대로 PS 산출물을 함께 낸다.
+    #
+    # 왜 config 인가: 데이터로 추론하면(예: sso_ps principal 이 하나도 없으면 IdC 미사용) IdC 를 막
+    # 도입해 아직 할당이 없는 고객을 미사용으로 오판한다. 고객이 선언하는 값이다(불변식 ④).
+    # 이 값은 PS 마이그레이션 KPI 표시 여부에도 쓴다.
+    uses_identity_center: bool = True
+
 
 class RiskRules(BaseModel):
     """M4 위험 점수 규칙 — 임계치 + 가중치(0-100 스케일로 합산 후 클램프).

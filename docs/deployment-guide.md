@@ -192,6 +192,12 @@ ai:
 
 provisioning:
   idc_region: us-east-1        # The region where IdC (Identity Center) resides. One region per account.
+                               # May be left empty ("") when uses_identity_center is false.
+  uses_identity_center: true   # false if you do NOT use IAM Identity Center. This decides which
+                               # artifacts an approved persona produces:
+                               #   true  → Permission Set .tf + managed IAM policy/role .tf + policy JSON
+                               #   false → managed IAM policy/role .tf + policy JSON only
+                               # (a Permission Set .tf cannot be applied without an IdC instance)
 
 risk_rules:                    # Risk scoring rules (defaults recommended; adjust if needed)
   long_lived_key_days: 90
@@ -421,18 +427,54 @@ and change the config to `cross_account: true`. The detailed procedure is in the
 > - **Permission Set assignment (actual application)** is only possible when the target account **belongs to the same
 >   AWS Organization as the tooling IdC**. For accounts in a different Org / standalone accounts, only analysis and PS
 >   definition generation are possible.
-> - **Pure IAM User environments without IdC** are limited to analysis and least-privilege output. PS automation
->   presupposes IdC.
+> - **Environments without IdC (IAM roles/users only)** cannot use PS automation, but they are **not** limited to
+>   reading reports: an approved persona produces a **managed IAM policy `.tf`, an IAM role `.tf`, and the policy
+>   JSON**, which you apply yourself. See §13.1. Set `provisioning.uses_identity_center: false` so PS artifacts you
+>   cannot apply are not offered.
 
 ---
 
-## 13. (Optional) Create · assign Permission Sets — apply least privilege
+## 13. Apply least privilege — approve a persona, then reflect it
 
-When the analysis finishes, you can create actual IdC Permission Sets from **Persona review** in the dashboard.
+When the analysis finishes, review and approve each persona's policy in **Persona review**. Approval produces the
+**artifacts you apply**; which ones you get depends on `provisioning.uses_identity_center`:
+
+| Artifact | File | What it is for |
+| --- | --- | --- |
+| IAM policy (.tf) | `<Persona>.iam-policy.tf` | One managed IAM policy. Attaches to nothing — you attach it to your existing roles/users. |
+| Policy JSON | `<Persona>.policy.json` | The raw policy document, for pasting into the console or replacing an existing policy. |
+| IAM role (.tf) | `<Persona>.iam-role.tf` | When you also want a new role. The trust policy is a Terraform variable — **you must fill it in**. |
+| Permission Set (.tf) | `<Persona>.permission-set.tf` | IdC Permission Set definition. Only when `uses_identity_center: true`. |
+
+A full run also writes `iac/iam_policies.tf` (every persona's managed policy in one file) to the output bucket, plus
+`iac/permission_sets.tf` and `iac/account_assignments.tf` when IdC is in use.
+
+> **Two things to check before applying** — these are properties of the analysis, not bugs:
+> - Every statement's `Resource` is `"*"`. Only **actions** were minimized; narrow the resource scope yourself.
+> - A persona policy is the **union of the actually-used actions of all its members**. It is an upper bound for any
+>   single member: never short, sometimes more than one member needs.
+> - Applying to other accounts is per-account (`provider alias` or Terraform workspace). LP2PS does not apply
+>   across accounts.
+
+### 13.1 Without Identity Center — apply as an IAM policy
+
+1. **Persona review** → **Edit policy** → review permissions → **Approve with this policy**
+2. In the **Reflection artifacts** dialog pick a form and download it:
+   - Reusing an existing role (most common): **IAM policy (.tf)** → `terraform apply` → attach the resulting policy
+     ARN to that role (`aws_iam_role_policy_attachment`, or the console)
+   - Replacing a policy by hand: **Policy JSON** → paste into the IAM console
+   - Creating a new role: **IAM role (.tf)** → fill in `var.<persona>_trusted_principals` → `terraform apply`
+3. Repeat per account you want to reflect it in (`provider alias` / workspace).
+
+The IAM policy and IAM role artifacts can be applied together — the role attaches its policy **inline**, so the two
+files never create the same policy name twice.
+
+### 13.2 With Identity Center — create a Permission Set
+
 (IdC must be enabled in the tooling account.)
 
 1. **Persona review** → click **Edit policy** for a persona → review permissions (actually-used ones included; unused ones excluded after review)
-2. **Approve with this policy** → confirm approval → Terraform is shown
+2. **Approve with this policy** → confirm approval → the artifacts dialog opens
 3. **Create Permission Set in IdC…** → second confirmation ("actual write operation") → **Confirm creation**
    → a PS definition is created in the tooling account's IdC (including the inline least-privilege policy; no account assignment).
 

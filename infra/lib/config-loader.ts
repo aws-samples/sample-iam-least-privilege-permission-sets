@@ -24,6 +24,10 @@ export interface AiConfig {
 export interface ProvisioningConfig {
   // PS 정의 생성 게이트는 런타임(approved + UI 확인). config 는 IdC 리전만(선택).
   idc_region?: string;
+  // IdC(Identity Center) 사용 여부. false 면 Permission Set 산출물을 만들지 않고 관리형 IAM
+  // 정책/역할 Terraform 만 낸다(IdC 인스턴스가 없으면 PS .tf 는 apply 자체가 불가능하다).
+  // 생략 시 엔진 기본값 true — 기존 배포의 동작이 바뀌지 않는다.
+  uses_identity_center?: boolean;
 }
 
 // 아래 3개(risk_rules/catalog/permission_sets)는 **엔진 전용 튜너블**이다. 스키마·기본값의 단일

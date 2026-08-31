@@ -22,7 +22,13 @@ import { api } from "@/api/client";
 import { useAsync } from "@/api/useAsync";
 import { useAccounts } from "@/AccountContext";
 import { useSplitPanel } from "@/SplitPanelContext";
-import type { CatalogEntry, PolicyAction, PrincipalKind, TerraformArtifact } from "@/api/types";
+import type {
+  CatalogEntry,
+  PolicyAction,
+  PolicyArtifact,
+  PrincipalKind,
+  TerraformArtifact,
+} from "@/api/types";
 
 /** 우측 패널 탭. 슬롯이 하나라 두 화면을 탭으로 합친다. */
 type PanelTab = "policy" | "targets";
@@ -553,9 +559,13 @@ function PersonaEditorPanel({
   const [jsonDraft, setJsonDraft] = useState("");
   const [jsonError, setJsonError] = useState<string | null>(null);
 
-  // 승인 플로우 상태머신: idle → confirmApprove → terraform → confirmProvision → provisioning → done
-  const [flow, setFlow] = useState<"idle" | "confirmApprove" | "terraform" | "confirmProvision" | "provisioning" | "provisioned">("idle");
+  // 승인 플로우 상태머신: idle → confirmApprove → artifacts → confirmProvision → provisioning → done
+  const [flow, setFlow] = useState<"idle" | "confirmApprove" | "artifacts" | "confirmProvision" | "provisioning" | "provisioned">("idle");
   const [terraform, setTerraform] = useState<TerraformArtifact | null>(null);
+  // 반영 산출물. IdC 를 쓰지 않는 고객은 여기에 Permission Set 이 **없다** — 대신 IAM 정책/역할이
+  // 있어서 승인한 정책을 실제로 apply 할 수 있다(예전엔 PS 뿐이라 반영할 물건이 없었다).
+  const [artifacts, setArtifacts] = useState<PolicyArtifact[]>([]);
+  const [artifactTab, setArtifactTab] = useState<string>("");
   const [provisionArn, setProvisionArn] = useState<string | null>(null);
   const [provisionErr, setProvisionErr] = useState<string | null>(null);
   const [approvedMsg, setApprovedMsg] = useState<string | null>(null);
@@ -605,9 +615,17 @@ function PersonaEditorPanel({
   async function doApprove() {
     const res = await api.approvePersona(entry.persona, effectiveJson);
     setTerraform(res.terraform);
+    // 구 백엔드(artifacts 미지원)와도 동작해야 한다 — 없으면 빈 배열이 되고 산출물 탭만 비어 보인다.
+    const arts = res.artifacts ?? [];
+    setArtifacts(arts);
+    setArtifactTab(arts[0]?.target ?? "");
     setApprovedMsg(`${res.entry.persona} 정책이 승인되었습니다.`);
-    setFlow("terraform");
+    setFlow("artifacts");
   }
+
+  // 현재 보고 있는 산출물 / PS 산출물(있을 때만 IdC 생성 버튼을 노출).
+  const shownArtifact = artifacts.find((a) => a.target === artifactTab) ?? artifacts[0] ?? null;
+  const hasPermissionSet = artifacts.some((a) => a.target === "permission_set_tf");
 
   async function doProvision() {
     if (!terraform) return;
@@ -785,35 +803,75 @@ function PersonaEditorPanel({
         }
       >
         <SpaceBetween size="s">
-          <Box>{entry.persona} 를 {includedCount}개 action 으로 승인합니다. 승인 후 Permission Set Terraform 이 생성됩니다.</Box>
+          <Box>
+            {entry.persona} 를 {includedCount}개 action 으로 승인합니다. 승인 후 이 정책을 반영할 산출물
+            (관리형 IAM 정책·역할 Terraform, 정책 JSON, Identity Center 사용 시 Permission Set)이 생성됩니다.
+          </Box>
           {entry.ai_suggested && <Alert type="warning">AI 제안 persona 입니다 — 승인 시 사람 검증(human-in-the-loop)으로 기록됩니다.</Alert>}
         </SpaceBetween>
       </Modal>
 
-      {/* 2) Terraform 팝업 (다운로드 + PS 생성 진입) */}
+      {/* 2) 반영 산출물 팝업 (형태 선택 + 다운로드 + IdC 생성 진입) */}
       <Modal
-        visible={flow === "terraform"}
+        visible={flow === "artifacts"}
         onDismiss={() => setFlow("idle")}
         size="large"
-        header={terraform ? `Permission Set Terraform — ${terraform.permission_set_name}` : ""}
+        header={`반영 산출물 — ${entry.persona}`}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
               <Button onClick={() => setFlow("idle")}>닫기</Button>
-              {terraform && <Button iconName="download" onClick={() => download(terraform.filename, terraform.hcl)}>.tf 다운로드</Button>}
-              <Button variant="primary" onClick={() => setFlow("confirmProvision")}>IdC에 Permission Set 생성…</Button>
+              {shownArtifact && (
+                <Button
+                  iconName="download"
+                  onClick={() =>
+                    download(
+                      shownArtifact.filename,
+                      shownArtifact.content,
+                      shownArtifact.language === "json" ? "application/json" : "text/plain",
+                    )
+                  }
+                >
+                  {shownArtifact.filename} 다운로드
+                </Button>
+              )}
+              {/* IdC 를 쓰지 않는 고객에게는 이 버튼을 아예 보이지 않는다 — 눌러도 IdC 인스턴스가
+                  없어 실패하고, "우리랑 상관없는 기능"을 권하는 화면이 된다. */}
+              {hasPermissionSet && (
+                <Button variant="primary" onClick={() => setFlow("confirmProvision")}>IdC에 Permission Set 생성…</Button>
+              )}
             </SpaceBetween>
           </Box>
         }
       >
-        {terraform && (
+        {artifacts.length === 0 ? (
+          <Alert type="warning">산출물을 받지 못했습니다. 승인은 저장되었으니 목록에서 다시 열어 보세요.</Alert>
+        ) : (
           <SpaceBetween size="s">
-            <Alert type="info">account assignment(멤버계정 권한 부여)은 포함되지 않습니다 — 필요 시 사람이 수동으로 추가하세요.</Alert>
-            <Box variant="code">
-              <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "Monaco, Menlo, monospace", fontSize: 12, lineHeight: 1.5, maxHeight: 380, overflow: "auto" }}>
-                {terraform.hcl}
-              </pre>
+            <Box variant="p">
+              같은 정책을 <b>어떤 형태로 반영할지</b> 고르세요. 필요한 형태만 내려받아 쓰면 됩니다.
             </Box>
+            <Tabs
+              activeTabId={shownArtifact?.target ?? ""}
+              onChange={(e) => setArtifactTab(e.detail.activeTabId)}
+              tabs={artifacts.map((a) => ({
+                id: a.target,
+                label: a.label,
+                content: (
+                  <SpaceBetween size="s">
+                    {a.notes.map((n, i) => (
+                      // 첫 항목만 강조(그 산출물 고유의 주의). 나머지는 공통 제약.
+                      <Alert key={i} type={i === 0 ? "warning" : "info"}>{n}</Alert>
+                    ))}
+                    <Box variant="code">
+                      <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "Monaco, Menlo, monospace", fontSize: 12, lineHeight: 1.5, maxHeight: 320, overflow: "auto" }}>
+                        {a.content}
+                      </pre>
+                    </Box>
+                  </SpaceBetween>
+                ),
+              }))}
+            />
           </SpaceBetween>
         )}
       </Modal>
@@ -821,12 +879,12 @@ function PersonaEditorPanel({
       {/* 3) PS 생성 2차 확인 (실제 쓰기 게이트) */}
       <Modal
         visible={flow === "confirmProvision" || flow === "provisioning"}
-        onDismiss={() => flow !== "provisioning" && setFlow("terraform")}
+        onDismiss={() => flow !== "provisioning" && setFlow("artifacts")}
         header="tooling 계정 IdC에 Permission Set 생성"
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button variant="link" disabled={flow === "provisioning"} onClick={() => setFlow("terraform")}>취소</Button>
+              <Button variant="link" disabled={flow === "provisioning"} onClick={() => setFlow("artifacts")}>취소</Button>
               <Button variant="primary" loading={flow === "provisioning"} onClick={doProvision}>생성 확인</Button>
             </SpaceBetween>
           </Box>

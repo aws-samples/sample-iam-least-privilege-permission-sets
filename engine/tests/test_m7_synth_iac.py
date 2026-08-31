@@ -67,9 +67,9 @@ def test_iac_parses_and_has_permission_sets(tmp_path):
     synth_policies(st, RUN)
     outputs = emit_iac(st, RUN, _cfg())
 
-    # 3개 파일 생성.
+    # IdC 사용(기본) → PS 2종 + providers + IAM 정책(항상).
     assert set(k.split("/")[-1] for k in outputs) == {
-        "providers.tf", "permission_sets.tf", "account_assignments.tf"
+        "providers.tf", "iam_policies.tf", "permission_sets.tf", "account_assignments.tf"
     }
     # permission_sets.tf 는 hcl2 로 파싱되고 permission set resource 를 포함.
     ps_hcl = outputs["iac/permission_sets.tf"]
@@ -107,6 +107,21 @@ def test_empty_policy_persona_skipped_in_iac(tmp_path):
     parsed = hcl2.load(io.StringIO(outputs["iac/permission_sets.tf"]))
     # 생성된 permission set resource 가 없어야(빈 정책 persona 제외).
     assert parsed.get("resource", []) == []
+
+
+def test_iac_without_identity_center_emits_iam_policies_only(tmp_path):
+    """IdC 미사용 고객: PS 파일은 apply 불가하므로 내지 않고, IAM 정책은 반드시 낸다."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    _seed_catalog(st)
+    synth_policies(st, RUN)
+    cfg = _cfg()
+    cfg.provisioning.uses_identity_center = False
+    outputs = emit_iac(st, RUN, cfg)
+
+    assert set(k.split("/")[-1] for k in outputs) == {"providers.tf", "iam_policies.tf"}
+    parsed = hcl2.load(io.StringIO(outputs["iac/iam_policies.tf"]))
+    types = {list(r.keys())[0].strip('"') for r in parsed.get("resource", [])}
+    assert types == {"aws_iam_policy"}
 
 
 def test_iac_deterministic(tmp_path):

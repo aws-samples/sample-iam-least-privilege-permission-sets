@@ -14,6 +14,7 @@ from lp2ps.models import ExecSummary, ReportRef
 
 from ..deps import valid_run_id
 from . import get_repos
+from .iac import pick_iac_key
 
 router = APIRouter(tags=["reports"])
 
@@ -60,6 +61,12 @@ def _build_report(run_id: str, account: str | None) -> ReportRef:
     summary_raw = repos._storage(run_id).read_json("exec_summary.json")
     full = ExecSummary.model_validate(summary_raw)
 
+    # IdC 를 쓰지 않는 run 에는 permission_sets.tf 가 없다 → 실제 존재하는 IaC 산출물을 고른다.
+    # 고정 키를 presign 하면 URL 은 발급되지만 클릭 시 없는 객체를 받는다(원인 파악이 어렵다).
+    # 하나도 없으면 빈 문자열 — 프론트가 링크를 비활성화한다.
+    iac_key = pick_iac_key(repos, run_id)
+    iac_url = repos.presign(run_id, iac_key) if iac_key else ""
+
     if account:
         if not _ACCOUNT_RE.match(account):
             raise HTTPException(status_code=400, detail="잘못된 account 형식")
@@ -70,7 +77,7 @@ def _build_report(run_id: str, account: str | None) -> ReportRef:
             return ReportRef(
                 run_id=run_id,
                 report_html_url=repos.presign(run_id, report_key),
-                iac_zip_url=repos.presign(run_id, "iac/permission_sets.tf"),
+                iac_zip_url=iac_url,
                 exec_summary=acct_summary,
             )
         # 폴백: 계정별 산출물 없음 → 전체 리포트.
@@ -78,6 +85,6 @@ def _build_report(run_id: str, account: str | None) -> ReportRef:
     return ReportRef(
         run_id=run_id,
         report_html_url=repos.presign(run_id, "report.html"),
-        iac_zip_url=repos.presign(run_id, "iac/permission_sets.tf"),  # 후속: zip 번들로 교체
+        iac_zip_url=iac_url,  # 후속: zip 번들로 교체
         exec_summary=full,
     )

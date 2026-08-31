@@ -52,7 +52,10 @@ region: us-west-2       # Deployment region
 cross_account: false    # false for single-account analysis (see step 4 for multi-account)
 accounts: [self]
 provisioning:
-  idc_region: us-east-1 # IdC (Identity Center) region
+  idc_region: us-east-1        # IdC (Identity Center) region. May be "" if you do not use IdC.
+  uses_identity_center: true   # false if you do not use IdC — this changes which artifacts approval produces
+                               #  true  → Permission Set .tf + managed IAM policy/role .tf + policy JSON
+                               #  false → managed IAM policy/role .tf + policy JSON (a PS .tf has no IdC to apply to)
 ```
 Validate:
 ```bash
@@ -116,6 +119,22 @@ The web app requires login. Self sign-up is disabled, so an administrator invite
    `aws cognito-idp admin-get-user --user-pool-id <pool> --username <email> --region <region> --query UserStatus`.
 5. Open the **web dashboard URL** in a browser → sign in as this user
 6. Click **"Run full scan"** at the top of the dashboard → the first analysis starts (a few minutes) → once done, personas and reports are populated
+
+### Reflecting an approved policy
+
+**Persona review** → **Edit policy** → review permissions → **Approve with this policy** opens the
+**Reflection artifacts** dialog. Download whichever form you need.
+
+| Artifact | Use it when |
+|---|---|
+| **IAM policy (.tf)** | Attaching least privilege to an existing role (most common). Apply, then attach the resulting policy ARN. |
+| **Policy JSON** | Replacing an existing policy by hand in the console. |
+| **IAM role (.tf)** | Creating a new role too. Fill in `var.<persona>_trusted_principals` (who may assume it) **before** applying. |
+| **Permission Set (.tf)** | Only appears when you use IdC (`uses_identity_center: true`). |
+
+> ⚠ Before applying: the policy's `Resource` is `"*"` — only **actions** were minimized. And a persona policy is
+> the **union of the actually-used actions of all its members**, so it may exceed what one member needs but never
+> falls short. Apply **per account** when reflecting it in several accounts.
 
 ---
 

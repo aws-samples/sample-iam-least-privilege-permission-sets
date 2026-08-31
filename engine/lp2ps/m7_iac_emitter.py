@@ -1,7 +1,11 @@
 """M7 IaC Emitter — policies + permission_sets → Terraform HCL.
 
-catalog + 합성된 policies/<persona>.json 을 jinja2 템플릿으로 렌더해 다음을 만든다:
-- `iac/permission_sets.tf`     — persona 별 Permission Set 정의 + inline policy(최소권한)
+catalog + 합성된 policies/<persona>.json 을 렌더해 다음을 만든다:
+- `iac/iam_policies.tf`        — persona 별 관리형 IAM 정책(**항상**). IdC 를 쓰지 않는 고객이
+                                 실제로 반영할 수 있는 유일한 산출물이다. 생성은 `policy_export`
+                                 (백엔드 개별 다운로드와 같은 코드 — 화면과 파일이 어긋나지 않게).
+- `iac/permission_sets.tf`     — persona 별 Permission Set 정의 + inline policy(최소권한).
+                                 `provisioning.uses_identity_center=false` 면 내지 않는다.
 - `iac/account_assignments.tf` — **주석 골격만**(불변식 ①: account assignment 은 도구가 안 함, 사람 수동)
 - `iac/providers.tf`           — provider + IdC instance ARN 변수
 
@@ -17,6 +21,7 @@ from typing import TYPE_CHECKING
 from jinja2 import Environment, PackageLoader, StrictUndefined
 
 from .models import CatalogEntry
+from .policy_export import build_bulk_iam_policies
 
 if TYPE_CHECKING:  # pragma: no cover
     from .config import Config
@@ -41,8 +46,10 @@ _env = Environment(  # nosec B701 — HCL 출력(HTML 아님), 값은 주입 시
 
 def emit_iac(storage: "Storage", run: "RunContext", cfg: "Config") -> dict[str, str]:
     """catalog + policies → iac/*.tf. 반환 = {상대경로: 렌더된 HCL}."""
-    catalog = _load_catalog(storage)
-    ps_models = [_ps_model(entry, storage, cfg) for entry in catalog]
+    catalog = sorted(_load_catalog(storage), key=lambda e: e.persona)  # 결정론(입력 순서에 의존 금지)
+    # 정책은 persona 당 한 번만 읽는다(PS·IAM 산출물이 같은 문서를 쓴다).
+    policies = {entry.persona: _load_policy(storage, entry) for entry in catalog}
+    ps_models = [_ps_model(entry, policies[entry.persona], cfg) for entry in catalog]
     # included action 이 0 이라 정책 Statement 가 비는 persona 는 PS 를 생성하지 않는다
     # (빈 inline policy 는 apply 시 IAM 이 거부 — 최소 1 Statement 필요).
     ps_models = [p for p in ps_models if p["has_statements"]]
@@ -54,21 +61,30 @@ def emit_iac(storage: "Storage", run: "RunContext", cfg: "Config") -> dict[str, 
         # Terraform var 기본값 — 사용자가 tfvars 로 채운다(런타임 provision-ps 는 자동 조회 사용).
         identity_center_instance_arn="",
     )
-    outputs[f"{IAC_DIR}/permission_sets.tf"] = _env.get_template("permission_sets.tf.j2").render(
-        permission_sets=ps_models
+
+    # IdC 를 쓰지 않는 고객용 산출물 — 관리형 IAM 정책. **항상 낸다**(IdC 고객도 IdC 밖 역할에
+    # 같은 정책을 붙일 수 있다). 이게 없으면 non-IdC 고객은 run 산출물에서 쓸 게 하나도 없다.
+    outputs[f"{IAC_DIR}/iam_policies.tf"] = build_bulk_iam_policies(
+        [(entry.persona, policies[entry.persona]) for entry in catalog]
     )
-    outputs[f"{IAC_DIR}/account_assignments.tf"] = _env.get_template(
-        "account_assignments.tf.j2"
-    ).render(permission_sets=ps_models)
+
+    # PS 산출물은 IdC 를 쓰는 고객에게만. IdC 인스턴스가 없으면 apply 자체가 불가능해
+    # `var.identity_center_instance_arn` 만 물어보는 쓸모없는 파일이 된다.
+    if cfg.provisioning.uses_identity_center:
+        outputs[f"{IAC_DIR}/permission_sets.tf"] = _env.get_template("permission_sets.tf.j2").render(
+            permission_sets=ps_models
+        )
+        outputs[f"{IAC_DIR}/account_assignments.tf"] = _env.get_template(
+            "account_assignments.tf.j2"
+        ).render(permission_sets=ps_models)
 
     for relpath, content in outputs.items():
         storage.write_text(relpath, content)
     return outputs
 
 
-def _ps_model(entry: CatalogEntry, storage: "Storage", cfg: "Config") -> dict:
+def _ps_model(entry: CatalogEntry, policy_doc: dict, cfg: "Config") -> dict:
     """CatalogEntry + 합성 정책 → 템플릿용 dict."""
-    policy_doc = _load_policy(storage, entry)
     # inline policy 는 표준 IAM 문서만(메타 _lp2ps 제거).
     inline = {k: v for k, v in policy_doc.items() if not k.startswith("_")}
     session_duration = cfg.permission_sets.session_duration_overrides.get(

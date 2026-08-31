@@ -11,6 +11,7 @@ import type {
   MetricsPoint,
   AccountInfo,
   AiSettings,
+  PolicyArtifact,
   ProvisionResult,
   ReportRef,
   RiskCriteria,
@@ -50,8 +51,15 @@ export interface Api {
 
   getMetrics(): Promise<MetricsPoint[]>;
   getCatalog(): Promise<CatalogEntry[]>;
-  // 승인 시 정책 문서(편집 반영)를 함께 넘겨 Terraform 을 생성해 반환.
-  approvePersona(persona: string, policyDoc: string): Promise<{ entry: CatalogEntry; terraform: TerraformArtifact }>;
+  // 승인 시 정책 문서(편집 반영)를 함께 넘겨 반영 산출물을 생성해 반환.
+  // artifacts = 이 고객이 실제로 apply 할 수 있는 산출물 전부(IdC 미사용이면 PS 는 빠진다).
+  // terraform = PS 단건(기존 계약 유지 — provision-ps 흐름이 참조).
+  approvePersona(
+    persona: string,
+    policyDoc: string,
+  ): Promise<{ entry: CatalogEntry; terraform: TerraformArtifact; artifacts: PolicyArtifact[] }>;
+  // 승인 후 다시 볼 때(승인 응답을 잃은 뒤) 산출물만 다시 받는 경로.
+  getArtifacts(persona: string): Promise<PolicyArtifact[]>;
   // 2차 확인 후: tooling-IdC 에 PS 정의 생성(assignment 제외).
   provisionPermissionSet(persona: string): Promise<ProvisionResult>;
   getCleanup(): Promise<CleanupItem[]>;
@@ -92,6 +100,77 @@ POLICY
 # account assignment 은 의도적으로 생성하지 않음 — 필요 시 사람이 수동으로 추가.
 `;
   return { persona, permission_set_name: psName, filename: `${persona}.tf`, hcl };
+}
+
+// ---- mock 반영 산출물 ----
+// 정본은 engine/lp2ps/policy_export.py 다. 여기 사본은 **mock 모드에서 화면을 확인하기 위한 것**이며,
+// 실 API 는 엔진 산출물을 그대로 내려준다(VITE_USE_MOCKS=false). 그래서 문구가 100% 같지 않아도
+// 되지만, 탭 라벨·target·notes 갯수 같은 **계약**은 맞춰야 화면 검증이 의미가 있다.
+const MOCK_COMMON_NOTES = [
+  '정책의 Resource 는 "*" 입니다 — action 만 최소화했고 리소스 범위는 좁히지 않았습니다. 운영 반영 전에 리소스 조건을 좁히는 것을 권장합니다.',
+  "이 정책은 이 persona 멤버 전원의 실사용 action 합집합입니다 — 개별 멤버에게는 필요 이상일 수 있으나 부족하지는 않습니다.",
+  "다른 계정에 반영할 때는 계정마다 apply 하세요(provider alias 또는 Terraform workspace). LP2PS 는 계정 간 apply 를 수행하지 않습니다.",
+];
+
+// mock 이 IdC 사용 고객을 흉내내는가. `VITE_MOCK_NO_IDC=true` 로 빌드/실행하면 IdC 미사용 고객의
+// 화면(PS 탭·IdC 생성 버튼 없음)을 그대로 확인할 수 있다 — 이 기능의 대상이 그 고객이라 화면 검증
+// 경로가 필요하다. 실 배포에서는 config `provisioning.uses_identity_center` 가 결정한다.
+const MOCK_USES_IDC = import.meta.env.VITE_MOCK_NO_IDC !== "true";
+
+function toArtifacts(persona: string, policyDoc: string): PolicyArtifact[] {
+  const res = persona.replace(/[^0-9A-Za-z]/g, "_").replace(/^_+|_+$/g, "").toLowerCase() || "persona";
+  const iamName = `${persona}-least-privilege`;
+  const body = policyDoc.trim() || '{\n  "Version": "2012-10-17",\n  "Statement": []\n}';
+  const compact = body.replace(/\s+/g, " ");
+  const header = `# 자동 생성 — LP2PS. 검토 후 apply 하세요.\n#\n# persona: ${persona}\n# 주의: Statement 의 Resource 는 "*" 입니다 — action 만 최소화했습니다.\n`;
+
+  const artifacts: PolicyArtifact[] = [
+    {
+      persona,
+      target: "iam_policy_tf",
+      label: "IAM 정책 (.tf)",
+      filename: `${persona}.iam-policy.tf`,
+      content: `${header}\nresource "aws_iam_policy" "${res}" {\n  name        = "${iamName}"\n  description = "LP2PS 최소권한 — ${persona}"\n  policy      = jsonencode(${compact})\n}\n\noutput "${res}_policy_arn" {\n  value       = aws_iam_policy.${res}.arn\n  description = "생성된 관리형 정책 ARN — 기존 역할에 attach 할 때 사용하세요."\n}\n`,
+      language: "hcl",
+      notes: [...MOCK_COMMON_NOTES],
+    },
+    {
+      persona,
+      target: "policy_json",
+      label: "정책 JSON",
+      filename: `${persona}.policy.json`,
+      content: `${body}\n`,
+      language: "json",
+      notes: [...MOCK_COMMON_NOTES],
+    },
+    {
+      persona,
+      target: "iam_role_tf",
+      label: "IAM 역할 (.tf)",
+      filename: `${persona}.iam-role.tf`,
+      content: `${header}\nvariable "${res}_trusted_principals" {\n  description = "이 역할을 assume 할 주체 ARN 목록. LP2PS 는 이 값을 정하지 않습니다 — 반드시 채우세요."\n  type        = list(string)\n}\n\nresource "aws_iam_role" "${res}" {\n  name = "${iamName}"\n\n  assume_role_policy = jsonencode({\n    "Version" : "2012-10-17",\n    "Statement" : [{\n      "Effect" : "Allow",\n      "Principal" : { "AWS" : var.${res}_trusted_principals },\n      "Action" : "sts:AssumeRole"\n    }]\n  })\n}\n\nresource "aws_iam_role_policy" "${res}" {\n  name   = "${iamName}"\n  role   = aws_iam_role.${res}.id\n  policy = jsonencode(${compact})\n}\n`,
+      language: "hcl",
+      notes: [
+        "역할의 신뢰정책(누가 assume 하는가)은 LP2PS 가 알 수 없어 Terraform 변수로 비워뒀습니다. 채우지 않고 apply 하면 아무도 사용할 수 없는 역할이 생깁니다.",
+        ...MOCK_COMMON_NOTES,
+      ],
+    },
+  ];
+  if (MOCK_USES_IDC) {
+    artifacts.push({
+      persona,
+      target: "permission_set_tf",
+      label: "Permission Set (.tf)",
+      filename: `${persona}.permission-set.tf`,
+      content: `${header}\nresource "aws_ssoadmin_permission_set" "${res}" {\n  name             = "${iamName}"\n  description      = "LP2PS 최소권한 — ${persona}"\n  instance_arn     = var.identity_center_instance_arn\n  session_duration = "PT8H"\n}\n\nresource "aws_ssoadmin_permission_set_inline_policy" "${res}" {\n  instance_arn       = var.identity_center_instance_arn\n  permission_set_arn = aws_ssoadmin_permission_set.${res}.arn\n  inline_policy      = jsonencode(${compact})\n}\n\n# account assignment 은 의도적으로 생성하지 않음 — 필요 시 사람이 수동으로 추가.\n`,
+      language: "hcl",
+      notes: [
+        "account assignment(멤버계정 권한 부여)은 포함되지 않습니다 — 필요 시 사람이 수동으로 추가하세요.",
+        ...MOCK_COMMON_NOTES,
+      ],
+    });
+  }
+  return artifacts;
 }
 
 // mock 스케줄 상태(모듈 레벨 — PUT 이 GET 에 반영되도록 유지).
@@ -146,8 +225,10 @@ const mockApi: Api = {
     return delay({
       entry: { ...structuredClone(entry), approval_status: "approved" as const },
       terraform: toTerraform(persona, policyDoc),
+      artifacts: toArtifacts(persona, policyDoc),
     });
   },
+  getArtifacts: (persona) => delay(toArtifacts(persona, "")),
   provisionPermissionSet: (persona) =>
     delay(
       {
@@ -208,6 +289,7 @@ const realApi: Api = {
       // 백엔드 approve 는 {policy_doc} 를 기대(Body embed). 계약 일치.
       body: JSON.stringify({ policy_doc: policyDoc }),
     }),
+  getArtifacts: (persona) => real(`/catalog/${encodeURIComponent(persona)}/artifacts`),
   provisionPermissionSet: (persona) =>
     real(`/catalog/${encodeURIComponent(persona)}/provision-ps`, { method: "POST" }),
   getCleanup: () => real("/cleanup-backlog"),

@@ -204,6 +204,32 @@ class TerraformArtifact(BaseModel):
     hcl: str
 
 
+# 승인된 persona 정책을 **무엇으로 반영할지**. IdC 를 쓰지 않는 고객은 permission_set 을 쓸 수 없어
+# IAM 산출물이 필요하다(이게 없으면 정책을 다듬어 승인해도 반영할 물건이 없다).
+#  policy_json      : 정책 문서 원문(콘솔 붙여넣기·기존 정책 교체용)
+#  iam_policy_tf    : 관리형 IAM 정책 1개(attach 는 하지 않음 — 어느 역할에 붙일지는 사람이 정한다)
+#  iam_role_tf      : 역할까지 새로 만들 경우(신뢰정책은 LP2PS 가 알 수 없어 변수로 뺀다)
+#  permission_set_tf: IdC Permission Set(기존 산출물)
+ExportTarget = Literal["policy_json", "iam_policy_tf", "iam_role_tf", "permission_set_tf"]
+
+
+class PolicyArtifact(BaseModel):
+    """승인된 persona 정책의 반영 산출물 1건.
+
+    `TerraformArtifact`(PS 전용)를 대체하지 않고 일반화한다 — PS 는 `permission_set_tf` 타깃이다.
+    `notes` 는 **사람이 반드시 읽어야 하는 제약**이며 UI 가 그대로 노출한다(파일 주석과 중복돼도
+    괜찮다 — 파일을 열지 않고 다운로드만 하는 경로가 있다).
+    """
+
+    persona: str
+    target: ExportTarget
+    label: str  # UI 탭 제목
+    filename: str
+    content: str
+    language: Literal["json", "hcl"]
+    notes: list[str] = Field(default_factory=list)
+
+
 class ProvisionResult(BaseModel):
     """tooling 계정 IdC 에 PS 정의 생성 결과 (opt-in + 2차 확인 후).
 

@@ -17,7 +17,14 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
-from lp2ps.models import CatalogEntry, PolicyAction, ProvisionResult, TerraformArtifact
+from lp2ps.models import (
+    CatalogEntry,
+    PolicyAction,
+    PolicyArtifact,
+    ProvisionResult,
+    TerraformArtifact,
+)
+from lp2ps.policy_export import build_artifacts, iam_name, permission_set_artifact
 
 from ..audit import audit_event
 from ..auth import require_auth
@@ -48,6 +55,22 @@ def get_terraform(persona: str) -> TerraformArtifact:
     if policy_doc is None:
         raise HTTPException(status_code=404, detail=f"persona 정책 없음: {persona}")
     return _to_terraform(entry, policy_doc)
+
+
+@router.get("/catalog/{persona}/artifacts")
+def get_artifacts(persona: str) -> list[PolicyArtifact]:
+    """persona 정책의 **반영 산출물** 목록(IAM 정책/역할 .tf, 정책 JSON, 그리고 IdC 면 PS .tf).
+
+    IdC 를 쓰지 않는 고객이 승인된 정책을 실제로 반영할 수 있게 하는 경로다 — PS 산출물만 있던
+    시절엔 정책을 다듬어 승인해도 apply 할 물건이 없었다. 포함 여부는
+    `provisioning.uses_identity_center`(config)가 가른다.
+    """
+    _check_persona(persona)
+    entry = _find_persona(persona)
+    policy_doc = get_repos().get_policy_doc(persona)
+    if policy_doc is None:
+        raise HTTPException(status_code=404, detail=f"persona 정책 없음: {persona}")
+    return _to_artifacts(entry, policy_doc)
 
 
 @router.patch("/catalog/{persona}")
@@ -102,10 +125,17 @@ def approve_persona(
         raise HTTPException(status_code=409, detail="동시 수정 충돌 — 새로고침 후 다시 시도하세요.") from e
     audit_event(action="approve_persona", resource=persona, result="approved", claims=claims)
 
-    # 편집된 정책 문서가 오면 그걸로, 아니면 저장된 합성 정책으로 Terraform 생성.
+    # 편집된 정책 문서가 오면 그걸로, 아니면 저장된 합성 정책으로 산출물 생성.
     doc = parsed or get_repos().get_policy_doc(persona) or _empty_policy()
     tf = _to_terraform(approved, doc)
-    return {"entry": approved.model_dump(), "terraform": tf.model_dump()}
+    # artifacts = 반영 산출물 전체(IAM 정책/역할/JSON + IdC 면 PS). terraform 은 기존 계약이라
+    # 유지한다(PS 를 쓰는 고객의 provision-ps 흐름이 이 필드를 참조).
+    artifacts = _to_artifacts(approved, doc)
+    return {
+        "entry": approved.model_dump(),
+        "terraform": tf.model_dump(),
+        "artifacts": [a.model_dump() for a in artifacts],
+    }
 
 
 @router.post("/catalog/{persona}/provision-ps")
@@ -164,17 +194,49 @@ def provision_ps(persona: str, claims: dict = Depends(require_auth)) -> Provisio
     return result
 
 
-def _idc_region() -> str:
-    """provisioning.idc_region(config) → 없으면 API 리전. IdC 는 계정당 단일 리전."""
+def _config_inline() -> dict:
+    """CDK 가 Lambda 에 넣어주는 고객 config(JSON). 없거나 깨졌으면 빈 dict.
+
+    캐시하지 않는다 — 테스트가 env 를 바꿔가며 검증한다. 파싱 실패 시 예외를 올리지 않는다:
+    config 한 줄 때문에 카탈로그 조회 전체가 500 이 되면 안 되고, 각 호출자가 기본값을 갖는다.
+    """
     import json
     import os
 
     inline = os.environ.get("LP2PS_CONFIG_INLINE")
-    if inline:
-        r = json.loads(inline).get("provisioning", {}).get("idc_region")
-        if r:
-            return r
+    if not inline:
+        return {}
+    try:
+        parsed = json.loads(inline)
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _idc_region() -> str:
+    """provisioning.idc_region(config) → 없으면 API 리전. IdC 는 계정당 단일 리전."""
+    import os
+
+    r = _config_inline().get("provisioning", {}).get("idc_region")
+    if r:
+        return r
     return os.environ.get("AWS_REGION", "us-west-2")
+
+
+def _uses_identity_center() -> bool:
+    """이 고객이 IdC 를 쓰는가(config). 기본 True — 기존 배포의 동작을 바꾸지 않는다.
+
+    false 면 산출물에서 Permission Set 을 뺀다(IdC 인스턴스가 없어 apply 불가).
+    """
+    v = _config_inline().get("provisioning", {}).get("uses_identity_center")
+    return True if v is None else bool(v)
+
+
+def _session_duration(persona: str) -> str:
+    """PS 세션 유지시간(config permission_sets). 엔진 M7 과 같은 규칙(persona 개별 override 우선)."""
+    ps_cfg = _config_inline().get("permission_sets", {})
+    overrides = ps_cfg.get("session_duration_overrides") or {}
+    return overrides.get(persona) or ps_cfg.get("session_duration") or "PT8H"
 
 
 def _resolve_idc_instance_arn(session, idc_region: str) -> str | None:  # noqa: ANN001
@@ -199,32 +261,34 @@ def _find_persona(persona: str) -> CatalogEntry:
     raise HTTPException(status_code=404, detail=f"persona 없음: {persona}")
 
 
+def _to_artifacts(entry: CatalogEntry, policy_doc: dict) -> list[PolicyArtifact]:
+    """persona + 정책 문서 → 반영 산출물 목록. 생성은 엔진 `policy_export` 단일 소스."""
+    return build_artifacts(
+        entry.persona,
+        entry.description,
+        policy_doc,
+        uses_identity_center=_uses_identity_center(),
+        session_duration=_session_duration(entry.persona),
+    )
+
+
 def _to_terraform(entry: CatalogEntry, policy_doc: dict) -> TerraformArtifact:
-    """persona + 정책 문서 → Permission Set Terraform(HCL). 엔진 m7_iac_emitter 와 동일 형태."""
-    import json
+    """persona + 정책 문서 → Permission Set Terraform(HCL).
 
-    inline = {k: v for k, v in policy_doc.items() if not k.startswith("_")}
-    res = "".join(ch if ch.isalnum() else "_" for ch in entry.persona).strip("_").lower() or "persona"
-    ps_name = f"{entry.persona}-least-privilege"
-    hcl = f"""# 자동 생성 — LP2PS. 검토 후 apply 하세요.
-resource "aws_ssoadmin_permission_set" "{res}" {{
-  name             = "{ps_name}"
-  description      = "LP2PS 최소권한 — {entry.persona}"
-  instance_arn     = var.identity_center_instance_arn
-  session_duration = "PT8H"
-}}
-
-resource "aws_ssoadmin_permission_set_inline_policy" "{res}" {{
-  instance_arn       = var.identity_center_instance_arn
-  permission_set_arn = aws_ssoadmin_permission_set.{res}.arn
-  inline_policy      = jsonencode({json.dumps(inline, sort_keys=True, ensure_ascii=False)})
-}}
-
-# account assignment 은 의도적으로 생성하지 않음 — 필요 시 사람이 수동으로 추가.
-"""
+    HCL 본문은 엔진 `policy_export` 가 만든다 — 예전엔 이 함수·M7 템플릿·프론트 mock 이 각자
+    HCL 을 조립해 세 곳이 조용히 달라질 수 있었다(세션 유지시간이 실제로 달랐다: 여기 PT8H 고정,
+    M7 은 config 값). IdC 미사용 고객이어도 이 엔드포인트는 PS 형태를 그대로 반환한다 — 기존 계약이고,
+    산출물 선택은 `/artifacts` 가 담당한다.
+    """
+    art = permission_set_artifact(
+        entry.persona, entry.description, policy_doc,
+        session_duration=_session_duration(entry.persona),
+    )
     return TerraformArtifact(
-        persona=entry.persona, permission_set_name=ps_name,
-        filename=f"{entry.persona}.tf", hcl=hcl,
+        persona=entry.persona,
+        permission_set_name=iam_name(entry.persona),
+        filename=art.filename,
+        hcl=art.content,
     )
 
 
