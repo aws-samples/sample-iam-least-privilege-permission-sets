@@ -23,6 +23,9 @@ class Settings(BaseModel):
     runs_table: str
     metrics_table: str
     catalog_table: str
+    # cleanup 항목의 조치 상태(미조치/조치완료/보류)를 보관. 비어 있으면 상태 기능이 읽기 전용으로
+    # 퇴화한다(전부 미조치로 보임) — 배포에서 env 를 안 주면 조용히 그렇게 되므로 api-stack 이 항상 준다.
+    findings_table: str
     state_machine_arn: str
     schedule_rule_name: str
     region: str
@@ -38,6 +41,7 @@ def get_settings() -> Settings:
         runs_table=os.environ.get("LP2PS_RUNS_TABLE", ""),
         metrics_table=os.environ.get("LP2PS_METRICS_TABLE", ""),
         catalog_table=os.environ.get("LP2PS_CATALOG_TABLE", ""),
+        findings_table=os.environ.get("LP2PS_FINDINGS_TABLE", ""),
         state_machine_arn=os.environ.get("LP2PS_STATE_MACHINE_ARN", ""),
         schedule_rule_name=os.environ.get("LP2PS_SCHEDULE_RULE_NAME", ""),
         region=os.environ.get("AWS_REGION", "us-west-2"),

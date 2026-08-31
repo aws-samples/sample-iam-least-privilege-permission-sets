@@ -24,6 +24,12 @@ class CatalogConflict(Exception):
     """catalog override 낙관적 락 충돌(동시 쓰기) — 라우터가 409 로 변환."""
 
 
+class FindingsUnavailable(Exception):
+    """조치 상태 테이블이 배선되지 않음(env 누락) — 라우터가 503 으로 변환.
+
+    조용히 성공으로 응답하면 운영자는 표시했다고 믿는데 새로고침하면 사라진다. 실패로 알린다."""
+
+
 def _member_hash(members: list[str]) -> str:
     """persona 멤버셋 지문. 멤버셋이 바뀌면 승인 상속을 무효화하는 데 쓴다.
 
@@ -196,7 +202,50 @@ class Repositories:
             return []
         text = storage.read_bytes("cleanup_backlog.csv").decode("utf-8")
         reader = csv.DictReader(io.StringIO(text))
-        return [CleanupItem.model_validate(_cleanup_row(row)) for row in reader]
+        items = [CleanupItem.model_validate(_cleanup_row(row)) for row in reader]
+        # 사람이 표시한 조치 상태를 병합한다. 산출물(CSV)은 결정론이어야 하므로 상태를 담지 않고,
+        # 여기서 finding_key 로 붙인다. 상태 레코드가 없으면 모델 기본값(open=미조치).
+        statuses = self.get_finding_statuses()
+        for it in items:
+            st = statuses.get(it.finding_key) if it.finding_key else None
+            if st:
+                it.status = st.get("status", "open")
+                it.status_note = st.get("note", "")
+                it.status_updated_at = st.get("updated_at", "")
+                it.status_updated_by = st.get("updated_by", "")
+        return items
+
+    # ---- 조치 상태 (DynamoDB findings) ----
+    def get_finding_statuses(self) -> dict[str, dict]:
+        """finding_key → 상태 레코드. 테이블 미설정/접근 불가면 빈 dict(전부 미조치로 보인다)."""
+        if not self.s.findings_table:
+            return {}
+        try:
+            items = self._scan(self.s.findings_table)
+        except Exception:  # noqa: BLE001 — 테이블 비었거나 접근 불가면 상태 없음(카탈로그와 동일 정책)
+            return {}
+        return {i["id"]: _from_ddb(i) for i in items if "id" in i}
+
+    def put_finding_status(
+        self, finding_key: str, status: str, note: str, *, updated_by: str, updated_at: str
+    ) -> dict:
+        """조치 상태 저장(도구 소유 DynamoDB 만). 같은 키에 대해 마지막 쓰기가 이긴다.
+
+        catalog override 와 달리 낙관적 락을 두지 않는다 — 이건 단일 스칼라 상태이고, 동시에 두
+        운영자가 같은 항목을 다르게 표시하는 경우 "먼저 쓴 사람 것이 남는다" 가 오히려 혼란스럽다.
+        누가 언제 바꿨는지는 레코드(updated_by/updated_at)와 감사 로그에 남는다.
+        """
+        if not self.s.findings_table:
+            raise FindingsUnavailable
+        record = {
+            "id": finding_key,
+            "status": status,
+            "note": note,
+            "updated_at": updated_at,
+            "updated_by": updated_by,
+        }
+        self._ddb.Table(self.s.findings_table).put_item(Item=_to_ddb_item(record))
+        return record
 
     # ---- accounts (collection_manifest of latest run) ----
     def list_accounts(self, run_id: str | None = None) -> list[dict]:

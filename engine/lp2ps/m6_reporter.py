@@ -25,6 +25,57 @@ if TYPE_CHECKING:  # pragma: no cover
     from .storage import Storage
 
 BACKLOG_NAME = "cleanup_backlog.csv"
+
+# 권장 조치 문구. IdC 를 쓰는 고객에게만 "Permission Set 로 마이그레이션" 이 실행 가능한 조언이다 —
+# IdC 가 없는 고객에게 그렇게 쓰면 조치할 수 없는 항목을 영구히 안고 가게 된다(그 고객은 정책을
+# 다듬어 IAM 정책/역할로 적용하는 것이 완결된 조치다). 문구만 다르고 판정 로직은 동일하다.
+_RECOMMENDATION: dict[str, tuple[str, str]] = {
+    # type: (IdC 사용, IdC 미사용)
+    "unused_role": (
+        "역할 삭제 (미사용 — PS 카탈로그에 불필요)",
+        "역할 삭제 (미사용 — 최소권한 정책 대상이 아님)",
+    ),
+    "unused_permission": (
+        "실사용 기반 최소권한 Permission Set 로 마이그레이션",
+        "실사용 기반 최소권한 IAM 정책으로 교체 (persona 검토 화면에서 정책·역할 Terraform 을 받아 적용)",
+    ),
+    "long_lived_key": (
+        "Identity Center(SSO) + Permission Set 임시 자격증명으로 전환 (장기 키 폐기)",
+        "액세스키를 교체·폐기하고 IAM Role 임시 자격증명(sts:AssumeRole)으로 전환",
+    ),
+    "no_mfa": (
+        "Identity Center(SSO+MFA) + Permission Set 로 전환 (IAM User 폐기)",
+        "이 IAM User 에 MFA 를 설정 (장기적으로는 Identity Center 도입 검토)",
+    ),
+    "escalation_path": (
+        "상승 유발 권한을 제거한 최소권한 Permission Set 로 마이그레이션",
+        "상승 유발 권한을 제거한 최소권한 IAM 정책으로 교체",
+    ),
+}
+
+
+def _recommendation(ctype: CleanupType, uses_idc: bool) -> str:
+    idc_text, plain_text = _RECOMMENDATION[ctype]
+    return idc_text if uses_idc else plain_text
+
+
+def cleanup_finding_key(ctype: str, account_id: str, principal: str, extra: str = "") -> str:
+    """cleanup 항목의 **내용 기반 안정 키**(sha256 hex) — 조치 상태를 붙이는 식별자.
+
+    `CleanupItem.id`(c1, c2…)는 정렬 후 부여하는 순번이라 다음 run 에서 항목이 하나 늘거나 줄면
+    뒤가 전부 밀린다. 그걸 상태 키로 쓰면 "조치완료" 표시가 조용히 다른 항목으로 옮겨간다.
+
+    키에 넣는 것은 **같은 문제를 같은 것으로 보게 하는 최소 식별자**뿐이다: 유형 + 계정 + principal
+    (+ escalation 처럼 principal 당 여러 건이 나오는 유형만 경로 식별자). `detail` 은 일부러 넣지
+    않는다 — "액세스키 age 612일" 이나 "외 34건" 처럼 매일 변하는 수치가 들어 있어서, 넣으면 값이
+    1 바뀔 때마다 새 항목으로 보여 조치 상태가 사라진다.
+
+    API(`routers/cleanup.py`)가 상태 저장·조회에 같은 함수를 쓴다(키 산출 단일 소스).
+    """
+    import hashlib
+
+    joined = "\x1f".join([ctype, account_id, principal, extra])
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 EXEC_SUMMARY_NAME = "exec_summary.json"
 REPORT_NAME = "report.html"
 
@@ -94,6 +145,7 @@ def _read_json_safe(storage: "Storage", relpath: str) -> dict:
 def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[CleanupItem]:
     """principal 레코드에서 5유형 cleanup 항목 도출(결정론 id·정렬)."""
     items: list[CleanupItem] = []
+    uses_idc = cfg.provisioning.uses_identity_center
 
     for rec in records:
         # unused_role: role 인데 used_actions 가 전혀 없음(미사용 역할).
@@ -101,7 +153,7 @@ def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[Cleanu
         # (managed-only 역할도 미사용 대상으로 잡는다).
         if rec.identity_type == "role" and not rec.used_actions and (rec.granted_actions or rec.has_managed_policies):
             items.append(_item("unused_role", rec, rec.risk_level,
-                               "90일간 미사용 역할", "역할 삭제 (미사용 — PS 카탈로그에 불필요)",
+                               "90일간 미사용 역할", _recommendation("unused_role", uses_idc),
                                evidence={
                                    "식별 유형": "role",
                                    "부여된 action 수": str(len(rec.granted_actions)),
@@ -115,7 +167,7 @@ def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[Cleanu
         if action_gaps:
             detail = f"granted 이나 미사용: {action_gaps[0]} 외 {max(0, len(action_gaps) - 1)}건"
             items.append(_item("unused_permission", rec, rec.risk_level, detail,
-                               "실사용 기반 최소권한 Permission Set 로 마이그레이션",
+                               _recommendation("unused_permission", uses_idc),
                                evidence={
                                    "부여된 action 수": str(len(rec.granted_actions)),
                                    "실사용 action 수": str(len(rec.used_actions)),
@@ -128,7 +180,7 @@ def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[Cleanu
         if rec.access_key_age_days is not None and rec.access_key_age_days >= cfg.risk_rules.long_lived_key_days:
             items.append(_item("long_lived_key", rec, rec.risk_level,
                                f"액세스키 age {rec.access_key_age_days}일",
-                               "Identity Center(SSO) + Permission Set 임시 자격증명으로 전환 (장기 키 폐기)",
+                               _recommendation("long_lived_key", uses_idc),
                                evidence={
                                    "액세스키 나이": f"{rec.access_key_age_days}일",
                                    "임계 기준": f"{cfg.risk_rules.long_lived_key_days}일 이상",
@@ -139,7 +191,7 @@ def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[Cleanu
         # no_mfa (콘솔 로그인 가능한 user 한정 — 서비스 계정 오탐 방지)
         if rec.identity_type == "user" and rec.console_login and not rec.mfa:
             items.append(_item("no_mfa", rec, rec.risk_level,
-                               "MFA 미설정 콘솔 사용자", "Identity Center(SSO+MFA) + Permission Set 로 전환 (IAM User 폐기)",
+                               "MFA 미설정 콘솔 사용자", _recommendation("no_mfa", uses_idc),
                                evidence={
                                    "식별 유형": "user",
                                    "콘솔 로그인": "가능",
@@ -151,13 +203,15 @@ def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[Cleanu
         for path in rec.escalation_paths:
             items.append(_item("escalation_path", rec, rec.risk_level,
                                f"{path.via} → {path.to} ({path.mitre})",
-                               "상승 유발 권한을 제거한 최소권한 Permission Set 로 마이그레이션",
+                               _recommendation("escalation_path", uses_idc),
                                evidence={
                                    "경유(via)": path.via,
                                    "도달 대상(to)": path.to,
                                    "MITRE ATT&CK": path.mitre,
                                    "부여된 action 수": str(len(rec.granted_actions)),
-                               }))
+                               },
+                               # 한 principal 에 상승 경로가 여러 건 나오므로 경로 자체로 건을 구분한다.
+                               key_extra=f"{path.via}\x1f{path.to}\x1f{path.mitre}"))
 
     # 결정론 id: (type, account, principal, detail) 정렬 후 c1.. 부여.
     items.sort(key=lambda x: (x.type, x.account_id, x.principal, x.detail))
@@ -167,9 +221,12 @@ def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[Cleanu
 
 
 def _item(ctype: CleanupType, rec: PrincipalRecord, risk, detail: str, rec_text: str,
-          evidence: dict[str, str] | None = None) -> CleanupItem:
+          evidence: dict[str, str] | None = None, key_extra: str = "") -> CleanupItem:
     return CleanupItem(
         id="",  # 나중에 정렬 후 부여
+        # 조치 상태용 안정 키. key_extra 는 principal 당 여러 건이 나오는 유형(escalation_path)에서만
+        # 건을 구분하는 데 쓴다 — 나머지 유형은 (유형, 계정, principal) 이 곧 한 건이다.
+        finding_key=cleanup_finding_key(ctype, rec.account_id, rec.principal, key_extra),
         type=ctype,
         account_id=rec.account_id,
         principal=rec.principal,
@@ -199,11 +256,14 @@ def _write_backlog(storage: "Storage", items: list[CleanupItem]) -> None:
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\n")  # 결정론(플랫폼 무관 개행)
     # risk_score/risk_reasons/evidence 추가 — reasons 는 '|' join, evidence 는 JSON(정렬키·결정론).
-    writer.writerow(["id", "type", "account_id", "principal", "risk_level", "detail",
+    # finding_key 추가 — API 가 조치 상태를 이 키로 병합한다(순번 id 로는 run 간 대응이 깨진다).
+    # 조치 상태 자체는 여기 쓰지 않는다(엔진 산출물은 결정론, 사람의 판단은 findings 테이블 소관).
+    writer.writerow(["id", "finding_key", "type", "account_id", "principal", "risk_level", "detail",
                      "recommendation", "risk_score", "risk_reasons", "evidence"])
     for it in items:
         # 사용자/자원 유래 텍스트 셀을 formula-injection 무력화(수치 컬럼 제외).
-        writer.writerow([_csv_safe(it.id), _csv_safe(it.type), _csv_safe(it.account_id),
+        writer.writerow([_csv_safe(it.id), _csv_safe(it.finding_key),
+                         _csv_safe(it.type), _csv_safe(it.account_id),
                          _csv_safe(it.principal), _csv_safe(it.risk_level), _csv_safe(it.detail),
                          _csv_safe(it.recommendation), it.risk_score,
                          _csv_safe("|".join(it.risk_reasons)),

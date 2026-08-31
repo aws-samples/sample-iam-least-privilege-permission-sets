@@ -50,6 +50,7 @@ const api = new ApiStack(app, `${prefix}-Api`, {
   runsTable: data.runsTable,
   metricsTable: data.metricsTable,
   catalogTable: data.catalogTable,
+  findingsTable: data.findingsTable,
   stateMachine: engine.stateMachine,
   scheduleRule: engine.scheduleRule,
 });

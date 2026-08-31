@@ -142,8 +142,14 @@ export type CleanupType =
   | "no_mfa"
   | "escalation_path";
 
+// 조치 진행 상태. 엔진 산출물엔 없고 API 가 도구 소유 DynamoDB 에서 병합한다.
+export type CleanupStatus = "open" | "done" | "deferred";
+
 export interface CleanupItem {
   id: string;
+  // 조치 상태를 붙이는 내용 기반 안정 키(sha256 hex). `id`(c1, c2…)는 run 마다 밀릴 수 있어 쓰지
+  // 않는다. 이전 형식 산출물(구 run)에는 없으므로 빈 문자열일 수 있다 → 그때는 상태 표시 불가.
+  finding_key: string;
   type: CleanupType;
   account_id: string;
   principal: string;
@@ -153,6 +159,19 @@ export interface CleanupItem {
   risk_score: number; // 0-100 (가중치 합)
   risk_reasons: string[]; // 왜 이 레벨인지 — M4 규칙 근거
   evidence?: Record<string, string>; // 유형별 상세 근거(라벨→값)
+  status: CleanupStatus;
+  status_note: string;
+  status_updated_at: string;
+  status_updated_by: string;
+}
+
+// PUT /cleanup-backlog/{finding_key}/status 응답.
+export interface CleanupStatusRecord {
+  finding_key: string;
+  status: CleanupStatus;
+  note: string;
+  updated_at: string;
+  updated_by: string;
 }
 
 // 위험도 산정 기준(왜 critical/high 인지 설명용). config risk_rules 유래.

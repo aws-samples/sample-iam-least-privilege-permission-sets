@@ -108,6 +108,9 @@ export class DataStack extends cdk.Stack {
     this.runsTable = mkTable("RunsTable", "run_id");
     this.metricsTable = mkTable("MetricsTable", "run_id", "ts");
     this.catalogTable = mkTable("CatalogTable", "persona");
+    // findings — 조치 필요 항목의 **조치 상태**(미조치/조치완료/보류)를 사람이 표시한 기록.
+    // pk `id` 는 CleanupItem.id(c1, c2… 순번)가 **아니라** finding_key(내용 기반 sha256)다. 순번은
+    // 다음 run 에서 항목이 하나 늘면 뒤로 전부 밀리므로 상태가 다른 항목에 붙는다.
     this.findingsTable = mkTable("FindingsTable", "id");
 
     new cdk.CfnOutput(this, "DataBucketName", { value: this.dataBucket.bucketName });

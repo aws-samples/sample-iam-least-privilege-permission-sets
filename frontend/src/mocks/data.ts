@@ -6,6 +6,7 @@
 import type {
   CatalogEntry,
   CleanupItem,
+  CleanupStatus,
   MetricsPoint,
   PolicyAction,
   ReportRef,
@@ -218,7 +219,8 @@ function reasonsFor(type: CleanupItem["type"], level: CleanupItem["risk_level"])
 }
 
 function genCleanup(): CleanupItem[] {
-  const seedItems: Omit<CleanupItem, "id" | "account_id" | "risk_level" | "risk_score" | "risk_reasons">[] = [
+  const seedItems: Omit<CleanupItem, "id" | "finding_key" | "account_id" | "risk_level" | "risk_score"
+    | "risk_reasons" | "status" | "status_note" | "status_updated_at" | "status_updated_by">[] = [
     { type: "long_lived_key", principal: "user/legacy-svc", detail: "액세스키 age 612일", recommendation: "키 회전 또는 역할 전환" },
     { type: "no_mfa", principal: "user/ops-break-glass", detail: "MFA 미설정 콘솔 사용자", recommendation: "MFA 강제 또는 SSO 전환" },
     { type: "escalation_path", principal: "role/platform-admin", detail: "iam:CreateRole → AttachRolePolicy 상승 경로", recommendation: "권한 경계(permission boundary) 적용" },
@@ -236,8 +238,14 @@ function genCleanup(): CleanupItem[] {
     for (let i = 0; i < counts[type]; i++) {
       const acct = ACCOUNTS[n % ACCOUNTS.length];
       const level = RISK_CYCLE[(n + (type === "long_lived_key" ? 0 : 2)) % RISK_CYCLE.length];
+      // 조치 상태 mock — 8개마다 조치완료, 13개마다 보류. 화면에서 세 상태·필터·집계가 실제로
+      // 렌더되는지 확인하려면 mock 에 세 상태가 다 있어야 한다(전부 미조치면 검증이 불가능하다).
+      const marked: CleanupStatus = n % 8 === 3 ? "done" : n % 13 === 5 ? "deferred" : "open";
       out.push({
         id: `c${++n}`,
+        // 실제 키는 엔진의 sha256 hex(64자). mock 도 같은 형식으로 만들어 화면 로직이 형식에
+        // 의존하지 않는지 함께 확인한다.
+        finding_key: n.toString(16).padStart(64, "0"),
         type,
         account_id: acct,
         principal: `arn:aws:iam::${acct}:${seed.principal}${i === 0 ? "" : "-" + i}`,
@@ -247,6 +255,10 @@ function genCleanup(): CleanupItem[] {
         risk_score: LEVEL_SCORE[level],
         risk_reasons: reasonsFor(type, level),
         evidence: TYPE_EVIDENCE[type],
+        status: marked,
+        status_note: marked === "done" ? "IdC 없이 IAM 정책만 다듬어 적용함" : marked === "deferred" ? "차기 분기 정리 예정" : "",
+        status_updated_at: marked === "open" ? "" : "2026-08-30T05:00:00Z",
+        status_updated_by: marked === "open" ? "" : "ops@example.com",
       });
     }
   });

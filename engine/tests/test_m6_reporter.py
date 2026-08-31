@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 
 from lp2ps.config import Config
 from lp2ps.m6_reporter import BACKLOG_NAME, EXEC_SUMMARY_NAME, build_reports
@@ -123,6 +124,115 @@ def test_reports_deterministic(tmp_path):
     build_reports(st, RUN, _cfg())
     b = st.read_bytes(BACKLOG_NAME)
     assert a == b
+
+
+def _cfg_no_idc() -> Config:
+    return Config.model_validate({"customer": "test", "region": "us-west-2",
+                                  "cross_account": False, "accounts": ["self"],
+                                  "provisioning": {"uses_identity_center": False}})
+
+
+# ---- finding_key: 조치 상태가 run 을 넘어 살아남는 근거 ----
+
+def test_finding_key_stable_when_volatile_detail_changes(tmp_path):
+    """detail 의 변하는 수치(액세스키 age)가 바뀌어도 finding_key 는 같다.
+
+    detail 을 키에 넣었다면 매일 새 항목이 되어 "조치완료" 표시가 하루 만에 사라진다."""
+    keys = []
+    for age in (612, 613):
+        st = LocalFSStorage(tmp_path / str(age), "test", "run-x")
+        st.write_normalized([
+            PrincipalRecord(account_id="111122223333", principal="arn:aws:iam::111122223333:user/u",
+                            identity_type="user", access_key_age_days=age, risk_level="high",
+                            run_id="run-x"),
+        ])
+        st.write_json("catalog.json", [])
+        build_reports(st, RUN, _cfg())
+        rows = list(csv.DictReader(io.StringIO(st.read_bytes(BACKLOG_NAME).decode())))
+        row = next(r for r in rows if r["type"] == "long_lived_key")
+        assert str(age) in row["detail"], "detail 은 실제로 달라야 함(대조 전제)"
+        keys.append(row["finding_key"])
+    assert keys[0] == keys[1], "detail 만 달라졌는데 finding_key 가 바뀌면 상태가 유실된다"
+
+
+def test_finding_key_survives_id_shift(tmp_path):
+    """항목이 하나 늘어 `id` 순번이 밀려도 기존 항목의 finding_key 는 그대로다."""
+    target = "arn:aws:iam::111122223333:user/u"
+    base = PrincipalRecord(account_id="111122223333", principal=target, identity_type="user",
+                           mfa=False, console_login=True, risk_level="medium", run_id="run-x")
+    # 정렬키(type, ...)는 유형명 사전순이라 long_lived_key < no_mfa — 이 항목을 추가하면 no_mfa 의
+    # 순번이 밀린다(unused_* 는 no_mfa 뒤라 밀어내지 못한다).
+    extra = PrincipalRecord(account_id="111122223333",
+                            principal="arn:aws:iam::111122223333:user/aaa", identity_type="user",
+                            mfa=True, console_login=False, access_key_age_days=400,
+                            risk_level="low", run_id="run-x")
+
+    def _row(recs):
+        st = LocalFSStorage(tmp_path / str(len(recs)), "test", "run-x")
+        st.write_normalized(recs)
+        st.write_json("catalog.json", [])
+        build_reports(st, RUN, _cfg())
+        rows = list(csv.DictReader(io.StringIO(st.read_bytes(BACKLOG_NAME).decode())))
+        return next(r for r in rows if r["type"] == "no_mfa" and r["principal"] == target)
+
+    before, after = _row([base]), _row([base, extra])
+    assert before["id"] != after["id"], "순번이 실제로 밀려야 함(대조 전제 — 안 밀리면 이 테스트는 무의미)"
+    assert before["finding_key"] == after["finding_key"]
+
+
+def test_finding_key_distinct_per_escalation_path(tmp_path):
+    """한 principal 의 상승 경로가 여러 건이면 건마다 다른 키(키 하나로 뭉치면 개별 조치 불가)."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    st.write_normalized([
+        PrincipalRecord(account_id="111122223333", principal="arn:aws:iam::111122223333:role/r",
+                        identity_type="role", granted_actions=["iam:*"], risk_level="high",
+                        used_actions=[UsedAction(action="iam:ListRoles", last_used=None, count_90d=1)],
+                        escalation_paths=[
+                            EscalationPath(via="iam:PassRole", to="lambda", mitre="TA0004"),
+                            EscalationPath(via="iam:AttachRolePolicy", to="admin", mitre="TA0004"),
+                        ], run_id="run-x"),
+    ])
+    st.write_json("catalog.json", [])
+    build_reports(st, RUN, _cfg())
+    rows = [r for r in csv.DictReader(io.StringIO(st.read_bytes(BACKLOG_NAME).decode()))
+            if r["type"] == "escalation_path"]
+    assert len(rows) == 2
+    assert len({r["finding_key"] for r in rows}) == 2
+
+
+def test_backlog_csv_has_finding_key_column(tmp_path):
+    """CSV 헤더에 finding_key 가 있고, 각 행이 64자 hex 다(API 가 이 컬럼으로 상태를 병합)."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    _seed(st)
+    build_reports(st, RUN, _cfg())
+    text = st.read_bytes(BACKLOG_NAME).decode()
+    header = next(csv.reader(io.StringIO(text)))
+    assert header[:3] == ["id", "finding_key", "type"]
+    rows = list(csv.DictReader(io.StringIO(text)))
+    assert rows and all(re.fullmatch(r"[0-9a-f]{64}", r["finding_key"]) for r in rows)
+
+
+# ---- 권장 조치 문구: IdC 미사용 고객은 조치 가능한 문구를 받아야 한다 ----
+
+def test_recommendation_avoids_permission_set_when_no_idc(tmp_path):
+    """uses_identity_center=false 면 어떤 항목도 Permission Set 를 권하지 않는다(조치 불가 조언 금지)."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    _seed(st)
+    build_reports(st, RUN, _cfg_no_idc())
+    rows = list(csv.DictReader(io.StringIO(st.read_bytes(BACKLOG_NAME).decode())))
+    assert len(rows) >= 5
+    for r in rows:
+        assert "Permission Set" not in r["recommendation"], r
+        assert "PS " not in r["recommendation"], r
+
+
+def test_recommendation_mentions_permission_set_when_idc(tmp_path):
+    """대조군 — IdC 고객에게는 기존대로 PS 문구가 나온다(위 테스트가 항상 통과하는 게 아님을 보장)."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    _seed(st)
+    build_reports(st, RUN, _cfg())
+    rows = list(csv.DictReader(io.StringIO(st.read_bytes(BACKLOG_NAME).decode())))
+    assert any("Permission Set" in r["recommendation"] for r in rows)
 
 
 def test_sec018_csv_formula_injection_neutralized():

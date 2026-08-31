@@ -346,6 +346,124 @@ def test_cleanup_and_reports(monkeypatch):
     assert latest["exec_summary"]["personas"] == 3
 
 
+# ---- 조치 상태(미조치/조치완료/보류) ----
+
+KEY_A = "a" * 64
+KEY_B = "b" * 64
+
+
+def _seed_findings_table(monkeypatch):
+    """findings 테이블 생성 + env 배선(CDK api-stack 이 하는 일과 동일)."""
+    boto3.resource("dynamodb", region_name="us-west-2").create_table(
+        TableName="findings", KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST")
+    monkeypatch.setenv("LP2PS_FINDINGS_TABLE", "findings")
+
+
+def _write_backlog(run_id: str, rows: list[str]) -> None:
+    """finding_key 컬럼이 있는 백로그 CSV 를 그 run 에 쓴다."""
+    from lp2ps.storage import S3Storage
+
+    header = ("id,finding_key,type,account_id,principal,risk_level,detail,"
+              "recommendation,risk_score,risk_reasons,evidence\n")
+    S3Storage(f"s3://{BUCKET}", CUSTOMER, run_id).write_text(
+        "cleanup_backlog.csv", header + "".join(r + "\n" for r in rows))
+
+
+@mock_aws
+def test_cleanup_status_put_then_get_merges(monkeypatch):
+    """조치완료 표시 → GET /cleanup-backlog 에 status·메모·작성자가 병합돼 보인다."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch); _seed_findings_table(monkeypatch)
+    _write_backlog("run-001", [f"c1,{KEY_A},no_mfa,111122223333,arn:u,medium,MFA 없음,fix,35,,{{}}"])
+    c = _client(monkeypatch)
+    # 표시 전에는 미조치.
+    assert c.get("/cleanup-backlog").json()[0]["status"] == "open"
+    r = c.put(f"/cleanup-backlog/{KEY_A}/status",
+              json={"status": "done", "note": "IdC 없이 IAM 정책만 다듬어 적용함"})
+    assert r.status_code == 200, r.text
+    assert r.json()["finding_key"] == KEY_A
+    item = c.get("/cleanup-backlog").json()[0]
+    assert item["status"] == "done"
+    assert item["status_note"] == "IdC 없이 IAM 정책만 다듬어 적용함"
+    assert item["status_updated_at"].endswith("Z")
+    # 보류로 변경 — 마지막 쓰기가 이긴다.
+    c.put(f"/cleanup-backlog/{KEY_A}/status", json={"status": "deferred", "note": "차기 분기"})
+    assert c.get("/cleanup-backlog").json()[0]["status"] == "deferred"
+
+
+@mock_aws
+def test_cleanup_status_survives_new_run_with_shifted_id(monkeypatch):
+    """이 기능의 핵심 — 새 run 에서 순번 id 가 밀려도 finding_key 가 같으면 상태가 유지된다."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch); _seed_findings_table(monkeypatch)
+    _write_backlog("run-001", [f"c1,{KEY_A},no_mfa,111122223333,arn:u,medium,MFA 없음,fix,35,,{{}}"])
+    c = _client(monkeypatch)
+    c.put(f"/cleanup-backlog/{KEY_A}/status", json={"status": "done", "note": "처리"})
+
+    # 새 run: 항목이 하나 늘어 기존 항목의 id 가 c1 → c2 로 밀렸다(detail 수치도 변했다).
+    boto3.resource("dynamodb", region_name="us-west-2").Table(RUNS_TABLE).put_item(
+        Item={"run_id": "run-002", "customer": CUSTOMER, "started_at": "2026-07-17T00:00:00Z",
+              "account_scope": 1, "status": "succeeded"})
+    _write_backlog("run-002", [
+        f"c1,{KEY_B},long_lived_key,111122223333,arn:v,high,액세스키 age 613일,fix,50,,{{}}",
+        f"c2,{KEY_A},no_mfa,111122223333,arn:u,medium,MFA 없음(외 2건),fix,35,,{{}}",
+    ])
+    items = {i["finding_key"]: i for i in c.get("/cleanup-backlog").json()}
+    assert items[KEY_A]["id"] == "c2", "순번이 실제로 밀려야 함(대조 전제)"
+    assert items[KEY_A]["status"] == "done", "id 가 밀렸는데 상태가 유실되면 안 된다"
+    assert items[KEY_B]["status"] == "open", "표시하지 않은 새 항목은 미조치"
+
+
+@mock_aws
+def test_cleanup_status_rejects_bad_finding_key(monkeypatch):
+    """경로 파라미터가 sha256 hex 가 아니면 400 — 임의 문자열이 DynamoDB 키가 되지 않게."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch); _seed_findings_table(monkeypatch)
+    c = _client(monkeypatch)
+    assert c.put("/cleanup-backlog/not-a-key/status", json={"status": "done"}).status_code == 400
+    # 대조군: 형식이 맞으면 통과한다(위 400 이 경로 자체 문제가 아님을 보장).
+    assert c.put(f"/cleanup-backlog/{KEY_A}/status", json={"status": "done"}).status_code == 200
+
+
+@mock_aws
+def test_cleanup_status_503_when_table_unwired(monkeypatch):
+    """findings 테이블 env 가 없으면 조용히 성공하지 않고 503(표시했다고 착각 방지)."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    monkeypatch.delenv("LP2PS_FINDINGS_TABLE", raising=False)
+    c = _client(monkeypatch)
+    r = c.put(f"/cleanup-backlog/{KEY_A}/status", json={"status": "done"})
+    assert r.status_code == 503, r.text
+    # 조회는 계속 동작(전부 미조치로 보인다).
+    assert c.get("/cleanup-backlog").status_code == 200
+
+
+@mock_aws
+def test_cleanup_status_requires_auth(monkeypatch):
+    """쓰기 경로는 인증 필수(auth 미비활성 → 401)."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch); _seed_findings_table(monkeypatch)
+    c = _client(monkeypatch, auth=False)
+    assert c.put(f"/cleanup-backlog/{KEY_A}/status", json={"status": "done"}).status_code == 401
+
+
+@mock_aws
+def test_cleanup_status_rejects_unknown_status_and_long_note(monkeypatch):
+    _seed_env(monkeypatch); _seed_aws(monkeypatch); _seed_findings_table(monkeypatch)
+    c = _client(monkeypatch)
+    assert c.put(f"/cleanup-backlog/{KEY_A}/status", json={"status": "resolved"}).status_code == 422
+    assert c.put(f"/cleanup-backlog/{KEY_A}/status",
+                 json={"status": "done", "note": "x" * 501}).status_code == 422
+
+
+@mock_aws
+def test_cleanup_legacy_csv_without_finding_key_has_no_status(monkeypatch):
+    """구 산출물(finding_key 컬럼 없음)은 빈 키 → 상태 병합 안 함(엉뚱한 항목에 붙는 것보다 낫다)."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch); _seed_findings_table(monkeypatch)
+    c = _client(monkeypatch)
+    # _seed_aws 의 CSV 는 finding_key 컬럼이 없다.
+    item = c.get("/cleanup-backlog").json()[0]
+    assert item["finding_key"] == ""
+    assert item["status"] == "open"
+
+
 def _seed_aws_no_runs(monkeypatch):
     """갓 배포한 상태 — 테이블/버킷은 있고 run 은 0건(_seed_aws 의 run-001 산출물이 없다)."""
     s3 = boto3.client("s3", region_name="us-west-2")

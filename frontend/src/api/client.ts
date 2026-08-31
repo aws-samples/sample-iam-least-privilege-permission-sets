@@ -8,6 +8,8 @@ import type {
   AssistantAnswer,
   CatalogEntry,
   CleanupItem,
+  CleanupStatus,
+  CleanupStatusRecord,
   MetricsPoint,
   AccountInfo,
   AiSettings,
@@ -63,6 +65,9 @@ export interface Api {
   // 2차 확인 후: tooling-IdC 에 PS 정의 생성(assignment 제외).
   provisionPermissionSet(persona: string): Promise<ProvisionResult>;
   getCleanup(): Promise<CleanupItem[]>;
+  // 조치 상태 표시. 실제 조치는 사람이 AWS 에서 수행하고 여기엔 그 사실만 기록한다.
+  // findingKey 가 빈 항목(구 형식 산출물)은 호출하면 안 된다 — 상태를 붙일 대상을 특정할 수 없다.
+  setCleanupStatus(findingKey: string, status: CleanupStatus, note: string): Promise<CleanupStatusRecord>;
   getRiskCriteria(): Promise<RiskCriteria>;
   getReport(runId: string): Promise<ReportRef>;
   // null = 아직 볼 수 있는 리포트가 없다(갓 배포한 상태 · 전체 조회 미실행). 오류가 아니다.
@@ -240,7 +245,26 @@ const mockApi: Api = {
       },
       900,
     ),
-  getCleanup: () => delay([...mock.CLEANUP]),
+  getCleanup: () => delay(mock.CLEANUP.map((c) => ({ ...c }))),
+  // mock 은 모듈 상태를 그 자리에서 갱신한다 — 표시 후 재조회했을 때 값이 유지되는지(=화면이
+  // 낙관적 갱신에만 의존하지 않는지)까지 확인할 수 있어야 한다.
+  setCleanupStatus: (findingKey, status, note) => {
+    const target = mock.CLEANUP.find((c) => c.finding_key === findingKey);
+    const rec: CleanupStatusRecord = {
+      finding_key: findingKey,
+      status,
+      note,
+      updated_at: new Date().toISOString(),
+      updated_by: "mock@example.com",
+    };
+    if (target) {
+      target.status = status;
+      target.status_note = note;
+      target.status_updated_at = rec.updated_at;
+      target.status_updated_by = rec.updated_by;
+    }
+    return delay(rec);
+  },
   getRiskCriteria: () => delay(structuredClone(mock.RISK_CRITERIA)),
   getReport: (runId) => delay(mock.REPORTS[runId] ?? mock.REPORTS[mock.LATEST_RUN_ID]),
   getLatestReport: (_account) => delay(mock.REPORTS[mock.LATEST_RUN_ID]),
@@ -293,6 +317,11 @@ const realApi: Api = {
   provisionPermissionSet: (persona) =>
     real(`/catalog/${encodeURIComponent(persona)}/provision-ps`, { method: "POST" }),
   getCleanup: () => real("/cleanup-backlog"),
+  setCleanupStatus: (findingKey, status, note) =>
+    real(`/cleanup-backlog/${encodeURIComponent(findingKey)}/status`, {
+      method: "PUT",
+      body: JSON.stringify({ status, note }),
+    }),
   getRiskCriteria: () => real("/cleanup-backlog/risk-criteria"),
   getReport: (runId) => real(`/reports/${runId}`),
   getLatestReport: (account) => real(account ? `/reports?account=${encodeURIComponent(account)}` : "/reports"),

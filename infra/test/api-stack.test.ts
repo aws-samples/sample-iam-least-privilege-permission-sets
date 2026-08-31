@@ -65,6 +65,7 @@ const api = new ApiStack(app, "TestApi", {
   runsTable: data.runsTable,
   metricsTable: data.metricsTable,
   catalogTable: data.catalogTable,
+  findingsTable: data.findingsTable,
   stateMachine: engine.stateMachine,
   scheduleRule: engine.scheduleRule,
 });
@@ -211,6 +212,35 @@ assert(
 assert(
   !JSON.stringify(recordRun.map((s) => s.Resource)).includes('"*"'),
   "RecordRunningRun has no bare '*' resource",
+);
+
+// ---- Cleanup action-status wiring ----
+//
+// The status a human marks on a cleanup item (미조치/조치완료/보류) lives in the findings table,
+// not in the engine's deterministic output. If the Lambda does not receive the table name the
+// feature degrades to read-only: every item shows as 미조치 and PUT answers 503. That is loud at
+// the API, but nothing in a synth/deploy would surface it, so it is asserted here.
+assert(
+  envVars.LP2PS_FINDINGS_TABLE !== undefined,
+  "the API Lambda receives LP2PS_FINDINGS_TABLE (without it cleanup status marking is dead)",
+);
+// The API must be able to read *and* write it -- this is the one tool-owned table where the API
+// itself is the writer (the engine never touches it). Member accounts are unaffected. The table
+// lives in the data stack, so the grant shows up as an Fn::ImportValue naming FindingsTable.
+const findingsGrants = statements.filter((s) => {
+  const acts = Array.isArray(s.Action) ? s.Action : [s.Action ?? ""];
+  return acts.includes("dynamodb:PutItem") && JSON.stringify(s.Resource).includes("FindingsTable");
+});
+assert(
+  findingsGrants.length >= 1,
+  "the API role may PutItem on the findings table (cleanup status writes)",
+);
+assert(
+  findingsGrants.some((s) => {
+    const acts = Array.isArray(s.Action) ? s.Action : [s.Action ?? ""];
+    return acts.includes("dynamodb:Scan");
+  }),
+  "the API role may Scan the findings table (status merge on GET /cleanup-backlog)",
 );
 
 if (process.exitCode && process.exitCode !== 0) {

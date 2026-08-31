@@ -27,6 +27,10 @@ SynthesisSource = Literal["access_analyzer", "fallback_used_actions"]
 CleanupType = Literal[
     "unused_permission", "unused_role", "long_lived_key", "no_mfa", "escalation_path"
 ]
+# 조치 진행 상태. 엔진은 항상 "open"(미조치)만 낸다 — 사람이 무엇을 처리했는지는 엔진이 알 수 없다.
+# 상태는 API 가 도구 소유 DynamoDB(findings)에 따로 보관하고 조회 시 병합한다(불변식 ②: 코어 산출물은
+# 결정론이어야 하므로 사람의 판단을 산출물에 섞지 않는다).
+CleanupStatus = Literal["open", "done", "deferred"]
 
 
 class UsedAction(BaseModel):
@@ -150,6 +154,10 @@ class CatalogEntry(BaseModel):
 
 class CleanupItem(BaseModel):
     id: str
+    # 조치 상태를 붙이기 위한 **내용 기반 안정 키**(sha256 hex). `id` 는 정렬 후 부여하는 순번(c1, c2…)
+    # 이라 항목이 하나 늘거나 사라지면 뒤의 모든 항목이 밀린다 — 그걸 키로 상태를 저장하면 다음 run
+    # 에서 "조치완료" 가 엉뚱한 항목에 붙는다. 산출은 m6_reporter.cleanup_finding_key.
+    finding_key: str = ""
     type: CleanupType
     account_id: str
     principal: str
@@ -162,6 +170,11 @@ class CleanupItem(BaseModel):
     # 유형별 상세 근거(라벨→값). 상세 화면에서 "왜/무엇" 을 더 깊이 보여준다.
     # 예(unused_permission): {"미사용 action 수": "35", "granted 총 action": "50", "대표 미사용": "s3:Delete…"}
     evidence: dict[str, str] = Field(default_factory=dict)
+    # ---- 조치 상태(사람이 표시) — 엔진 산출물에는 담지 않는다. API 가 findings 테이블에서 병합. ----
+    status: CleanupStatus = "open"
+    status_note: str = ""  # 조치완료/보류 사유(예: "IdC 없이 IAM 정책만 다듬어 적용함")
+    status_updated_at: str = ""  # ISO8601
+    status_updated_by: str = ""  # 표시한 운영자(Cognito email 또는 sub)
 
 
 class ExecSummary(BaseModel):

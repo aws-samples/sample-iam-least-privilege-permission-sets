@@ -2,27 +2,82 @@
 
 GET /cleanup-backlog/risk-criteria — 위험도 산정 기준(가중치·레벨 경계). 운영자가 "왜 이 항목이
 critical/high 인지" 이해하도록 규칙을 노출한다. 임계치는 전부 config(risk_rules)에서 읽는다(불변식④).
+
+PUT /cleanup-backlog/{finding_key}/status — 조치 상태 표시(미조치/조치완료/보류). 실제 조치는 사람이
+AWS 콘솔·Terraform 으로 수행하고(이 도구는 대상 계정에 쓰지 않는다), 여기엔 **그 사실을 기록**만 한다.
+그래서 상태는 도구 소유 DynamoDB(findings)에 있고 엔진 산출물에는 없다(불변식 ②).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
+from datetime import datetime, timezone
 
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 
 from lp2ps.config import RiskRules
-from lp2ps.models import CleanupItem
+from lp2ps.models import CleanupItem, CleanupStatus
 
+from ..audit import audit_event
+from ..auth import require_auth
+from ..repositories import FindingsUnavailable
 from . import get_repos
 
 router = APIRouter(tags=["cleanup"])
+
+# finding_key 는 엔진이 만드는 sha256 hex 다(m6_reporter.cleanup_finding_key). 경로 파라미터로
+# 오므로 형식을 고정해 임의 문자열이 DynamoDB 키로 들어가는 것을 막는다.
+FINDING_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @router.get("/cleanup-backlog")
 def get_cleanup() -> list[CleanupItem]:
     return get_repos().get_cleanup()
+
+
+class SetStatusRequest(BaseModel):
+    status: CleanupStatus
+    # 조치 근거 메모. IdC 없이 IAM 정책만 다듬어 적용한 경우처럼 "권장 조치와 다른 방법으로
+    # 해결했다" 를 남기는 자리다. 길이를 제한해 무한 쓰기를 막는다.
+    note: str = Field(default="", max_length=500)
+
+
+class StatusRecord(BaseModel):
+    finding_key: str
+    status: CleanupStatus
+    note: str
+    updated_at: str
+    updated_by: str
+
+
+@router.put("/cleanup-backlog/{finding_key}/status")
+def set_cleanup_status(
+    finding_key: str, req: SetStatusRequest, claims: dict = Depends(require_auth)
+) -> StatusRecord:
+    """조치 상태 표시. 대상 계정에는 아무 것도 하지 않는다(기록 전용)."""
+    if not FINDING_KEY_RE.match(finding_key):
+        raise HTTPException(status_code=400, detail="잘못된 finding_key 형식")
+    # 표시 시각은 서버 시각(감사 기록). 엔진 결정론 제약(불변식 ②)은 산출물에만 적용되고, 이건
+    # 사람의 행위 기록이라 wall-clock 이 맞다.
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    actor = claims.get("email") or claims.get("sub") or ""
+    try:
+        rec = get_repos().put_finding_status(
+            finding_key, req.status, req.note, updated_by=actor, updated_at=now
+        )
+    except FindingsUnavailable as e:
+        audit_event(action="cleanup_status", resource=finding_key, result="failure",
+                    claims=claims, reason="findings_table_unset")
+        raise HTTPException(status_code=503, detail="조치 상태 저장소가 배선되지 않았습니다") from e
+    audit_event(action="cleanup_status", resource=finding_key, result="success",
+                claims=claims, status=req.status)
+    return StatusRecord(
+        finding_key=rec["id"], status=rec["status"], note=rec["note"],
+        updated_at=rec["updated_at"], updated_by=rec["updated_by"],
+    )
 
 
 class RiskRuleInfo(BaseModel):

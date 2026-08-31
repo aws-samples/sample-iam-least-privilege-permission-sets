@@ -33,6 +33,7 @@ export interface ApiStackProps extends cdk.StackProps {
   runsTable: dynamodb.Table;
   metricsTable: dynamodb.Table;
   catalogTable: dynamodb.Table;
+  findingsTable: dynamodb.Table;
   stateMachine: sfn.StateMachine;
   scheduleRule: events.Rule;
 }
@@ -42,8 +43,8 @@ const ASSETS = path.join(__dirname, "..", "assets");
 export class ApiStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ApiStackProps) {
     super(scope, id, props);
-    const { cfg, userPool, dataBucket, runsTable, metricsTable, catalogTable, stateMachine, scheduleRule } =
-      props;
+    const { cfg, userPool, dataBucket, runsTable, metricsTable, catalogTable, findingsTable,
+      stateMachine, scheduleRule } = props;
 
     // CORS 허용 origin 은 CloudFront 도메인만. Web 스택(도메인)은 Api 보다 나중에 배포되어
     // synth 시 도메인을 알 수 없으므로 CfnParameter 로 받는다(2단계: 최초 배포 → 도메인 확인 →
@@ -172,6 +173,9 @@ export class ApiStack extends cdk.Stack {
         LP2PS_RUNS_TABLE: runsTable.tableName,
         LP2PS_METRICS_TABLE: metricsTable.tableName,
         LP2PS_CATALOG_TABLE: catalogTable.tableName,
+        // 조치 필요 항목의 상태(미조치/조치완료/보류). 없으면 PUT 이 503 이 되고 화면은 전부
+        // 미조치로 보인다 — 조용히 성공한 척하지 않기 위해 항상 주입한다.
+        LP2PS_FINDINGS_TABLE: findingsTable.tableName,
         LP2PS_STATE_MACHINE_ARN: stateMachine.stateMachineArn,
         LP2PS_SCHEDULE_RULE_NAME: scheduleRule.ruleName,
         LP2PS_TOOLING_ACCOUNT: this.account, // 관제 계정 식별(계정 목록에서 is_tooling 표기)
@@ -204,6 +208,7 @@ export class ApiStack extends cdk.Stack {
       }),
     );
     catalogTable.grantReadWriteData(apiFn); // PATCH/approve 는 catalog 조정(도구 DynamoDB만)
+    findingsTable.grantReadWriteData(apiFn); // 조치 상태 표시(도구 DynamoDB만 — 대상 계정 무관)
     stateMachine.grantStartExecution(apiFn); // POST /runs 트리거
 
     // 스케줄 관리(GET/PUT /schedule) — 도구 소유 EventBridge 규칙 하나만. describe/put 로 cron·
