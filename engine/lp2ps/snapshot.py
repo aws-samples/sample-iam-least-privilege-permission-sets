@@ -148,8 +148,15 @@ def _metrics_for(
     records: list[PrincipalRecord], catalog: list[CatalogEntry], run: "RunContext", account_id: str
 ) -> MetricsPoint:
     unused_permissions = sum(len([f for f in r.unused_findings if ":" in f]) for r in records)
+    undetermined_permissions = sum(
+        len([f for f in r.undetermined_findings if ":" in f]) for r in records
+    )
+    # `used_services` 도 비어야 미사용 — action 세부가 없어 used_actions 만 빈 역할을 미사용으로
+    # 세면 지표가 부풀고, m6 백로그 건수와도 어긋난다(같은 판정식을 쓴다).
     unused_roles = sum(
-        1 for r in records if r.identity_type == "role" and not r.used_actions and r.granted_actions
+        1
+        for r in records
+        if r.identity_type == "role" and not r.used_actions and not r.used_services and r.granted_actions
     )
     long_lived_keys = sum(1 for r in records if r.access_key_age_days is not None and r.access_key_age_days >= 90)
     # no_mfa: 콘솔 로그인 가능한 user 만(서비스 계정은 MFA 무관 — m4/m6 와 일치).
@@ -172,6 +179,7 @@ def _metrics_for(
         run_id=run.run_id,
         ts=run.started_at,
         unused_permissions=unused_permissions,
+        undetermined_permissions=undetermined_permissions,
         unused_roles=unused_roles,
         long_lived_keys=long_lived_keys,
         no_mfa=no_mfa,

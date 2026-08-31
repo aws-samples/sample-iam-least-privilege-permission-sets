@@ -148,22 +148,36 @@ def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[Cleanu
     uses_idc = cfg.provisioning.uses_identity_center
 
     for rec in records:
-        # unused_role: role 인데 used_actions 가 전혀 없음(미사용 역할).
+        # unused_role: role 인데 실사용 증거가 **어느 층위에도** 없음.
         # 권한 보유는 inline(granted_actions) 또는 attached managed 정책 중 하나면 성립
         # (managed-only 역할도 미사용 대상으로 잡는다).
-        if rec.identity_type == "role" and not rec.used_actions and (rec.granted_actions or rec.has_managed_policies):
+        #
+        # `used_services` 를 함께 보는 이유: Access Advisor 의 action-level 추적 범위는 서비스별로
+        # 달라, 실제로 쓰이는 역할도 action 세부가 안 나와 `used_actions` 가 빌 수 있다. 그때 서비스
+        # 단위 last_authenticated 만 있으면 그 역할은 **쓰이는 중**이다 — "90일간 미사용, 삭제 검토"
+        # 라고 권하면 운영 중인 역할을 지우게 된다(S3 복제 역할 등이 실제로 이 오탐에 걸렸다).
+        if (
+            rec.identity_type == "role"
+            and not rec.used_actions
+            and not rec.used_services
+            and (rec.granted_actions or rec.has_managed_policies)
+        ):
             items.append(_item("unused_role", rec, rec.risk_level,
                                "90일간 미사용 역할", _recommendation("unused_role", uses_idc),
                                evidence={
                                    "식별 유형": "role",
                                    "부여된 action 수": str(len(rec.granted_actions)),
                                    "90일 사용 action": "0",
+                                   "사용 흔적 서비스": "없음",
                                    "관리형 정책 연결": "예" if rec.has_managed_policies else "아니오",
                                    "수집 소스": ", ".join(rec.source) or "-",
                                }))
 
-        # unused_permission: granted-vs-used 갭(unused_findings 중 action 형태).
+        # unused_permission: granted-vs-used 갭 중 **미사용이 확정된 것만**(m2 가 이미 가름).
+        # 판정 불가분은 건수만 증거로 실어 보낸다 — 조치 대상이 아니지만, 이 백로그가 부여 권한
+        # 전체를 설명한다고 오해하지 않게 하려면 얼마가 미판정인지 보여야 한다.
         action_gaps = [f for f in rec.unused_findings if ":" in f]
+        undetermined = [f for f in rec.undetermined_findings if ":" in f]
         if action_gaps:
             detail = f"granted 이나 미사용: {action_gaps[0]} 외 {max(0, len(action_gaps) - 1)}건"
             items.append(_item("unused_permission", rec, rec.risk_level, detail,
@@ -172,6 +186,7 @@ def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[Cleanu
                                    "부여된 action 수": str(len(rec.granted_actions)),
                                    "실사용 action 수": str(len(rec.used_actions)),
                                    "미사용 action 수": str(len(action_gaps)),
+                                   "근거 불명 action 수": str(len(undetermined)),
                                    "대표 미사용": ", ".join(action_gaps[:5]),
                                    "수집 소스": ", ".join(rec.source) or "-",
                                }))

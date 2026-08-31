@@ -55,6 +55,61 @@ def test_backlog_has_five_types(tmp_path):
     assert ids == [f"c{i}" for i in range(1, len(rows) + 1)]
 
 
+# ---- 사용 흔적이 있는 역할을 '미사용' 이라 부르지 않는다 ----
+#
+# Access Advisor 의 action-level 추적 범위는 서비스별로 달라, 실제로 쓰이는 역할도 action 세부가
+# 안 나와 used_actions 가 빌 수 있다. 서비스 단위 인증 기록(used_services)만 있어도 그 역할은
+# 쓰이는 중이다 — "90일간 미사용, 삭제 검토" 를 내면 운영 중인 역할을 지우게 된다.
+
+
+def _role_rec(**kw) -> PrincipalRecord:
+    base = dict(account_id="111122223333", principal="arn:aws:iam::111122223333:role/repl",
+                identity_type="role", granted_actions=["s3:ReplicateObject"],
+                risk_level="low", run_id="run-x")
+    base.update(kw)
+    return PrincipalRecord(**base)
+
+
+def _backlog_types(st, recs) -> set[str]:
+    st.write_normalized(recs)
+    st.write_json("catalog.json", [])
+    build_reports(st, RUN, _cfg())
+    rows = list(csv.DictReader(io.StringIO(st.read_bytes(BACKLOG_NAME).decode())))
+    return {r["type"] for r in rows}
+
+
+def test_role_with_service_level_usage_is_not_unused(tmp_path):
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    types = _backlog_types(st, [_role_rec(used_actions=[], used_services=["s3"])])
+    assert "unused_role" not in types, "서비스 인증 기록이 있으면 미사용 역할이 아니다"
+
+
+def test_role_with_no_usage_at_any_level_is_unused(tmp_path):
+    """대조: used_services 까지 비면 미사용 역할로 잡혀야 한다.
+
+    이 대조가 없으면 위 테스트는 unused_role 을 아예 못 만들게 망가뜨려도 통과한다.
+    """
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    types = _backlog_types(st, [_role_rec(used_actions=[], used_services=[])])
+    assert "unused_role" in types
+
+
+def test_unused_permission_evidence_reports_undetermined_count(tmp_path):
+    """판정 불가 건수를 증거에 실어, 백로그가 부여 권한 전체를 설명하는 것으로 오해받지 않게 한다."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    st.write_normalized([_role_rec(unused_findings=["s3:DeleteBucket"],
+                                   undetermined_findings=["s3:ReplicateObject", "s3:PutObjectAcl"],
+                                   used_services=["s3"])])
+    st.write_json("catalog.json", [])
+    build_reports(st, RUN, _cfg())
+    rows = [r for r in csv.DictReader(io.StringIO(st.read_bytes(BACKLOG_NAME).decode()))
+            if r["type"] == "unused_permission"]
+    assert len(rows) == 1
+    evidence = json.loads(rows[0]["evidence"])
+    assert evidence["미사용 action 수"] == "1"
+    assert evidence["근거 불명 action 수"] == "2"
+
+
 def test_exec_summary_counts(tmp_path):
     st = LocalFSStorage(tmp_path, "test", "run-x")
     _seed(st)
@@ -82,6 +137,24 @@ def test_snapshot_metrics(tmp_path):
     run_row = json.loads(st.read_bytes("run.json").decode())
     assert run_row["run_id"] == "run-x"
     assert run_row["status"] == "succeeded"
+
+
+def test_snapshot_separates_undetermined_permissions(tmp_path):
+    """판정 불가는 unused_permissions 에서 빠지고 별도 지표로 센다.
+
+    두 지표가 분리돼 있지 않으면, 근거 배선이 좋아져 미사용 수가 줄어든 것을
+    "권한이 정리됐다" 로 오독한다(시계열 그래프가 그렇게 보인다).
+    """
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    st.write_normalized([_role_rec(unused_findings=["s3:DeleteBucket"],
+                                   undetermined_findings=["s3:ReplicateObject", "s3:PutObjectAcl"],
+                                   used_services=["s3"])])
+    st.write_json("catalog.json", [])
+    build_reports(st, RUN, _cfg())
+    point = write_snapshot(st, RUN, account_scope=1, status="succeeded")
+    assert point.unused_permissions == 1
+    assert point.undetermined_permissions == 2
+    assert point.unused_roles == 0, "서비스 인증 기록이 있으면 지표도 미사용으로 세지 않는다"
 
 
 def test_unused_role_detected_via_managed_only(tmp_path):

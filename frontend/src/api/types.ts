@@ -33,7 +33,13 @@ export interface PrincipalRecord {
   tags: Record<string, string>;
   granted_actions: string[];
   used_actions: UsedAction[];
-  unused_findings: string[];
+  // Access Advisor 가 "이 principal 이 인증했다"고 확인한 서비스(정렬). used_actions 가 비어도
+  // 이게 비어 있지 않으면 그 principal 은 쓰이는 중이다 — 미사용 판정 금지의 근거.
+  used_services: string[];
+  unused_findings: string[]; // 미사용이 확정된 것
+  // 판정 불가: 서비스는 인증됐으나 그 action 의 사용 근거가 없는 것. '미사용' 과 섞으면
+  // "안 쓰니 지워도 된다"는 잘못된 권고가 된다.
+  undetermined_findings: string[];
   mfa: boolean;
   console_login: boolean; // 콘솔 로그인 가능 여부(MFA 관련성 — 서비스 계정 오탐 방지)
   has_managed_policies: boolean; // attached managed 정책 존재(미사용 role 판정 보강)
@@ -83,6 +89,9 @@ export interface MetricsPoint {
   run_id: string;
   ts: string; // ISO8601
   unused_permissions: number;
+  // 판정 불가 권한 수. unused_permissions 에서 빠진 몫이라, 함께 보지 않으면 근거 배선이
+  // 개선돼 미사용 수가 줄어든 것을 "정리됐다" 로 오독한다.
+  undetermined_permissions: number;
   unused_roles: number;
   long_lived_keys: number;
   no_mfa: number;
@@ -108,6 +117,9 @@ export interface PolicyAction {
   action: string;
   used: boolean; // 실사용 여부 (기본 포함)
   included: boolean; // 최종 정책 포함 여부 (사용자 토글)
+  // used=false 의 이유가 "안 썼다"가 아니라 "알 수 없다"인 경우. '90일간 미사용' 이 아니라
+  // '근거 불명' 으로 표시해야 한다 — 근거 없이 제외를 권하면 워크로드가 깨진다.
+  undetermined: boolean;
   last_used: string | null;
   count_90d: number;
 }

@@ -3,11 +3,22 @@
 M1 수집 raw JSON 을 계정 단위로 읽어 principal 단위 `PrincipalRecord` 로 정규화한다:
 - granted_actions ← credential_report 의 inline 정책 문서(Allow Action)
 - used_actions   ← access_advisor(action-level) ∪ cloudtrail(event → action 근사)
-- unused_findings ← analyzer_unused findings + (granted − used) 계산 갭
+- used_services  ← access_advisor 서비스 단위 last_authenticated(action 세부 없어도 "썼다"는 증거)
+- unused_findings ← analyzer_unused findings + (granted − used) 갭 중 **미사용이 확정되는 것**
+- undetermined_findings ← 같은 갭 중 **판정 불가**(아래 3단 근거)
 - mfa / access_key_age_days ← credential report CSV
 - principal_kind / trust_principals ← role 신뢰정책(AssumeRolePolicyDocument)
 - tags            ← role/user 태그
 - source          ← 이 principal 에 기여한 수집 소스 목록
+
+**미사용 vs 판정 불가**(granted action A, 서비스 ns, 실사용 증거 없음일 때):
+  1. A 가 Access Advisor 의 추적 목록에 있고 last_accessed 가 비어 있다 → **미사용 확정**
+     (AWS 가 그 action 을 추적하고 있는데 기록이 없다 = 안 썼다)
+  2. ns 를 이 principal 이 인증한 적이 없다(서비스 단위 last_authenticated 부재) → **미사용 확정**
+     (서비스 자체를 안 썼으니 그 안의 어떤 action 도 안 썼다)
+  3. ns 는 인증했는데 A 가 추적 목록에 없다 → **판정 불가**. Access Advisor 의 action-level 추적은
+     서비스·action 별로 지원 범위가 다르고, CloudTrail 은 관리 이벤트·단일 리전만 본다. 여기서
+     "미사용" 이라고 부르면 실제로 쓰이는 권한을 지우라고 권하게 된다.
 
 불변식 ②(결정론): as_of(run.started_at) 기준으로만 시간 계산, 안정 정렬, wall-clock 미사용.
 risk_score/risk_level/persona 등은 후속 모듈(m4/m5)이 채운다 — 여기선 계약 기본값.
@@ -149,6 +160,7 @@ def _normalize_account(
 
     used_by_arn, used_sources_by_arn = _used_actions_by_principal(raw)
     analyzer_by_arn = _analyzer_findings_by_principal(raw.get(ANALYZER, {}))
+    authed_svcs_by_arn, tracked_by_arn_svc = _advisor_evidence(raw.get(ADVISOR, {}))
 
     # principal 집합 = 인벤토리 ∪ used ∪ analyzer. credential_report 가 degraded 여도 다른 소스가
     # 본 principal 은 최소 레코드로 살린다(그렇지 않으면 이 소스 하나 실패로 전체가 비어버림).
@@ -162,10 +174,26 @@ def _normalize_account(
         used = used_by_arn.get(arn, [])
         used_action_names = {u.action for u in used}
 
-        # (granted − used) 갭 + analyzer findings 를 unused_findings 로 합친다.
+        # (granted − used) 갭을 "미사용 확정" 과 "판정 불가" 로 가른다(모듈 독스트링의 3단 근거).
         gap = sorted(a for a in granted if a not in used_action_names and not _is_wildcard(a))
+        authed_svcs = authed_svcs_by_arn.get(arn, frozenset())
+        confirmed_unused: list[str] = []
+        undetermined: list[str] = []
+        for action in gap:
+            ns, _, name = action.partition(":")
+            if name in tracked_by_arn_svc.get((arn, ns), frozenset()):
+                confirmed_unused.append(action)   # ① AWS 가 추적 중인데 기록 없음
+            elif ns not in authed_svcs:
+                confirmed_unused.append(action)   # ② 서비스 자체를 인증한 적 없음
+            else:
+                undetermined.append(action)       # ③ 서비스는 썼는데 이 action 은 근거 없음
+
+        # analyzer_unused finding 은 action 이 아니라 finding_type 라벨("UnusedIAMRole" 등)이라
+        # 위 3단 판정과 겹치지 않는다 — 그래서 판정 불가에서 빼는 처리가 필요 없다.
+        # (collector 가 언젠가 action 단위 finding 을 싣게 되면 그때 우선순위를 정해야 한다.)
         analyzer_findings = analyzer_by_arn.get(arn, [])
-        unused_findings = sorted(set(gap) | set(analyzer_findings))
+        unused_findings = sorted(set(confirmed_unused) | set(analyzer_findings))
+        undetermined_findings = sorted(undetermined)
 
         cred_row = cred_by_arn.get(arn, {})
         # 이 principal 에 **실제로 기여한** 소스만 기록(거짓 양성 방지):
@@ -197,7 +225,9 @@ def _normalize_account(
                 tags=dict(p.get("tags") or {}) if in_inventory else {},
                 granted_actions=sorted(set(granted)),
                 used_actions=used,
+                used_services=sorted(authed_svcs),
                 unused_findings=unused_findings,
+                undetermined_findings=undetermined_findings,
                 mfa=_mfa(cred_row),
                 console_login=_console_login(cred_row),
                 has_managed_policies=has_managed,
@@ -325,6 +355,40 @@ def _actions_from_document(document: dict) -> set[str]:
 
 def _is_wildcard(action: str) -> bool:
     return "*" in action
+
+
+# ---- advisor 근거 인덱스(미사용 확정 vs 판정 불가 판별용) ----
+def _advisor_evidence(
+    advisor_raw: dict,
+) -> tuple[dict[str, frozenset[str]], dict[tuple[str, str], frozenset[str]]]:
+    """Access Advisor raw → (principal→인증한 서비스 집합, (principal,서비스)→추적 action 이름 집합).
+
+    두 값의 역할이 다르다:
+      - 인증한 서비스(`last_authenticated` 존재): "이 서비스를 썼다" 는 증거. action 세부를 못 줘도
+        남는다 → 미사용 판정을 막는 근거.
+      - 추적 action 이름: `TrackedActionsLastAccessed` 에 **올라온 이름 전체**(last_accessed 가 비어
+        있는 것도 포함). AWS 가 추적하는 action 인지 여부를 알려주므로, 기록 없음을 "안 썼다" 로
+        확정할 수 있는지 가른다. 목록에 아예 없는 action 은 추적 대상이 아니라 근거가 없는 것이다.
+    """
+    authed: dict[str, frozenset[str]] = {}
+    tracked: dict[tuple[str, str], frozenset[str]] = {}
+    for entry in advisor_raw.get("last_accessed", []) or []:
+        arn = entry.get("principal", "")
+        if not arn:
+            continue
+        svcs: set[str] = set()
+        for svc in entry.get("services", []) or []:
+            ns = svc.get("service", "")
+            if not ns:
+                continue
+            if svc.get("last_authenticated"):
+                svcs.add(ns)
+            names = {a.get("action", "") for a in (svc.get("actions") or [])}
+            names.discard("")
+            if names:
+                tracked[(arn, ns)] = frozenset(names)
+        authed[arn] = frozenset(svcs)
+    return authed, tracked
 
 
 # ---- used actions (access advisor ∪ cloudtrail) ----

@@ -58,7 +58,15 @@ class PrincipalRecord(BaseModel):
     tags: dict[str, str] = Field(default_factory=dict)
     granted_actions: list[str] = Field(default_factory=list)
     used_actions: list[UsedAction] = Field(default_factory=list)
+    # Access Advisor 가 "이 principal 이 인증했다"고 확인한 서비스 네임스페이스(정렬).
+    # action 세부까지 주지 않는 서비스도 여기엔 남는다 — `used_actions` 가 비어 있어도 이 목록이
+    # 비어 있지 않으면 그 principal 은 **쓰이는 중**이다(미사용 판정 금지).
+    used_services: list[str] = Field(default_factory=list)
+    # granted 인데 실사용 근거가 없고, 그 근거 부재가 "안 썼다"로 확정되는 것들.
     unused_findings: list[str] = Field(default_factory=list)
+    # granted 인데 **판정 불가**: 서비스는 인증됐지만 Access Advisor 가 그 action 을 추적하지 않고
+    # CloudTrail 에도 안 잡힌 것. 미사용과 섞으면 "안 쓰니 지워도 된다"는 잘못된 권고가 된다.
+    undetermined_findings: list[str] = Field(default_factory=list)
     mfa: bool = False
     console_login: bool = False  # 콘솔 로그인 가능 여부(MFA 관련성 판단 — 서비스 계정 오탐 방지)
     has_managed_policies: bool = False  # attached managed 정책 존재(미사용 role 판정 보강)
@@ -95,6 +103,9 @@ class MetricsPoint(BaseModel):
     run_id: str
     ts: str  # ISO8601
     unused_permissions: int = 0
+    # 판정 불가 권한 수. unused_permissions 에서 빠진 몫이라, 이 값을 함께 보지 않으면
+    # 근거 배선이 개선될 때 미사용 수가 줄어든 것을 "개선" 으로 오독한다.
+    undetermined_permissions: int = 0
     unused_roles: int = 0
     long_lived_keys: int = 0
     no_mfa: int = 0
@@ -116,6 +127,9 @@ class PolicyAction(BaseModel):
     action: str
     used: bool = False  # 실사용 여부 (기본 포함)
     included: bool = False  # 최종 정책 포함 여부 (사용자 토글)
+    # used=False 의 이유가 "안 썼다"가 아니라 "알 수 없다"인 경우. UI 가 '90일간 미사용' 대신
+    # '근거 불명' 으로 표시해야 한다 — 근거 없이 제외를 권하면 워크로드를 깨뜨린다.
+    undetermined: bool = False
     last_used: str | None = None
     count_90d: int = 0
 

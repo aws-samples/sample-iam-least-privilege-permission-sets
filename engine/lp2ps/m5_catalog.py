@@ -265,8 +265,12 @@ def _merge_actions(members: list[PrincipalRecord]) -> list[PolicyAction]:
     1. **실사용(used)** action: used=True, included=True(기본 포함). last_used·count 병합.
     2. **권한 gap**(granted 이나 미사용, unused_findings): used=False, included=False(기본 제외).
        "정말 필요 없나?" 검토용으로 노출 — 운영자가 enable/disable 로 최종 판단.
+    3. **판정 불가**(undetermined_findings): used=False, included=False, undetermined=True.
+       기본 제외는 2 와 같지만 **이유가 다르다** — 안 썼다는 증거가 아니라 증거가 없다는 뜻이다.
+       빼면 UI 에서 사라져 사람이 포함시킬 기회를 잃고, 2 에 섞으면 '미사용' 이라 거짓말하게 된다.
 
     같은 action 이 어떤 멤버엔 used, 다른 멤버엔 unused 면 **used 가 우선**(사용 실적 존재).
+    미사용 확정과 판정 불가가 겹치면 **미사용 확정이 우선**(한 멤버에서라도 안 썼다고 확인됐다).
     결정론(action 정렬).
     """
     merged: dict[str, PolicyAction] = {}
@@ -291,6 +295,16 @@ def _merge_actions(members: list[PrincipalRecord]) -> list[PolicyAction]:
                 continue  # action 형태만, 이미 used 로 잡힌 건 건너뜀.
             merged[finding] = PolicyAction(
                 action=finding, used=False, included=False,
+                last_used=None, count_90d=0,
+            )
+
+    # 3) 판정 불가 — used 도 아니고 미사용 확정도 아닌 것만(둘 다 우선).
+    for rec in members:
+        for finding in rec.undetermined_findings:
+            if ":" not in finding or finding in merged:
+                continue
+            merged[finding] = PolicyAction(
+                action=finding, used=False, included=False, undetermined=True,
                 last_used=None, count_90d=0,
             )
     return sorted(merged.values(), key=lambda a: a.action)

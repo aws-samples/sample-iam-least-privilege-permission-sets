@@ -605,7 +605,11 @@ function PersonaEditorPanel({
       const next: PolicyAction[] = [];
       for (const a of prev) next.push({ ...a, included: acts.includes(a.action) });
       for (const act of acts) {
-        if (!known.has(act)) next.push({ action: act, used: false, included: true, last_used: null, count_90d: 0 });
+        // 사람이 JSON 에 직접 타이핑한 action = 명시적 포함. 근거를 못 찾은 상태가 아니므로
+        // undetermined=false 다(불명 배지를 붙이면 사용자 자신의 입력을 의심하는 화면이 된다).
+        if (!known.has(act)) {
+          next.push({ action: act, used: false, included: true, undetermined: false, last_used: null, count_90d: 0 });
+        }
       }
       return next;
     });
@@ -644,6 +648,8 @@ function PersonaEditorPanel({
 
   const includedCount = editActions.filter((a) => a.included).length;
   const unusedCount = editActions.filter((a) => !a.used).length;
+  // 근거 불명 = 사용 기록이 없다는 뜻이 아니라 판정할 근거가 없다는 뜻. 미사용 수에서 떼어 센다.
+  const undeterminedCount = editActions.filter((a) => !a.used && a.undetermined).length;
   const rows = useMemo(() => targetRows(entry), [entry]);
 
   return (
@@ -660,7 +666,7 @@ function PersonaEditorPanel({
                 {approvedMsg && <Alert type="success" dismissible onDismiss={() => setApprovedMsg(null)}>{approvedMsg}</Alert>}
                 <Header
                   variant="h3"
-                  description="실사용 권한=기본 포함 · 미사용 권한(부여됐으나 90일 미사용)=기본 제외, 검토 후 판단"
+                  description="실사용=기본 포함 · 미사용(90일 기록 없음)=기본 제외 · 근거 불명(사용 여부를 확인할 수 없음)=기본 제외이나 삭제 전 담당자 확인 필요"
                   actions={
                     <SpaceBetween direction="horizontal" size="xs">
                       <SegmentedControl
@@ -672,8 +678,13 @@ function PersonaEditorPanel({
                           { id: "access", text: "동작별" },
                         ]}
                       />
+                      {/* 두 종류를 한 토글로 숨기지만 라벨엔 구분해 적는다 — '미사용 숨기기' 라고만
+                          쓰면 근거 불명 항목까지 미사용으로 여기게 된다. */}
                       <Toggle checked={hideUnused} onChange={(e) => setHideUnused(e.detail.checked)}>
-                        미사용 숨기기{unusedCount > 0 ? ` (${unusedCount})` : ""}
+                        미사용·불명 숨기기
+                        {unusedCount > 0
+                          ? ` (미사용 ${unusedCount - undeterminedCount} · 불명 ${undeterminedCount})`
+                          : ""}
                       </Toggle>
                     </SpaceBetween>
                   }
@@ -703,7 +714,11 @@ function PersonaEditorPanel({
                                 id: "action", header: "Action", minWidth: 200, cell: (a: PolicyAction) => (
                                   <SpaceBetween direction="horizontal" size="xxs">
                                     <Box fontWeight={a.used ? "normal" : "bold"}>{a.action}</Box>
-                                    {!a.used && <Badge color="blue">미사용 · 검토</Badge>}
+                                    {!a.used && (
+                                      a.undetermined
+                                        ? <Badge color="grey">근거 불명 · 검토</Badge>
+                                        : <Badge color="blue">미사용 · 검토</Badge>
+                                    )}
                                     {groupBy === "service" && (
                                       <Badge color={accessKindOf(a.action) === "write" ? "red" : "grey"}>
                                         {accessKindOf(a.action) === "write" ? "쓰기" : "읽기"}
@@ -716,6 +731,10 @@ function PersonaEditorPanel({
                                 id: "usage", header: "최근 사용", cell: (a: PolicyAction) =>
                                   a.used ? (
                                     <StatusIndicator type="success">{fmtLastUsed(a.last_used)}</StatusIndicator>
+                                  ) : a.undetermined ? (
+                                    // "안 썼다"가 아니라 "알 수 없다". Access Advisor 가 이 action 을
+                                    // 추적하지 않고 CloudTrail(단일 리전·관리 이벤트)에도 안 잡혔다.
+                                    <StatusIndicator type="pending">사용 여부 확인 불가</StatusIndicator>
                                   ) : (
                                     <StatusIndicator type="stopped">90일간 미사용</StatusIndicator>
                                   ),

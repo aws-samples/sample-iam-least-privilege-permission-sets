@@ -173,6 +173,27 @@ def test_permission_gap_included_disabled(tmp_path):
     assert actions["s3:GetObject"].used
 
 
+def test_undetermined_actions_are_listed_and_flagged(tmp_path):
+    """판정 불가 action 도 체크리스트에 담되 undetermined=True 로 구분한다.
+
+    빼면 사람이 포함시킬 기회를 잃고, gap 에 섞으면 UI 가 '90일간 미사용' 이라 거짓말한다.
+    """
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    r1 = _rec("arn:aws:iam::111122223333:role/a", ["s3:GetObject"])
+    r1.unused_findings = ["s3:DeleteBucket"]
+    r1.undetermined_findings = ["s3:ReplicateObject", "s3:GetObject"]  # GetObject 는 used 가 우선
+    r2 = _rec("arn:aws:iam::111122223333:role/b", ["s3:GetObject"])
+    st.write_normalized([r1, r2])
+    actions = {a.action: a for a in build_catalog(st, RUN, CatalogConfig())[0].actions}
+
+    assert actions["s3:ReplicateObject"].undetermined is True
+    assert not actions["s3:ReplicateObject"].used
+    assert not actions["s3:ReplicateObject"].included, "근거가 없다고 기본 포함으로 넓히지 않는다"
+    # 대조: 미사용 확정과 실사용은 undetermined 가 아니어야 한다(전부 True 면 구분이 사라진다).
+    assert actions["s3:DeleteBucket"].undetermined is False
+    assert actions["s3:GetObject"].undetermined is False and actions["s3:GetObject"].used
+
+
 def test_small_clusters_merge_into_general(tmp_path):
     """min_members_for_persona 미만 군집은 버리지 않고 General 로 합친다(#2)."""
     st = LocalFSStorage(tmp_path, "test", "run-x")

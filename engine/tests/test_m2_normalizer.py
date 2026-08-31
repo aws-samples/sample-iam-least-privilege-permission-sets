@@ -68,8 +68,12 @@ def _seed_raw(storage: LocalFSStorage) -> None:
                         {
                             "service": "s3",
                             "last_authenticated": "2026-07-10T00:00:00Z",
+                            # DeleteObject 는 **추적 목록에 있으나 기록 없음** → 미사용 확정.
+                            # (추적 목록에 없으면 근거 부재라 미사용이 아니라 판정 불가다 —
+                            #  test_gap_without_advisor_tracking_is_undetermined 가 그 쪽을 본다.)
                             "actions": [
-                                {"action": "GetObject", "last_accessed": "2026-07-10T00:00:00Z"}
+                                {"action": "DeleteObject", "last_accessed": None},
+                                {"action": "GetObject", "last_accessed": "2026-07-10T00:00:00Z"},
                             ],
                         }
                     ],
@@ -117,13 +121,121 @@ def test_normalize_derives_gap(tmp_path) -> None:
     # cloudtrail count 반영.
     put = next(u for u in r.used_actions if u.action == "s3:PutObject")
     assert put.count_90d == 12
-    # granted − used = DeleteObject 가 미사용 갭.
+    # granted − used = DeleteObject 가 미사용 갭(추적 목록에 있고 기록 없음 → 확정).
     assert r.unused_findings == ["s3:DeleteObject"]
+    assert r.undetermined_findings == []
+    assert r.used_services == ["s3"]
     # credential report 파생.
     assert r.mfa is False
     assert r.access_key_age_days == (RUN.started_dt.date() - __import__("datetime").date(2026, 1, 1)).days
     # 기여 소스.
     assert set(r.source) == {"credential_report", "access_advisor", "cloudtrail"}
+
+
+# ---- 미사용 확정 vs 판정 불가 ----
+#
+# Access Advisor 의 action-level 추적 범위는 서비스·action 별로 다르고 CloudTrail 은 단일 리전·관리
+# 이벤트만 본다. "실사용 기록이 없다" 를 곧 "안 쓴다" 로 읽으면 실제로 쓰이는 권한을 지우라고 권한다.
+# 실제 계정 데이터에서 이 오독이 미사용 권한 판정의 27.7%, 미사용 역할 판정의 19.6% 였다.
+
+
+def _seed_one_role(storage: LocalFSStorage, granted: list[str], advisor_services: list[dict],
+                   analyzer_findings: list[dict] | None = None) -> None:
+    """inline 정책 1개 + advisor 응답만 있는 최소 계정. CloudTrail 은 비운다(근거 없음 상태 재현)."""
+    storage.write_raw(ACCOUNT, "credential_report", {
+        "account_id": ACCOUNT,
+        "principals": [{
+            "principal": ARN, "name": "data-eng", "identity_type": "role",
+            "inline_policies": [{"name": "inline", "document": {
+                "Statement": [{"Effect": "Allow", "Action": granted, "Resource": "*"}]}}],
+            "attached_policies": [], "path": "/",
+        }],
+        "credential_report": [],
+    })
+    storage.write_raw(ACCOUNT, "access_advisor", {
+        "account_id": ACCOUNT,
+        "last_accessed": [{"principal": ARN, "services": advisor_services}],
+    })
+    storage.write_raw(ACCOUNT, "analyzer_unused", {
+        "account_id": ACCOUNT, "analyzer_arn": None, "findings": analyzer_findings or [],
+    })
+
+
+def test_gap_without_advisor_tracking_is_undetermined(tmp_path) -> None:
+    """서비스는 인증됐고 그 action 은 추적 목록에 없다 → 미사용이 아니라 판정 불가."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_one_role(storage, ["s3:GetObject", "s3:DeleteObject"], [{
+        "service": "s3",
+        "last_authenticated": "2026-07-10T00:00:00Z",
+        # GetObject 만 추적 대상. DeleteObject 는 목록에 아예 없다 → 증거 없음.
+        "actions": [{"action": "GetObject", "last_accessed": "2026-07-10T00:00:00Z"}],
+    }])
+    r = normalize(storage, RUN)[0]
+    assert r.undetermined_findings == ["s3:DeleteObject"]
+    assert r.unused_findings == [], "근거 없는 action 을 '미사용' 이라 부르면 안 된다"
+
+
+def test_gap_with_advisor_tracking_is_confirmed_unused(tmp_path) -> None:
+    """대조: 같은 action 이 추적 목록에 있고 기록만 비면 미사용 확정이다.
+
+    이 대조가 없으면 위 테스트는 '전부 판정 불가로 밀어버려도' 통과한다 — 판별력 확인용.
+    """
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_one_role(storage, ["s3:GetObject", "s3:DeleteObject"], [{
+        "service": "s3",
+        "last_authenticated": "2026-07-10T00:00:00Z",
+        "actions": [
+            {"action": "DeleteObject", "last_accessed": None},   # 추적됨 + 기록 없음
+            {"action": "GetObject", "last_accessed": "2026-07-10T00:00:00Z"},
+        ],
+    }])
+    r = normalize(storage, RUN)[0]
+    assert r.unused_findings == ["s3:DeleteObject"]
+    assert r.undetermined_findings == []
+
+
+def test_gap_in_never_authenticated_service_is_unused(tmp_path) -> None:
+    """서비스 자체를 인증한 적이 없으면 그 안의 action 은 추적 여부와 무관하게 미사용 확정."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_one_role(storage, ["dynamodb:DeleteTable"], [{
+        "service": "dynamodb", "last_authenticated": None, "actions": [],
+    }])
+    r = normalize(storage, RUN)[0]
+    assert r.unused_findings == ["dynamodb:DeleteTable"]
+    assert r.undetermined_findings == []
+    assert r.used_services == []
+
+
+def test_analyzer_findings_are_labels_not_actions(tmp_path) -> None:
+    """analyzer finding 은 finding_type 라벨이라 3단 판정과 겹치지 않는다.
+
+    이 전제가 깨지면(collector 가 action 단위 finding 을 싣게 되면) '미사용 확정 vs 판정 불가'
+    우선순위를 새로 정해야 한다 — 그때 이 테스트가 먼저 깨져서 알려준다.
+    """
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_one_role(
+        storage, ["s3:DeleteObject"],
+        [{"service": "s3", "last_authenticated": "2026-07-10T00:00:00Z", "actions": []}],
+        analyzer_findings=[{"id": "f1", "finding_type": "UnusedPermission",
+                            "resource": ARN, "resource_type": "AWS::IAM::Role",
+                            "status": "ACTIVE"}],
+    )
+    r = normalize(storage, RUN)[0]
+    assert r.unused_findings == ["UnusedPermission"], "라벨은 그대로 남는다"
+    assert not any(":" in f for f in r.unused_findings), "analyzer 발 항목에 action 형태는 없다"
+    # 서비스는 인증됐고 DeleteObject 는 추적 목록에 없으므로 판정 불가로 간다.
+    assert r.undetermined_findings == ["s3:DeleteObject"]
+
+
+def test_used_services_records_authenticated_only(tmp_path) -> None:
+    """used_services 는 인증 기록이 있는 서비스만 담는다(권한만 있는 서비스는 제외)."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_one_role(storage, ["s3:GetObject", "kms:Decrypt"], [
+        {"service": "s3", "last_authenticated": "2026-07-10T00:00:00Z", "actions": []},
+        {"service": "kms", "last_authenticated": None, "actions": []},
+    ])
+    r = normalize(storage, RUN)[0]
+    assert r.used_services == ["s3"], "권한만 있고 인증 기록 없는 kms 가 섞이면 미사용 판정이 죽는다"
 
 
 def test_max_ts_handles_mixed_source_formats() -> None:

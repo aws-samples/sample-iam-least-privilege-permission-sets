@@ -28,35 +28,35 @@ export const RUNS: Run[] = [
 export const METRICS: MetricsPoint[] = [
   {
     run_id: "run-001", ts: "2026-05-19T02:00:00Z",
-    unused_permissions: 1604, unused_roles: 59, long_lived_keys: 23, no_mfa: 14,
+    unused_permissions: 1604, undetermined_permissions: 612, unused_roles: 59, long_lived_keys: 23, no_mfa: 14,
     over_privileged_principals: 512, escalation_paths: 37, personas: 6,
     iam_users_pending_migration: 148, ps_migration_pct: 12,
     risk_dist: { critical: 141, high: 288, medium: 402, low: 380 },
   },
   {
     run_id: "run-002", ts: "2026-06-02T02:00:00Z",
-    unused_permissions: 1498, unused_roles: 55, long_lived_keys: 22, no_mfa: 13,
+    unused_permissions: 1498, undetermined_permissions: 588, unused_roles: 55, long_lived_keys: 22, no_mfa: 13,
     over_privileged_principals: 471, escalation_paths: 33, personas: 6,
     iam_users_pending_migration: 131, ps_migration_pct: 24,
     risk_dist: { critical: 128, high: 271, medium: 419, low: 421 },
   },
   {
     run_id: "run-003", ts: "2026-06-16T02:00:00Z",
-    unused_permissions: 1421, unused_roles: 52, long_lived_keys: 21, no_mfa: 12,
+    unused_permissions: 1421, undetermined_permissions: 566, unused_roles: 52, long_lived_keys: 21, no_mfa: 12,
     over_privileged_principals: 438, escalation_paths: 30, personas: 7,
     iam_users_pending_migration: 118, ps_migration_pct: 38,
     risk_dist: { critical: 119, high: 260, medium: 431, low: 461 },
   },
   {
     run_id: "run-004", ts: "2026-06-30T02:00:00Z",
-    unused_permissions: 1352, unused_roles: 49, long_lived_keys: 19, no_mfa: 10,
+    unused_permissions: 1352, undetermined_permissions: 540, unused_roles: 49, long_lived_keys: 19, no_mfa: 10,
     over_privileged_principals: 401, escalation_paths: 27, personas: 7,
     iam_users_pending_migration: 92, ps_migration_pct: 54,
     risk_dist: { critical: 110, high: 251, medium: 439, low: 484 },
   },
   {
     run_id: "run-005", ts: "2026-07-14T02:00:00Z",
-    unused_permissions: 1284, unused_roles: 47, long_lived_keys: 18, no_mfa: 9,
+    unused_permissions: 1284, undetermined_permissions: 521, unused_roles: 47, long_lived_keys: 18, no_mfa: 9,
     over_privileged_principals: 368, escalation_paths: 24, personas: 8,
     iam_users_pending_migration: 71, ps_migration_pct: 66,
     risk_dist: { critical: 103, high: 244, medium: 437, low: 500 },
@@ -64,16 +64,20 @@ export const METRICS: MetricsPoint[] = [
 ];
 
 // ---- 정책 편집기용 action 체크리스트 헬퍼 ----
+// granted_unused 의 마지막 1건은 '근거 불명' 으로 만든다 — 실제 배포에선 미사용 판정의 약 28%가
+// 판정 불가로 갈리므로, mock 화면도 그 분기를 반드시 렌더해야 UI 검증이 실배포와 어긋나지 않는다.
 function mkActions(
   used: [string, string, number][], // [action, last_used, count]
   granted_unused: string[],
 ): PolicyAction[] {
   return [
     ...used.map(([action, last_used, count_90d]) => ({
-      action, used: true, included: true, last_used, count_90d,
+      action, used: true, included: true, undetermined: false, last_used, count_90d,
     })),
-    ...granted_unused.map((action) => ({
-      action, used: false, included: false, last_used: null, count_90d: 0,
+    ...granted_unused.map((action, i) => ({
+      action, used: false, included: false,
+      undetermined: granted_unused.length > 1 && i === granted_unused.length - 1,
+      last_used: null, count_90d: 0,
     })),
   ];
 }

@@ -406,7 +406,9 @@ def _parquet_schema():
             ("tags", pa.string()),  # 정렬된 JSON 문자열(_JSON_COLUMNS)
             ("granted_actions", pa.list_(pa.string())),
             ("used_actions", pa.list_(used_action)),
+            ("used_services", pa.list_(pa.string())),
             ("unused_findings", pa.list_(pa.string())),
+            ("undetermined_findings", pa.list_(pa.string())),
             ("mfa", pa.bool_()),
             ("console_login", pa.bool_()),
             ("has_managed_policies", pa.bool_()),

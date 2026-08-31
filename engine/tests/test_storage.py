@@ -18,7 +18,9 @@ def _rec(account: str, principal: str, run_id: str = "run-x") -> PrincipalRecord
         identity_type="role",
         granted_actions=["s3:GetObject", "s3:PutObject"],
         used_actions=[UsedAction(action="s3:GetObject", last_used="2026-07-01T00:00:00Z", count_90d=5)],
+        used_services=["s3"],
         unused_findings=["s3:PutObject"],
+        undetermined_findings=["s3:DeleteObject"],
         source=["credential_report"],
         run_id=run_id,
     )
@@ -58,6 +60,10 @@ def test_parquet_roundtrip_and_determinism(tmp_path) -> None:
     rows = parquet_bytes_to_rows(b1)
     assert [r["principal"] for r in rows] == ["arn:a", "arn:b"]
     assert rows[0]["used_actions"][0]["action"] == "s3:GetObject"
+    # 미사용/판정 불가는 서로 다른 컬럼으로 왕복해야 한다 — 섞이면 UI 가 근거를 잘못 표시한다.
+    assert rows[0]["used_services"] == ["s3"]
+    assert rows[0]["unused_findings"] == ["s3:PutObject"]
+    assert rows[0]["undetermined_findings"] == ["s3:DeleteObject"]
 
 
 def test_parquet_schema_covers_every_model_field() -> None:
