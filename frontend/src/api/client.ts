@@ -13,6 +13,7 @@ import type {
   MetricsPoint,
   AccountInfo,
   AiSettings,
+  DeploymentSettings,
   PolicyArtifact,
   ProvisionResult,
   ReportRef,
@@ -79,6 +80,8 @@ export interface Api {
   // AI 개입 기능 런타임 on/off(SSM).
   getAiSettings(): Promise<AiSettings>;
   putAiSettings(state: AiSettings): Promise<AiSettings>;
+  // 배포 성격(config 유래) — IdC 미사용 고객은 PS 마이그레이션 지표를 '해당 없음' 으로 본다.
+  getDeploymentSettings(): Promise<DeploymentSettings>;
   // 관리 중인 계정 목록(계정 선택기).
   getAccounts(): Promise<AccountInfo[]>;
 }
@@ -285,6 +288,9 @@ const mockApi: Api = {
       600,
     ),
   getAiSettings: () => delay(structuredClone(mockAi)),
+  // MOCK_USES_IDC 와 같은 스위치를 쓴다(VITE_MOCK_NO_IDC=true) — 산출물 탭과 대시보드 지표가
+  // 같은 전제를 보게 해야 mock 화면 검증이 실제 배포와 어긋나지 않는다.
+  getDeploymentSettings: () => delay({ uses_identity_center: MOCK_USES_IDC }),
   putAiSettings: (state) => {
     mockAi = { enabled: state.enabled };
     return delay(structuredClone(mockAi));
@@ -328,6 +334,7 @@ const realApi: Api = {
   askAssistant: (question) =>
     real("/assistant/ask", { method: "POST", body: JSON.stringify({ question }) }),
   getAiSettings: () => real("/settings/ai"),
+  getDeploymentSettings: () => real("/settings/deployment"),
   putAiSettings: (state) => real("/settings/ai", { method: "PUT", body: JSON.stringify(state) }),
   getAccounts: () => real("/accounts"),
   getSchedule: () => real("/schedule"),

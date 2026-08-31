@@ -136,11 +136,13 @@ function scheduleSummary(s: ScheduleState): string {
 }
 
 // 현황 KPI 카드 — 현재 값만 표시. onClick 이 있으면 클릭 가능(조치 필요 항목으로 딥링크).
-function Kpi({ label, value, onClick }: { label: string; value: string; onClick?: () => void }) {
+// hint: 숫자만으로 오해가 생기는 카드의 보조 설명(예: '해당 없음' 인 이유).
+function Kpi({ label, value, onClick, hint }: { label: string; value: string; onClick?: () => void; hint?: string }) {
   const inner = (
     <SpaceBetween size="xs">
       <Box variant="awsui-key-label">{label}</Box>
-      <Box fontSize="display-l" fontWeight="bold">{value}</Box>
+      <Box fontSize={value.length > 6 ? "heading-l" : "display-l"} fontWeight="bold">{value}</Box>
+      {hint && <Box fontSize="body-s" color="text-body-secondary">{hint}</Box>}
       {onClick && <Box fontSize="body-s" color="text-status-info">항목 보기 →</Box>}
     </SpaceBetween>
   );
@@ -180,9 +182,16 @@ export default function Dashboard() {
   const [ai, setAi] = useState<AiSettings | null>(null);
   const [aiSaving, setAiSaving] = useState(false);
 
+  // 배포 성격 — IdC 미사용 고객에게는 PS 마이그레이션 지표가 구조적으로 달성 불가라 감춘다.
+  // 조회 실패 시 기존 동작(IdC 사용)으로 폴백: 지표가 사라지는 편보다 남는 편이 오해가 적다.
+  const [usesIdc, setUsesIdc] = useState(true);
+
   useEffect(() => {
     api.getSchedule().then(setSchedule).catch(() => setSchedule(null));
     api.getAiSettings().then(setAi).catch(() => setAi({ enabled: false }));
+    api.getDeploymentSettings()
+      .then((d) => setUsesIdc(d.uses_identity_center))
+      .catch(() => setUsesIdc(true));
   }, []);
 
   async function toggleAi(enabled: boolean) {
@@ -369,7 +378,14 @@ export default function Dashboard() {
           <Kpi label="미사용 권한" value={last.unused_permissions.toLocaleString()} onClick={() => navigate("/cleanup?type=unused_permission")} />
           <Kpi label="미사용 역할" value={String(last.unused_roles)} onClick={() => navigate("/cleanup?type=unused_role")} />
           <Kpi label="장기 액세스키" value={String(last.long_lived_keys)} onClick={() => navigate("/cleanup?type=long_lived_key")} />
-          <Kpi label="PS 마이그레이션" value={`${last.ps_migration_pct}%`} />
+          {/* PS 전환율은 IdC 가 있어야 의미가 있다. IdC 미사용 배포에서는 분자(sso_ps)가 구조적으로
+              0 이라 항상 0% 로 보이는데, 그건 "전환이 안 되고 있다" 가 아니라 "해당 없음" 이다.
+              달성 불가한 목표를 KPI 로 띄우지 않는다. */}
+          {usesIdc ? (
+            <Kpi label="PS 마이그레이션" value={`${last.ps_migration_pct}%`} />
+          ) : (
+            <Kpi label="PS 마이그레이션" value="해당 없음" hint="Identity Center 를 사용하지 않는 배포입니다" />
+          )}
         </Grid>
 
         <Grid gridDefinition={[{ colspan: 8 }, { colspan: 4 }]}>
@@ -408,11 +424,23 @@ export default function Dashboard() {
           </Container>
         </Grid>
 
-        <Container header={<Header variant="h2">IAM User → Permission Set 마이그레이션</Header>}>
+        {/* IdC 미사용 배포에서는 'PS 전환율' 시리즈가 항상 0 인 직선이라 차트를 읽는 사람을
+            오해시킨다(전환이 정체된 것처럼 보인다). IAM User 수는 그 고객에게도 의미가 있으므로
+            (임시 자격증명 전환 대상) 그 시리즈만 남기고 제목을 바꾼다. */}
+        <Container
+          header={
+            <Header
+              variant="h2"
+              description={usesIdc ? undefined : "Identity Center 를 사용하지 않는 배포이므로 PS 전환율은 표시하지 않습니다. IAM User 는 IAM Role 임시 자격증명으로 전환할 대상입니다."}
+            >
+              {usesIdc ? "IAM User → Permission Set 마이그레이션" : "IAM User 추이"}
+            </Header>
+          }
+        >
           <LineChart
             series={[
-              mkSeries("PS 전환율(%)", "ps_migration_pct", CHART_SERIES[3]),
-              mkSeries("마이그레이션 대기 IAM User", "iam_users_pending_migration", CHART_SERIES[2]),
+              ...(usesIdc ? [mkSeries("PS 전환율(%)", "ps_migration_pct", CHART_SERIES[3])] : []),
+              mkSeries(usesIdc ? "마이그레이션 대기 IAM User" : "IAM User 수", "iam_users_pending_migration", CHART_SERIES[2]),
             ]}
             xScaleType="categorical"
             xDomain={xDomain}

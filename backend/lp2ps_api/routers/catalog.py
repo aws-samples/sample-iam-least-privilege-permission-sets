@@ -28,6 +28,7 @@ from lp2ps.policy_export import build_artifacts, iam_name, permission_set_artifa
 
 from ..audit import audit_event
 from ..auth import require_auth
+from ..customer_config import config_inline, uses_identity_center
 from ..deps import get_settings, valid_persona
 from ..repositories import CatalogConflict
 from . import get_repos
@@ -195,22 +196,8 @@ def provision_ps(persona: str, claims: dict = Depends(require_auth)) -> Provisio
 
 
 def _config_inline() -> dict:
-    """CDK 가 Lambda 에 넣어주는 고객 config(JSON). 없거나 깨졌으면 빈 dict.
-
-    캐시하지 않는다 — 테스트가 env 를 바꿔가며 검증한다. 파싱 실패 시 예외를 올리지 않는다:
-    config 한 줄 때문에 카탈로그 조회 전체가 500 이 되면 안 되고, 각 호출자가 기본값을 갖는다.
-    """
-    import json
-    import os
-
-    inline = os.environ.get("LP2PS_CONFIG_INLINE")
-    if not inline:
-        return {}
-    try:
-        parsed = json.loads(inline)
-    except (ValueError, TypeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+    """고객 config(JSON) — 정본은 `..customer_config.config_inline`(여러 라우터가 공유)."""
+    return config_inline()
 
 
 def _idc_region() -> str:
@@ -224,12 +211,8 @@ def _idc_region() -> str:
 
 
 def _uses_identity_center() -> bool:
-    """이 고객이 IdC 를 쓰는가(config). 기본 True — 기존 배포의 동작을 바꾸지 않는다.
-
-    false 면 산출물에서 Permission Set 을 뺀다(IdC 인스턴스가 없어 apply 불가).
-    """
-    v = _config_inline().get("provisioning", {}).get("uses_identity_center")
-    return True if v is None else bool(v)
+    """이 고객이 IdC 를 쓰는가 — 정본은 `..customer_config.uses_identity_center`."""
+    return uses_identity_center()
 
 
 def _session_duration(persona: str) -> str:

@@ -1,4 +1,6 @@
-"""GET /settings/ai · PUT /settings/ai — AI 개입 기능 런타임 ON/OFF.
+"""GET /settings/deployment — 화면 구성을 가르는 배포 성격(읽기 전용).
+
+GET /settings/ai · PUT /settings/ai — AI 개입 기능 런타임 ON/OFF.
 
 AI(어시스턴트 Q&A, 향후 persona 제안)는 Bedrock 비용이 발생하므로 운영 중 즉시 켜고 끌 수 있어야
 한다. config yaml(`ai.enabled`)은 재배포가 필요해 런타임 토글에 부적합하므로, 상태를 **SSM
@@ -20,9 +22,27 @@ from pydantic import BaseModel
 
 from ..audit import audit_event
 from ..auth import require_auth
+from ..customer_config import uses_identity_center
 from ..deps import get_settings
 
 router = APIRouter(tags=["settings"])
+
+
+class DeploymentSettings(BaseModel):
+    """이 배포의 성격 — 화면이 무엇을 보여줄지 가른다.
+
+    uses_identity_center=false 인 고객에게 'PS 마이그레이션 12%' 같은 지표를 보여주면 영구히 달성할
+    수 없는 목표를 띄우는 것이 된다(IdC 인스턴스가 없어 분자가 구조적으로 0). 그런 배포에서는
+    지표를 '해당 없음' 으로 표시한다. 값의 출처는 config 이며 데이터 추론이 아니다.
+    """
+
+    uses_identity_center: bool = True
+
+
+@router.get("/settings/deployment")
+def get_deployment_settings() -> DeploymentSettings:
+    """config 유래 배포 성격. 인증 없이 읽는다(AI 토글 GET 과 동일 — 비밀이 아니다)."""
+    return DeploymentSettings(uses_identity_center=uses_identity_center())
 
 
 class AiSettings(BaseModel):

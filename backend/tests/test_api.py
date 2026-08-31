@@ -346,6 +346,27 @@ def test_cleanup_and_reports(monkeypatch):
     assert latest["exec_summary"]["personas"] == 3
 
 
+# ---- 배포 성격(GET /settings/deployment) ----
+
+@mock_aws
+def test_deployment_settings_defaults_to_identity_center(monkeypatch):
+    """config 에 값이 없으면 True — 기존 배포의 화면을 바꾸지 않는다."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    monkeypatch.delenv("LP2PS_CONFIG_INLINE", raising=False)
+    c = _client(monkeypatch)
+    assert c.get("/settings/deployment").json() == {"uses_identity_center": True}
+
+
+@mock_aws
+def test_deployment_settings_reflects_config_false(monkeypatch):
+    """uses_identity_center=false 를 그대로 내린다(대시보드가 PS 지표를 '해당 없음' 으로 표시)."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    monkeypatch.setenv("LP2PS_CONFIG_INLINE",
+                       json.dumps({"provisioning": {"uses_identity_center": False}}))
+    c = _client(monkeypatch)
+    assert c.get("/settings/deployment").json() == {"uses_identity_center": False}
+
+
 # ---- 조치 상태(미조치/조치완료/보류) ----
 
 KEY_A = "a" * 64

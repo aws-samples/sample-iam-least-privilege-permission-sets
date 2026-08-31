@@ -271,3 +271,9 @@ export interface ScheduleState {
 export interface AiSettings {
   enabled: boolean;
 }
+
+// 이 배포의 성격(config 유래, 읽기 전용). IdC 를 쓰지 않는 고객에게는 PS 마이그레이션 지표가
+// 구조적으로 달성 불가(분자가 항상 0)라 '해당 없음' 으로 표시한다.
+export interface DeploymentSettings {
+  uses_identity_center: boolean;
+}
