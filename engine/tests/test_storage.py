@@ -94,6 +94,46 @@ def test_normalized_roundtrip_preserves_kind_and_tags(tmp_path) -> None:
     assert got.tags == {"Team": "data", "Env": "prod"}
 
 
+def test_normalized_roundtrip_preserves_age_and_window(tmp_path) -> None:
+    """생성일·경과일·실측 관측 구간이 parquet 왕복에서 살아남아야 한다.
+
+    스키마 allowlist 대조(`test_parquet_schema_covers_every_model_field`)는 컬럼이 **있는지**만
+    본다 — 값이 실제로 왕복하는지는 별개다. 이 네 값이 죽으면 신규 역할이 다시 '미사용 역할'
+    삭제 후보로 올라가고, 화면은 측정하지 않은 기간을 근거처럼 표시한다.
+    """
+    st = LocalFSStorage(tmp_path, "acme", "run-1")
+    rec = _rec("111122223333", "arn:a")
+    rec.create_date = "2026-07-12T00:00:00+00:00"
+    rec.age_days = 3
+    rec.observed_days = 2
+    rec.observed_from = "2026-07-13T04:05:06+00:00"
+    st.write_normalized([rec])
+
+    got = st.read_normalized()[0]
+    assert got.create_date == "2026-07-12T00:00:00+00:00"
+    assert got.age_days == 3
+    assert got.observed_days == 2
+    assert got.observed_from == "2026-07-13T04:05:06+00:00"
+
+
+def test_normalized_roundtrip_keeps_unmeasured_as_null(tmp_path) -> None:
+    """대조군 — 미수집(None)은 0 이 아니라 None 으로 왕복해야 한다.
+
+    0 으로 왕복하면 "생성 당일" · "관측 0일" 이라는 실측값처럼 읽혀, 값 없음이 값으로 꾸며진다.
+    """
+    st = LocalFSStorage(tmp_path, "acme", "run-1")
+    got = _roundtrip_single(st, _rec("111122223333", "arn:a"))
+    assert got.create_date is None
+    assert got.age_days is None
+    assert got.observed_days is None
+    assert got.observed_from is None
+
+
+def _roundtrip_single(st: LocalFSStorage, rec: PrincipalRecord) -> PrincipalRecord:
+    st.write_normalized([rec])
+    return st.read_normalized()[0]
+
+
 def test_write_read_normalized(tmp_path) -> None:
     st = LocalFSStorage(tmp_path, "acme", "run-1")
     st.write_normalized([_rec("111122223333", "arn:a")])

@@ -9,10 +9,11 @@
 - unused_permission: unused_findings 건수 × 가중치(상한)
 - escalation_path: escalation_paths 건수 × 가중치(상한)
 - wildcard_action: granted 에 '*' 또는 'svc:*'
-- admin_like: granted 가 관리자급('*' 단독 또는 'iam:*'+대량)
+- admin_like: granted 에 `*`(전체) 또는 `iam:*`(IAM 전체 제어)가 있음 — 둘 중 **하나면** hit 이다.
+  (예전 독스트링은 "'iam:*'+대량" 이라고 적혀 있었지만 코드에 '대량' 조건은 없다.)
 
 불변식 ②(결정론): 가중치 합·안정 정렬만, wall-clock/random 없음. 같은 입력 → 같은 점수·같은 audit.
-불변식 ③: AI 미사용(순수 결정론). count_90d=0 모호성(#7): Access Advisor 가 used 로 넣은 이상
+불변식 ③: AI 미사용(순수 결정론). count_observed=0 모호성(#7): Access Advisor 가 used 로 넣은 이상
 "사용됨"으로 보고 미사용에서 제외한다(m2 에서 이미 unused_findings 에 안 들어감) — 여기선 재판정 안 함.
 """
 
@@ -121,11 +122,14 @@ def _score_one(rec: PrincipalRecord, rules: "RiskRules") -> tuple[int, list[str]
 
 
 def _is_admin_like(granted: list[str]) -> bool:
-    """관리자급 판정: 전체 와일드카드 단독, 또는 iam 전체 제어."""
+    """관리자급 판정: granted 에 `*`(전체) 또는 `iam:*`(IAM 전체 제어)가 있으면 hit.
+
+    관리형 정책 문서를 수집하기 전에는 이 판정이 사실상 죽어 있었다 — AdministratorAccess 는
+    관리형 정책이라 문서가 없으면 granted_actions 에 `*` 가 들어오지 않고, 라이브 계정에서
+    Administrator 보유 역할 8개가 전부 risk=low·score=0 으로 나왔다.
+    """
     gset = set(granted)
-    if "*" in gset:
-        return True
-    return "iam:*" in gset
+    return "*" in gset or "iam:*" in gset
 
 
 def _level(score: int, rules: "RiskRules") -> RiskLevel:

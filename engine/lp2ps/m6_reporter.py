@@ -1,9 +1,9 @@
 """M6 Reporter — cleanup 백로그 + 리포트 + exec summary.
 
 M3/M4/M5 로 enrich 된 normalized.parquet + catalog 를 읽어:
-- `cleanup_backlog.csv` — 5유형(unused_permission/unused_role/long_lived_key/no_mfa/escalation_path)
-  CleanupItem 목록(계약 model). UI 는 카테고리 요약→드릴다운.
-- `exec_summary.json` — ExecSummary(accounts/principals/personas/unused_permissions_removed/generated_at).
+- `cleanup_backlog.csv` — 6유형(unused_permission/unused_role/new_role_unused/long_lived_key/
+  no_mfa/escalation_path) CleanupItem 목록(계약 model). UI 는 카테고리 요약→드릴다운.
+- `exec_summary.json` — ExecSummary(accounts/principals/personas/unused_permission_*/generated_at).
 - `report.html` — 사람이 읽는 요약(결정론 정적 HTML).
 
 불변식 ②(결정론): 안정 정렬, generated_at 은 run.started_at(유일 허용 wall-clock)에서. 불변식 ③: AI 미사용.
@@ -35,6 +35,12 @@ _RECOMMENDATION: dict[str, tuple[str, str]] = {
         "역할 삭제 (미사용 — PS 카탈로그에 불필요)",
         "역할 삭제 (미사용 — 최소권한 정책 대상이 아님)",
     ),
+    # 관측 기간이 짧아 판단 근거가 부족한 신규 역할. **삭제를 권고하지 않는다** —
+    # 어제 만든 역할에 사용 기록이 없는 건 당연하고, 그걸 근거로 지우면 배포 중인 것을 깬다.
+    "new_role_unused": (
+        "신규 역할 — 관측 기간이 짧다. 용도 확인 후 판단(삭제 권고 아님)",
+        "신규 역할 — 관측 기간이 짧다. 용도 확인 후 판단(삭제 권고 아님)",
+    ),
     "unused_permission": (
         "실사용 기반 최소권한 Permission Set 로 마이그레이션",
         "실사용 기반 최소권한 IAM 정책으로 교체 (persona 검토 화면에서 정책·역할 Terraform 을 받아 적용)",
@@ -57,6 +63,43 @@ _RECOMMENDATION: dict[str, tuple[str, str]] = {
 def _recommendation(ctype: CleanupType, uses_idc: bool) -> str:
     idc_text, plain_text = _RECOMMENDATION[ctype]
     return idc_text if uses_idc else plain_text
+
+
+def is_unused_role(rec: PrincipalRecord) -> bool:
+    """이 역할이 '실사용 증거가 어느 층위에도 없다' 인가 — 미사용 판정식의 **단일 소스**.
+
+    `snapshot._metrics_for` 가 같은 함수를 쓴다. 예전엔 두 곳이 각자 조건을 갖고 있었고
+    (스냅샷은 `granted_actions` 만, m6 은 `granted_actions or has_managed_policies`) 그 결과
+    대시보드 "미사용 역할 40" 과 백로그 59건이 어긋났다 — 주석은 "같은 판정식" 이라고 적혀
+    있었지만 사실이 아니었다.
+    """
+    return (
+        rec.identity_type == "role"
+        and not rec.used_actions
+        and not rec.used_services
+        and (bool(rec.granted_actions) or rec.has_managed_policies)
+    )
+
+
+def is_too_new_to_judge(rec: PrincipalRecord, min_age_days: int) -> bool:
+    """관측 가능 기간이 최소 기준보다 짧은가(= 미사용이라 말할 근거가 부족한가).
+
+    나이를 모르면(구버전 raw 로 create_date 미수집) 판정을 바꾸지 않는다 — 모른다는 이유로
+    조치 대상을 늘리거나 줄이지 않고, 증거에 '확인 불가' 로 남긴다.
+    """
+    return rec.age_days is not None and rec.age_days < min_age_days
+
+
+def _window_phrase(rec: PrincipalRecord) -> str:
+    """이 principal 의 미사용 판정 근거 창을 **실측값**으로 서술.
+
+    화면·CSV 가 "90일" 이라고 쓰던 자리다. 그 90일은 어디서도 측정되지 않았다: CloudTrail
+    LookupEvents 는 페이지 상한에 걸려 라이브에서 2일만 덮었고, Access Advisor 는 AWS 가 문서화한
+    추적 창(최대 400일, 서비스·action 별로 상이)을 쓴다. 그래서 CloudTrail 쪽은 실측 일수를 쓰고
+    Advisor 쪽은 측정값이 아니라 **AWS 사양**임을 문구로 드러낸다.
+    """
+    ct = f"CloudTrail {rec.observed_days}일" if rec.observed_days is not None else "CloudTrail 근거 없음"
+    return f"{ct} + Access Advisor 추적 창(AWS 사양: 최대 400일)"
 
 
 def cleanup_finding_key(ctype: str, account_id: str, principal: str, extra: str = "") -> str:
@@ -154,21 +197,28 @@ def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[Cleanu
         #
         # `used_services` 를 함께 보는 이유: Access Advisor 의 action-level 추적 범위는 서비스별로
         # 달라, 실제로 쓰이는 역할도 action 세부가 안 나와 `used_actions` 가 빌 수 있다. 그때 서비스
-        # 단위 last_authenticated 만 있으면 그 역할은 **쓰이는 중**이다 — "90일간 미사용, 삭제 검토"
+        # 단위 last_authenticated 만 있으면 그 역할은 **쓰이는 중**이다 — "미사용, 삭제 검토"
         # 라고 권하면 운영 중인 역할을 지우게 된다(S3 복제 역할 등이 실제로 이 오탐에 걸렸다).
-        if (
-            rec.identity_type == "role"
-            and not rec.used_actions
-            and not rec.used_services
-            and (rec.granted_actions or rec.has_managed_policies)
-        ):
-            items.append(_item("unused_role", rec, rec.risk_level,
-                               "90일간 미사용 역할", _recommendation("unused_role", uses_idc),
+        #
+        # 나이로 한 번 더 가른다: 생성 후 `unused_action_days` 도 안 지난 역할은 사용 기록이 없는
+        # 게 당연하다(라이브 575: 미사용 판정 59건 중 16건이 90일 미만, 3건은 당일 생성). 그걸
+        # "미사용 역할, 삭제 후보" 로 내면 배포 중인 것을 지우라고 권하는 셈이다 → new_role_unused.
+        if is_unused_role(rec):
+            min_age = cfg.risk_rules.unused_action_days
+            too_new = is_too_new_to_judge(rec, min_age)
+            ctype: CleanupType = "new_role_unused" if too_new else "unused_role"
+            detail = (f"생성 후 미사용(생성 {rec.age_days}일 경과 — 관측 기간 부족)"
+                      if too_new else f"미사용 역할({_window_phrase(rec)} 근거로 사용 기록 없음)")
+            items.append(_item(ctype, rec, rec.risk_level, detail,
+                               _recommendation(ctype, uses_idc),
                                evidence={
                                    "식별 유형": "role",
                                    "부여된 action 수": str(len(rec.granted_actions)),
-                                   "90일 사용 action": "0",
+                                   "사용 근거": f"없음({_window_phrase(rec)})",
                                    "사용 흔적 서비스": "없음",
+                                   "역할 생성일": rec.create_date or "미수집",
+                                   "생성 후 경과": f"{rec.age_days}일" if rec.age_days is not None else "확인 불가",
+                                   "삭제 판단 최소 경과": f"{min_age}일",
                                    "관리형 정책 연결": "예" if rec.has_managed_policies else "아니오",
                                    "수집 소스": ", ".join(rec.source) or "-",
                                }))
@@ -309,12 +359,18 @@ def _exec_summary_for(
     items: list[CleanupItem], run: "RunContext", account_id: str,
 ) -> ExecSummary:
     accounts = len({r.account_id for r in records})
-    unused_removed = sum(1 for it in items if it.type == "unused_permission")
+    # 두 단위를 **둘 다** 낸다: 항목(principal) 수와 그 안의 action 총계. 하나만 내면 다른 화면의
+    # 같은 이름 지표와 어긋난다(예전: 리포트 74 = principal, 대시보드 2,271 = action).
+    with_unused = [it for it in items if it.type == "unused_permission"]
+    # action 총계는 `snapshot._metrics_for.unused_permissions` 와 **같은 식**이어야 한다 — 리포트와
+    # 대시보드가 같은 이름으로 다른 숫자를 보여주면 어느 쪽이 맞는지 알 수 없다.
+    action_total = sum(len([f for f in r.unused_findings if ":" in f]) for r in records)
     return ExecSummary(
         accounts=accounts,
         principals=len(records),
         personas=len(catalog),
-        unused_permissions_removed=unused_removed,
+        unused_permission_principals=len(with_unused),
+        unused_permission_actions=action_total,
         generated_at=run.started_at,  # 유일 허용 wall-clock(불변식 ②)
         account_id=account_id,
     )
@@ -323,6 +379,7 @@ def _exec_summary_for(
 _TYPE_LABEL_HTML = {
     "unused_permission": "미사용 권한",
     "unused_role": "미사용 역할",
+    "new_role_unused": "신규 역할(관측 기간 부족)",
     "long_lived_key": "장기 액세스키",
     "no_mfa": "MFA 미설정",
     "escalation_path": "권한 상승 경로",
@@ -345,7 +402,8 @@ def _render_html(
     """사람이 읽는 종합 보고서(결정론 정적 HTML, 외부 자원·스크립트 없음)."""
     esc = html.escape
 
-    # 위험 등급 분포(활성 principal 기준).
+    # 위험 등급 분포 — **수집된 전 principal** 기준(활성/비활성 구분은 하지 않는다. 예전 주석은
+    # "활성 principal 기준" 이라고 적혀 있었지만 아래 루프에 그런 필터가 없다).
     dist = {"critical": 0, "high": 0, "medium": 0, "low": 0}
     for r in records:
         dist[r.risk_level] = dist.get(r.risk_level, 0) + 1
@@ -366,17 +424,30 @@ def _render_html(
     }
     src_rows = ""
     accounts_m = manifest.get("accounts", []) if isinstance(manifest, dict) else []
-    seen_src: dict[str, dict] = {}
-    any_degraded = False
+    # 소스별로 **가장 나쁜 상태**를 대표로 쓴다. 예전엔 `setdefault` 로 첫 계정 것만 남겼는데,
+    # 그러면 계정 A 가 ok 이고 계정 B 가 degraded 일 때 표가 "정상" 만 보여주고 B 의 note 는
+    # 사라진다 — 경고 배너는 뜨는데 표에는 근거가 없어 어느 소스가 문제인지 알 수 없다.
+    _RANK = {"ok": 0, "skipped": 1, "degraded": 2}
+    worst: dict[str, dict] = {}
+    degraded_accounts: dict[str, list[str]] = {}
     for acct in accounts_m:
+        aid = str(acct.get("account_id", ""))
         for s in acct.get("sources", []):
-            seen_src.setdefault(s.get("source", ""), s)  # 소스별 대표 1건(단일계정 기준 충분)
+            src = s.get("source", "")
+            cur = worst.get(src)
+            if cur is None or _RANK.get(s.get("status", ""), 0) > _RANK.get(cur.get("status", ""), 0):
+                worst[src] = s
             if s.get("status") == "degraded":
-                any_degraded = True
-    for src, s in sorted(seen_src.items()):
+                degraded_accounts.setdefault(src, []).append(aid)
+    any_degraded = bool(degraded_accounts)
+    for src, s in sorted(worst.items()):
         status = s.get("status", "")
         label, color = _STATUS_LABEL.get(status, (status, "#879596"))
         note = s.get("note", "")
+        hit = degraded_accounts.get(src, [])
+        # 계정이 여러 개면 몇 개 계정에서 그랬는지 함께 — 대표 1건의 note 만으로는 범위를 알 수 없다.
+        if len(accounts_m) > 1 and hit:
+            note = f"[계정 {len(hit)}/{len(accounts_m)}개] {note}"
         src_rows += (
             f"<tr><td>{esc(_SOURCE_LABEL_HTML.get(src, src))}</td>"
             f"<td style='color:{color};font-weight:600'>{esc(label)}</td>"
@@ -487,7 +558,7 @@ def _render_html(
   <div class="kpi"><div class="n">{summary.accounts}</div><div class="l">분석 계정</div></div>
   <div class="kpi"><div class="n">{summary.principals:,}</div><div class="l">Principal</div></div>
   <div class="kpi"><div class="n">{summary.personas}</div><div class="l">Persona</div></div>
-  <div class="kpi"><div class="n">{summary.unused_permissions_removed:,}</div><div class="l">미사용 권한 정리 대상</div></div>
+  <div class="kpi"><div class="n">{summary.unused_permission_actions:,}</div><div class="l">미사용 action ({summary.unused_permission_principals:,}개 principal)</div></div>
   <div class="kpi"><div class="n">{esc_with}</div><div class="l">상승 경로 보유 principal</div></div>
 </div>
 

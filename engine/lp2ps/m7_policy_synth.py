@@ -2,8 +2,9 @@
 
 catalog 의 각 persona 에 대해, 멤버들이 **실사용한 action 합집합**으로 최소권한 IAM 정책 JSON 을
 `policies/<persona>.json` 에 만든다. `synthesis_source` 를 정책에 라벨링한다:
-- access_analyzer: CloudTrail/Access Advisor 기반 고신뢰(catalog 에서 승계)
-- fallback_used_actions: trail 부재 시 used 합집합 저신뢰
+- last_accessed_evidence: Access Advisor(서비스별 최종 사용) 또는 IAM Access Analyzer 미사용 발견이
+  근거에 기여함 → 고신뢰(catalog 에서 승계). CloudTrail 은 이 등급 판정에 들어가지 않는다.
+- fallback_used_actions: 위 소스 없이 관측된 used action 합집합만 → 저신뢰
 
 Access Analyzer Policy Generation(StartPolicyGeneration)은 계정별·비동기라 로컬 파이프라인에서는
 catalog 의 used action(이미 수집됨)으로 합성한다 — StartPolicyGeneration 은 allowlist(계정 미변경)이나

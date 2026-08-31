@@ -117,10 +117,14 @@ def get_risk_criteria() -> RiskCriteria:
                      detail=f"미사용 발견 1건당 +{r.weight_unused_permission}(상한 {r.weight_unused_permission_cap})"),
         RiskRuleInfo(key="escalation_path", label="권한 상승 경로", weight=r.weight_escalation_path,
                      detail=f"상승 경로 1건당 +{r.weight_escalation_path}(상한 {r.weight_escalation_cap})"),
+        # 아래 두 문구는 engine `m4_risk_scorer._score_one`/`_is_admin_like` 의 판정식을 그대로
+        # 옮긴 것이다. 조건을 바꾸려면 두 곳을 같이 바꿔야 한다 — 화면의 "판정 기준" 이 실제 채점과
+        # 어긋나면 사용자는 점수를 재현할 수 없다.
         RiskRuleInfo(key="wildcard_action", label="와일드카드 권한", weight=r.weight_wildcard_action,
-                     detail="granted 에 '*' 와일드카드 존재"),
+                     detail="granted action 에 '*' 가 포함됨(`s3:Get*` 같은 접두 와일드카드도 해당)"),
         RiskRuleInfo(key="admin_like", label="관리자급 권한", weight=r.weight_admin_like,
-                     detail="AdministratorAccess 급 광범위 권한('*' 단독 또는 iam:*)"),
+                     detail="granted 에 '*'(전체 허용) 또는 'iam:*' 가 있음 "
+                            "— AdministratorAccess 등 관리형 정책 연결로 들어온 경우 포함"),
     ]
     return RiskCriteria(
         level_critical=r.level_critical, level_high=r.level_high, level_medium=r.level_medium,

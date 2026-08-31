@@ -120,7 +120,8 @@ def _cmd_report(cfg: Config, args: argparse.Namespace) -> int:
         print(f"[report] {e}", file=sys.stderr)
         return 2
     print(f"[report] run_id={run.run_id} personas={result['personas']} "
-          f"cleanup(unused_perm)={result['unused_permissions_removed']} → {storage.location()}")
+          f"cleanup(unused_perm)={result['unused_permission_principals']}개 principal"
+          f"/{result['unused_permission_actions']}개 action → {storage.location()}")
     return 0
 
 

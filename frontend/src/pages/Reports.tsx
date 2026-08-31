@@ -106,7 +106,10 @@ export default function Reports() {
             <Value label="분석 계정">{s.accounts}</Value>
             <Value label="Principal">{s.principals.toLocaleString()}</Value>
             <Value label="Persona">{s.personas}</Value>
-            <Value label="제거된 미사용 권한">{s.unused_permissions_removed.toLocaleString()}</Value>
+            {/* "제거된" 이 아니다 — LP2PS 는 읽기 전용이고 아무것도 제거하지 않는다. principal 수와
+                action 수를 함께 보여준다(예전엔 principal 수를 '제거된 권한 수' 로 표시했다). */}
+            <Value label="미사용 권한(action)">{s.unused_permission_actions.toLocaleString()}</Value>
+            <Value label="미사용 권한 보유 principal">{s.unused_permission_principals.toLocaleString()}</Value>
           </ColumnLayout>
         </Container>
 
@@ -119,7 +122,8 @@ export default function Reports() {
               { id: "acct", header: "계정", cell: (a: ExecSummary) => a.account_id },
               { id: "principals", header: "Principal", cell: (a: ExecSummary) => a.principals.toLocaleString() },
               { id: "personas", header: "Persona", cell: (a: ExecSummary) => a.personas },
-              { id: "unused", header: "미사용 권한", cell: (a: ExecSummary) => a.unused_permissions_removed.toLocaleString() },
+              { id: "unused", header: "미사용 권한(action)", cell: (a: ExecSummary) => a.unused_permission_actions.toLocaleString() },
+              { id: "unused_p", header: "보유 principal", cell: (a: ExecSummary) => a.unused_permission_principals.toLocaleString() },
             ]}
             items={s.by_account}
           />

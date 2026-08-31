@@ -75,10 +75,12 @@ def run_report(storage: "Storage", run: "RunContext", cfg: "Config", account_sco
     _require(storage, NORMALIZED_NAME, "report")
     _require(storage, "catalog.json", "report")
     summary = build_reports(storage, run, cfg)
-    point = write_snapshot(storage, run, account_scope=account_scope, status=status)
+    point = write_snapshot(storage, run, account_scope=account_scope, status=status,
+                           risk_rules=cfg.risk_rules)
     return {
         "personas": summary.personas,
-        "unused_permissions_removed": summary.unused_permissions_removed,
+        "unused_permission_principals": summary.unused_permission_principals,
+        "unused_permission_actions": summary.unused_permission_actions,
         "metrics_run_id": point.run_id,
     }
 

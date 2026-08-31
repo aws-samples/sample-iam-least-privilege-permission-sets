@@ -46,6 +46,9 @@ provisioning:
 # verdict comes from Access Advisor, which is not paginated this way.
 collection:
   cloudtrail_max_pages: 200
+  # How far back LookupEvents is *asked* to go. The window actually covered is usually shorter
+  # (the page cap trims the oldest events); reports show the measured span, not this number.
+  cloudtrail_window_days: 90
 
 # Risk-scoring rule thresholds (tunable per customer; never hardcode in code).
 risk_rules:

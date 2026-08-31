@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from lp2ps.config import RiskRules
 from lp2ps.m2_normalizer import _sso_ps_records
 from lp2ps.models import PrincipalRecord
 from lp2ps.snapshot import _metrics
@@ -32,7 +33,7 @@ def test_migration_pct_snapshot_ratio() -> None:
         *[PrincipalRecord(account_id="a", principal=f"sso_ps::a::Admin::p{i}", identity_type="sso_ps",
                           run_id="run-x") for i in range(2)],
     ]
-    pt = _metrics(records, [], RUN)
+    pt = _metrics(records, [], RUN, RiskRules())
     assert pt.ps_migration_pct == 40  # round(100*2/5)
     assert pt.iam_users_pending_migration == 3
 
@@ -41,7 +42,7 @@ def test_migration_pct_zero_when_no_idc() -> None:
     # sso_ps 없음(IdC 미설정) → 0%.
     records = [PrincipalRecord(account_id="a", principal="arn:...:user/u", identity_type="user",
                                console_login=True, run_id="run-x")]
-    pt = _metrics(records, [], RUN)
+    pt = _metrics(records, [], RUN, RiskRules())
     assert pt.ps_migration_pct == 0
 
 
@@ -49,7 +50,7 @@ def test_migration_pct_no_human_access() -> None:
     # 사람 접근이 전혀 없음(role 만) → 분모 0 → 0% (0 나눗셈 방지).
     records = [PrincipalRecord(account_id="a", principal="arn:...:role/r", identity_type="role",
                                granted_actions=["s3:GetObject"], run_id="run-x")]
-    pt = _metrics(records, [], RUN)
+    pt = _metrics(records, [], RUN, RiskRules())
     assert pt.ps_migration_pct == 0
 
 
@@ -66,7 +67,7 @@ def _reserved(ps_suffix: str, actions: list[tuple[str, int, str]]) -> PrincipalR
         account_id=_ACCT,
         principal=f"arn:aws:iam::{_ACCT}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_{ps_suffix}",
         identity_type="role",
-        used_actions=[UsedAction(action=a, count_90d=c, last_used=t) for a, c, t in actions],
+        used_actions=[UsedAction(action=a, count_observed=c, last_used=t) for a, c, t in actions],
         run_id="run-x",
     )
 
@@ -93,7 +94,7 @@ def test_usage_merged_across_reserved_roles() -> None:
     ]
     merged = _reserved_sso_usage(recs)["Admin"]
     assert len(merged) == 1
-    assert merged[0].count_90d == 7
+    assert merged[0].count_observed == 7
     assert merged[0].last_used == "2026-07-20T00:00:00Z"
 
 
@@ -101,7 +102,7 @@ def test_ordinary_role_not_attributed() -> None:
     """대조군 — 일반 역할은 PS 귀속 대상이 아니다."""
     r = PrincipalRecord(
         account_id=_ACCT, principal=f"arn:aws:iam::{_ACCT}:role/data-eng", identity_type="role",
-        used_actions=[UsedAction(action="s3:GetObject", count_90d=1, last_used="2026-07-01T00:00:00Z")],
+        used_actions=[UsedAction(action="s3:GetObject", count_observed=1, last_used="2026-07-01T00:00:00Z")],
         run_id="run-x",
     )
     assert _reserved_sso_usage([r]) == {}
@@ -147,4 +148,4 @@ def test_sso_ps_still_counted_in_migration_pct() -> None:
         PrincipalRecord(account_id="a", principal="sso_ps::a::Admin::p1", identity_type="sso_ps",
                         is_exception=True, exception_type="sso_ps_synthetic", run_id="run-x"),
     ]
-    assert _metrics(records, [], RUN).ps_migration_pct == 50
+    assert _metrics(records, [], RUN, RiskRules()).ps_migration_pct == 50

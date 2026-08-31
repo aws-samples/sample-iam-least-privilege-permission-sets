@@ -386,7 +386,7 @@ def _parquet_schema():
         [
             ("action", pa.string()),
             ("last_used", pa.string()),
-            ("count_90d", pa.int64()),
+            ("count_observed", pa.int64()),
         ]
     )
     escalation = pa.struct(
@@ -413,12 +413,14 @@ def _parquet_schema():
             ("console_login", pa.bool_()),
             ("has_managed_policies", pa.bool_()),
             ("access_key_age_days", pa.int64()),
+            ("create_date", pa.string()),
+            ("age_days", pa.int64()),
+            ("observed_days", pa.int64()),
+            ("observed_from", pa.string()),
             ("escalation_paths", pa.list_(escalation)),
             ("risk_score", pa.int64()),
             ("risk_level", pa.string()),
             ("risk_reasons", pa.list_(pa.string())),
-            ("persona", pa.string()),
-            ("persona_confidence", pa.float64()),
             ("is_exception", pa.bool_()),
             ("exception_type", pa.string()),
             ("source", pa.list_(pa.string())),

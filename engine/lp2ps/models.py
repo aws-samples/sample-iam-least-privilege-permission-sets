@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 # ---- 리터럴 타입 (types.ts 와 동일) ----
 IdentityType = Literal["role", "user", "service", "sso_ps"]
@@ -23,9 +23,17 @@ PrincipalKind = Literal["human", "service", "unknown"]
 RiskLevel = Literal["critical", "high", "medium", "low"]
 ApprovalStatus = Literal["draft", "review", "approved"]
 RunStatus = Literal["running", "succeeded", "failed", "degraded"]
-SynthesisSource = Literal["access_analyzer", "fallback_used_actions"]
+# 합성 근거의 신뢰도 등급. `last_accessed_evidence` = Access Advisor(서비스별 최종 사용) 또는
+# IAM Access Analyzer 미사용 발견이 기여함. 옛 이름은 `access_analyzer` 였는데, 실제 근거가
+# Access **Advisor** 인 경우까지 IAM Access Analyzer 로 오표기했다(Terraform 태그·정책 메타에
+# 그대로 새겨졌다) — CatalogEntry 에 구값을 읽어 주는 alias 를 둔다.
+SynthesisSource = Literal["last_accessed_evidence", "fallback_used_actions"]
+_LEGACY_SYNTHESIS_SOURCE = {"access_analyzer": "last_accessed_evidence"}
 CleanupType = Literal[
-    "unused_permission", "unused_role", "long_lived_key", "no_mfa", "escalation_path"
+    "unused_permission", "unused_role", "long_lived_key", "no_mfa", "escalation_path",
+    # 생성 직후라 관측 기간 자체가 짧은 역할. unused_role 과 갈라 둔다 — 어제 만든 역할에 사용
+    # 기록이 없는 건 당연하고, 그걸 "미사용 역할이니 삭제" 로 권고하면 배포 중인 것을 지우게 한다.
+    "new_role_unused",
 ]
 # 조치 진행 상태. 엔진은 항상 "open"(미조치)만 낸다 — 사람이 무엇을 처리했는지는 엔진이 알 수 없다.
 # 상태는 API 가 도구 소유 DynamoDB(findings)에 따로 보관하고 조회 시 병합한다(불변식 ②: 코어 산출물은
@@ -36,7 +44,12 @@ CleanupStatus = Literal["open", "done", "deferred"]
 class UsedAction(BaseModel):
     action: str
     last_used: str | None = None  # ISO8601, 미사용이면 None
-    count_90d: int = 0
+    # CloudTrail 이 **실제로 훑은 구간** 안의 호출 횟수. 예전 이름은 count_90d 였는데 90일을
+    # 측정하는 곳이 어디에도 없었다 — LookupEvents 는 페이지 상한에 걸려 라이브에서 2.5일만 덮었고
+    # Access Advisor 는 최대 400일 창이다. 실제 구간은 `PrincipalRecord.observed_days` 가 말한다.
+    count_observed: int = Field(
+        default=0, validation_alias=AliasChoices("count_observed", "count_90d")
+    )
 
 
 class EscalationPath(BaseModel):
@@ -71,12 +84,22 @@ class PrincipalRecord(BaseModel):
     console_login: bool = False  # 콘솔 로그인 가능 여부(MFA 관련성 판단 — 서비스 계정 오탐 방지)
     has_managed_policies: bool = False  # attached managed 정책 존재(미사용 role 판정 보강)
     access_key_age_days: int | None = None
+    # IAM 생성일(ISO8601)과 as_of 기준 경과일. "사용 기록이 없다" 를 "안 쓰니 지워라" 로 읽으려면
+    # 관측 가능 기간이 필요하다 — 생성 3일 된 역할에 기록이 없는 건 당연하다.
+    create_date: str | None = None
+    age_days: int | None = None
+    # 이 계정에서 CloudTrail 이 **실제로 훑은** 구간(일수 / 가장 오래된 이벤트 시각).
+    # LookupEvents 는 최신순 페이지 상한이 있어 요청한 90일이 아니라 며칠만 덮일 수 있다.
+    # None = CloudTrail 근거 없음(Access Advisor 만).
+    observed_days: int | None = None
+    observed_from: str | None = None
     escalation_paths: list[EscalationPath] = Field(default_factory=list)
     risk_score: int = 0  # 0-100
     risk_level: RiskLevel = "low"
     risk_reasons: list[str] = Field(default_factory=list)
-    persona: str | None = None
-    persona_confidence: float = 0.0  # 0-1
+    # NOTE: 여기에 있던 `persona`/`persona_confidence` 는 **어느 모듈도 채우지 않아** 항상
+    # null/0.0 으로 나가던 유령 필드였다(persona 귀속은 CatalogEntry.members 가 계약). 계약에
+    # 남겨 두면 UI/고객이 "신뢰도 0" 을 실측값으로 읽는다 → 제거. 되살릴 때는 채우는 코드와 함께.
     is_exception: bool = False
     exception_type: str | None = None
     source: list[str] = Field(default_factory=list)  # 어느 수집 소스에서 왔는지
@@ -107,6 +130,9 @@ class MetricsPoint(BaseModel):
     # 근거 배선이 개선될 때 미사용 수가 줄어든 것을 "개선" 으로 오독한다.
     undetermined_permissions: int = 0
     unused_roles: int = 0
+    # 생성 직후라 관측 기간이 짧은 역할(삭제 권고 대상 아님). unused_roles 에서 뺀 몫이라, 함께
+    # 보여주지 않으면 "미사용 역할이 줄었다" 를 개선으로 오독한다.
+    new_unused_roles: int = 0
     long_lived_keys: int = 0
     no_mfa: int = 0
     over_privileged_principals: int = 0
@@ -127,11 +153,15 @@ class PolicyAction(BaseModel):
     action: str
     used: bool = False  # 실사용 여부 (기본 포함)
     included: bool = False  # 최종 정책 포함 여부 (사용자 토글)
-    # used=False 의 이유가 "안 썼다"가 아니라 "알 수 없다"인 경우. UI 가 '90일간 미사용' 대신
+    # used=False 의 이유가 "안 썼다"가 아니라 "알 수 없다"인 경우. UI 가 '미사용' 대신
     # '근거 불명' 으로 표시해야 한다 — 근거 없이 제외를 권하면 워크로드를 깨뜨린다.
     undetermined: bool = False
     last_used: str | None = None
-    count_90d: int = 0
+    # 관측 구간 내 호출 횟수(구간은 CatalogEntry.observed_window_days). DynamoDB 에 이미 저장된
+    # persona override 는 구 키(`count_90d`)로 들어 있어 alias 로 받아야 값이 0 으로 유실되지 않는다.
+    count_observed: int = Field(
+        default=0, validation_alias=AliasChoices("count_observed", "count_90d")
+    )
 
 
 class MemberDetail(BaseModel):
@@ -159,11 +189,21 @@ class CatalogEntry(BaseModel):
     policy_ref: str  # s3 key or id
     approval_status: ApprovalStatus = "draft"
     ai_suggested: bool = False
-    synthesis_source: SynthesisSource = "access_analyzer"  # 근거 신뢰도 등급(고신뢰/폴백)
+    synthesis_source: SynthesisSource = "last_accessed_evidence"  # 근거 신뢰도 등급(고신뢰/폴백)
     # 이 persona 합성에 **실제로 기여한 수집 소스** 목록(멤버 principal 들의 source 합집합).
     # 예: ["access_advisor", "cloudtrail", "credential_report"]. UI 가 근거 출처를 그대로 노출.
     contributing_sources: list[str] = Field(default_factory=list)
+    # 이 persona 멤버들의 CloudTrail 관측 구간 중 **가장 짧은** 값(일). UI 가 "횟수(90d)" 처럼
+    # 측정하지 않은 숫자를 쓰지 않도록, 실제로 훑은 구간을 그대로 표시하게 한다.
+    # None = CloudTrail 근거 없음(Access Advisor 만으로 합성).
+    observed_window_days: int | None = None
     actions: list[PolicyAction] = Field(default_factory=list)
+
+    @field_validator("synthesis_source", mode="before")
+    @classmethod
+    def _accept_legacy_synthesis_source(cls, v: object) -> object:
+        """이전 run 의 catalog.json(`access_analyzer`)도 읽을 수 있게 매핑한다."""
+        return _LEGACY_SYNTHESIS_SOURCE.get(v, v) if isinstance(v, str) else v
 
 
 class CleanupItem(BaseModel):
@@ -195,7 +235,15 @@ class ExecSummary(BaseModel):
     accounts: int
     principals: int
     personas: int
-    unused_permissions_removed: int
+    # 미사용 권한을 가진 **principal 수**. 예전 이름은 unused_permissions_removed 였는데 (a) 이 도구는
+    # 읽기 전용이라 아무것도 제거하지 않고, (b) 세는 단위가 principal 인데 대시보드의 "미사용 권한"
+    # 은 action 수라 두 화면이 서로 다른 숫자를 같은 이름으로 보여줬다(74 vs 2,271).
+    # 옛 exec_summary.json 을 계속 읽을 수 있게 alias 로 받는다.
+    unused_permission_principals: int = Field(
+        validation_alias=AliasChoices("unused_permission_principals", "unused_permissions_removed")
+    )
+    # 같은 항목의 action 총계(대시보드 "미사용 권한" 과 같은 단위).
+    unused_permission_actions: int = 0
     generated_at: str
     # 계정 필터용. account_id="" 이면 전체. by_account 는 계정별 분해(각 항목 account_id 채움).
     account_id: str = ""

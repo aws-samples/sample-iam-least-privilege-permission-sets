@@ -28,35 +28,35 @@ export const RUNS: Run[] = [
 export const METRICS: MetricsPoint[] = [
   {
     run_id: "run-001", ts: "2026-05-19T02:00:00Z",
-    unused_permissions: 1604, undetermined_permissions: 612, unused_roles: 59, long_lived_keys: 23, no_mfa: 14,
+    unused_permissions: 1604, undetermined_permissions: 612, unused_roles: 59, new_unused_roles: 7, long_lived_keys: 23, no_mfa: 14,
     over_privileged_principals: 512, escalation_paths: 37, personas: 6,
     iam_users_pending_migration: 148, ps_migration_pct: 12,
     risk_dist: { critical: 141, high: 288, medium: 402, low: 380 },
   },
   {
     run_id: "run-002", ts: "2026-06-02T02:00:00Z",
-    unused_permissions: 1498, undetermined_permissions: 588, unused_roles: 55, long_lived_keys: 22, no_mfa: 13,
+    unused_permissions: 1498, undetermined_permissions: 588, unused_roles: 55, new_unused_roles: 6, long_lived_keys: 22, no_mfa: 13,
     over_privileged_principals: 471, escalation_paths: 33, personas: 6,
     iam_users_pending_migration: 131, ps_migration_pct: 24,
     risk_dist: { critical: 128, high: 271, medium: 419, low: 421 },
   },
   {
     run_id: "run-003", ts: "2026-06-16T02:00:00Z",
-    unused_permissions: 1421, undetermined_permissions: 566, unused_roles: 52, long_lived_keys: 21, no_mfa: 12,
+    unused_permissions: 1421, undetermined_permissions: 566, unused_roles: 52, new_unused_roles: 6, long_lived_keys: 21, no_mfa: 12,
     over_privileged_principals: 438, escalation_paths: 30, personas: 7,
     iam_users_pending_migration: 118, ps_migration_pct: 38,
     risk_dist: { critical: 119, high: 260, medium: 431, low: 461 },
   },
   {
     run_id: "run-004", ts: "2026-06-30T02:00:00Z",
-    unused_permissions: 1352, undetermined_permissions: 540, unused_roles: 49, long_lived_keys: 19, no_mfa: 10,
+    unused_permissions: 1352, undetermined_permissions: 540, unused_roles: 49, new_unused_roles: 6, long_lived_keys: 19, no_mfa: 10,
     over_privileged_principals: 401, escalation_paths: 27, personas: 7,
     iam_users_pending_migration: 92, ps_migration_pct: 54,
     risk_dist: { critical: 110, high: 251, medium: 439, low: 484 },
   },
   {
     run_id: "run-005", ts: "2026-07-14T02:00:00Z",
-    unused_permissions: 1284, undetermined_permissions: 521, unused_roles: 47, long_lived_keys: 18, no_mfa: 9,
+    unused_permissions: 1284, undetermined_permissions: 521, unused_roles: 47, new_unused_roles: 5, long_lived_keys: 18, no_mfa: 9,
     over_privileged_principals: 368, escalation_paths: 24, personas: 8,
     iam_users_pending_migration: 71, ps_migration_pct: 66,
     risk_dist: { critical: 103, high: 244, medium: 437, low: 500 },
@@ -71,13 +71,13 @@ function mkActions(
   granted_unused: string[],
 ): PolicyAction[] {
   return [
-    ...used.map(([action, last_used, count_90d]) => ({
-      action, used: true, included: true, undetermined: false, last_used, count_90d,
+    ...used.map(([action, last_used, count_observed]) => ({
+      action, used: true, included: true, undetermined: false, last_used, count_observed,
     })),
     ...granted_unused.map((action, i) => ({
       action, used: false, included: false,
       undetermined: granted_unused.length > 1 && i === granted_unused.length - 1,
-      last_used: null, count_90d: 0,
+      last_used: null, count_observed: 0,
     })),
   ];
 }
@@ -105,7 +105,8 @@ export const CATALOG: CatalogEntry[] = [
     policy_ref: "policies/DataEngineer.json",
     approval_status: "review",
     ai_suggested: true,
-    synthesis_source: "access_analyzer",
+    synthesis_source: "last_accessed_evidence",
+    observed_window_days: 3,
     contributing_sources: ["access_advisor", "cloudtrail", "credential_report"],
     actions: mkActions(
       [
@@ -130,7 +131,8 @@ export const CATALOG: CatalogEntry[] = [
     policy_ref: "policies/ReadOnlyAuditor.json",
     approval_status: "approved",
     ai_suggested: false,
-    synthesis_source: "access_analyzer",
+    synthesis_source: "last_accessed_evidence",
+    observed_window_days: 3,
     contributing_sources: ["access_advisor", "analyzer_unused", "credential_report"],
     actions: mkActions(
       [
@@ -154,6 +156,9 @@ export const CATALOG: CatalogEntry[] = [
     approval_status: "review",
     ai_suggested: true,
     synthesis_source: "fallback_used_actions",
+    // CloudTrail 근거가 없는 persona → 창 길이를 말할 수 없다. UI 가 "90일" 을 박지 않고
+    // "관측 구간" 으로 폴백하는지 mock 으로 확인할 수 있게 null 로 둔다.
+    observed_window_days: null,
     contributing_sources: ["credential_report"],
     actions: mkActions(
       [
@@ -176,7 +181,8 @@ export const CATALOG: CatalogEntry[] = [
     policy_ref: "policies/CICDDeployer.json",
     approval_status: "draft",
     ai_suggested: true,
-    synthesis_source: "access_analyzer",
+    synthesis_source: "last_accessed_evidence",
+    observed_window_days: 3,
     contributing_sources: ["access_advisor", "cloudtrail", "credential_report"],
     actions: mkActions(
       [
@@ -200,6 +206,7 @@ const TYPE_REASONS: Record<CleanupItem["type"], string[]> = {
   no_mfa: ["MFA 미설정 콘솔 사용자"],
   escalation_path: ["권한 상승 경로 1건"],
   unused_role: ["미사용 권한/발견 20건"],
+  new_role_unused: ["미사용 권한/발견 12건"],
   unused_permission: ["미사용 권한/발견 35건"],
 };
 // 레벨→대표 점수(경계 이상). 데모용.
@@ -210,7 +217,8 @@ const TYPE_EVIDENCE: Record<CleanupItem["type"], Record<string, string>> = {
   long_lived_key: { "액세스키 나이": "612일", "임계 기준": "90일 이상", MFA: "미설정", "콘솔 로그인": "가능" },
   no_mfa: { "식별 유형": "user", "콘솔 로그인": "가능", MFA: "미설정", "액세스키 나이": "148일" },
   escalation_path: { "경유(via)": "iam:CreateRole", "도달 대상(to)": "AdministratorAccess", "MITRE ATT&CK": "T1098", "부여된 action 수": "42" },
-  unused_role: { "식별 유형": "role", "부여된 action 수": "37", "90일 사용 action": "0", "관리형 정책 연결": "예", "수집 소스": "access_advisor, credential_report" },
+  unused_role: { "식별 유형": "role", "부여된 action 수": "37", "사용 근거": "없음(CloudTrail 3일 + Access Advisor 추적 창(AWS 사양: 최대 400일))", "사용 흔적 서비스": "없음", "역할 생성일": "2024-03-11T04:22:10Z", "생성 후 경과": "856일", "삭제 판단 최소 경과": "90일", "관리형 정책 연결": "예", "수집 소스": "access_advisor, credential_report" },
+  new_role_unused: { "식별 유형": "role", "부여된 action 수": "12", "사용 근거": "없음(CloudTrail 3일 + Access Advisor 추적 창(AWS 사양: 최대 400일))", "사용 흔적 서비스": "없음", "역할 생성일": "2026-07-11T08:01:00Z", "생성 후 경과": "3일", "삭제 판단 최소 경과": "90일", "관리형 정책 연결": "예", "수집 소스": "access_advisor, credential_report" },
   unused_permission: { "부여된 action 수": "50", "실사용 action 수": "15", "미사용 action 수": "35", "대표 미사용": "s3:DeleteBucket, s3:PutBucketPolicy, iam:PassRole", "수집 소스": "access_advisor, cloudtrail" },
 };
 
@@ -228,12 +236,13 @@ function genCleanup(): CleanupItem[] {
     { type: "long_lived_key", principal: "user/legacy-svc", detail: "액세스키 age 612일", recommendation: "키 회전 또는 역할 전환" },
     { type: "no_mfa", principal: "user/ops-break-glass", detail: "MFA 미설정 콘솔 사용자", recommendation: "MFA 강제 또는 SSO 전환" },
     { type: "escalation_path", principal: "role/platform-admin", detail: "iam:CreateRole → AttachRolePolicy 상승 경로", recommendation: "권한 경계(permission boundary) 적용" },
-    { type: "unused_role", principal: "role/old-migration", detail: "90일간 미사용", recommendation: "역할 삭제 후보" },
+    { type: "unused_role", principal: "role/old-migration", detail: "미사용 역할(CloudTrail 3일 + Access Advisor 추적 창(AWS 사양: 최대 400일) 근거로 사용 기록 없음)", recommendation: "역할 삭제 후보" },
+    { type: "new_role_unused", principal: "role/EpoxyAccessRole", detail: "생성 후 미사용(생성 3일 경과 — 관측 기간 부족)", recommendation: "신규 역할 — 관측 기간이 짧다. 용도 확인 후 판단(삭제 권고 아님)" },
     { type: "unused_permission", principal: "role/data-eng-batch", detail: "granted 이나 미사용: s3:DeleteBucket 외 34건", recommendation: "최소권한 정책으로 교체" },
   ];
-  // 유형별 목표 건수(합계 118) — 미사용 권한이 압도적으로 많은 실제 분포 모사.
+  // 유형별 목표 건수(합계 122) — 미사용 권한이 압도적으로 많은 실제 분포 모사.
   const counts: Record<CleanupItem["type"], number> = {
-    unused_permission: 61, unused_role: 22, long_lived_key: 18, no_mfa: 9, escalation_path: 8,
+    unused_permission: 61, unused_role: 22, new_role_unused: 4, long_lived_key: 18, no_mfa: 9, escalation_path: 8,
   };
   const out: CleanupItem[] = [];
   let n = 0;
@@ -294,7 +303,8 @@ export const REPORTS: Record<string, ReportRef> = {
     iac_zip_url: "about:blank",
     exec_summary: {
       accounts: 24, principals: 1284, personas: 8,
-      unused_permissions_removed: 320, generated_at: "2026-07-14T02:12:00Z",
+      unused_permission_principals: 74, unused_permission_actions: 320,
+      generated_at: "2026-07-14T02:12:00Z",
     },
   },
 };

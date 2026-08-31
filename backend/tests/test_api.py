@@ -69,6 +69,8 @@ def _seed_aws(monkeypatch=None):
     st.write_text("cleanup_backlog.csv",
                   "id,type,account_id,principal,risk_level,detail,recommendation,risk_score,risk_reasons,evidence\n"
                   'c1,no_mfa,111122223333,arn:u,medium,MFA 없음,MFA 강제,35,MFA 미설정 콘솔 사용자|미사용 권한/발견 10건,"{""MFA"": ""미설정"", ""콘솔 로그인"": ""가능""}"\n')
+    # 구 키(`unused_permissions_removed`)를 일부러 그대로 둔다 — 이전 run 의 exec_summary.json 이
+    # 이 이름으로 S3 에 남아 있고, alias 가 깨지면 /reports 가 500 을 낸다(test_reports 가 잡는다).
     st.write_json("exec_summary.json", {"accounts": 1, "principals": 10, "personas": 3,
                   "unused_permissions_removed": 5, "generated_at": "2026-07-16T00:00:00Z"})
     st.write_text("report.html", "<html>ok</html>")
@@ -200,12 +202,24 @@ def test_patch_persona_saves_actions(monkeypatch):
     """PATCH /catalog/{persona} 가 action override 를 저장하고 GET 에 반영."""
     _seed_env(monkeypatch); _seed_aws(monkeypatch)
     c = _client(monkeypatch)
+    # `count_90d` 는 구 키다. 이미 DynamoDB 에 저장된 override 가 이 키로 들어 있어서 alias 로
+    # 받아야 한다 — 못 받으면 조용히 0 이 되고 UI 는 "관측 0회" 라는 거짓을 보여준다.
     new_actions = [{"action": "s3:GetObject", "used": True, "included": True,
                     "last_used": None, "count_90d": 5}]
     r = c.patch("/catalog/DataPersona", json={"actions": new_actions})
     assert r.status_code == 200
     entry = next(e for e in c.get("/catalog").json() if e["persona"] == "DataPersona")
     assert [a["action"] for a in entry["actions"]] == ["s3:GetObject"]
+    assert entry["actions"][0]["count_observed"] == 5
+    assert "count_90d" not in entry["actions"][0]  # 응답은 새 이름으로만 나간다.
+
+    # 새 이름도 그대로 받는다(대조군 — 위 assert 가 alias 때문이 아니라 우연히 통과하는 것 배제).
+    r2 = c.patch("/catalog/DataPersona", json={"actions": [
+        {"action": "s3:PutObject", "used": True, "included": True,
+         "last_used": None, "count_observed": 7}]})
+    assert r2.status_code == 200
+    entry2 = next(e for e in c.get("/catalog").json() if e["persona"] == "DataPersona")
+    assert [(a["action"], a["count_observed"]) for a in entry2["actions"]] == [("s3:PutObject", 7)]
 
 
 @mock_aws
@@ -591,12 +605,12 @@ def test_report_per_account(monkeypatch):
     st = S3Storage(f"s3://{BUCKET}", CUSTOMER, "run-001")
     # 계정별 분해가 담긴 exec_summary + 계정별 리포트 html.
     st.write_json("exec_summary.json", {
-        "accounts": 2, "principals": 10, "personas": 3, "unused_permissions_removed": 5,
+        "accounts": 2, "principals": 10, "personas": 3, "unused_permission_principals": 5, "unused_permission_actions": 41,
         "generated_at": "2026-07-16T00:00:00Z",
         "by_account": [
-            {"accounts": 1, "principals": 7, "personas": 2, "unused_permissions_removed": 3,
+            {"accounts": 1, "principals": 7, "personas": 2, "unused_permission_principals": 3, "unused_permission_actions": 25,
              "generated_at": "2026-07-16T00:00:00Z", "account_id": "111122223333"},
-            {"accounts": 1, "principals": 3, "personas": 1, "unused_permissions_removed": 2,
+            {"accounts": 1, "principals": 3, "personas": 1, "unused_permission_principals": 2, "unused_permission_actions": 16,
              "generated_at": "2026-07-16T00:00:00Z", "account_id": "444455556666"},
         ],
     })

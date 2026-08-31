@@ -60,8 +60,10 @@ catalog:
     - "cdk-*-file-publishing-role-*"
     - "cdk-*-image-publishing-role-*"
     - "cdk-*-lookup-role-*"
-  confidence_access_analyzer: 0.9
-  confidence_fallback: 0.5
+  # 접근 성격(Admin/Write/ReadOnly) 판정 임계치. "광범위" 의 기준은 계정 규모에 따라 다르다.
+  admin_min_services_with_identity: 20
+  admin_min_services: 50
+  write_ratio_threshold: 0.15
 
 permission_sets:
   session_duration: PT8H

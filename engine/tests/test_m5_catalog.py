@@ -21,7 +21,7 @@ RUN = RunContext(run_id="run-x", customer="test", started_at="2026-07-15T00:00:0
 def _rec(principal, actions, source=("access_advisor",), exception=False) -> PrincipalRecord:
     return PrincipalRecord(
         account_id="111122223333", principal=principal, identity_type="role",
-        used_actions=[UsedAction(action=a, last_used="2026-07-10T00:00:00Z", count_90d=5) for a in actions],
+        used_actions=[UsedAction(action=a, last_used="2026-07-10T00:00:00Z", count_observed=5) for a in actions],
         source=list(source), is_exception=exception, run_id="run-x",
     )
 
@@ -30,19 +30,19 @@ def _rec(principal, actions, source=("access_advisor",), exception=False) -> Pri
 
 def test_profile_readonly_when_all_read_verbs():
     r = _rec("arn:...:role/v", ["s3:GetObject", "s3:ListBucket", "ec2:DescribeInstances"])
-    assert _access_profile(r) == "ReadOnly"
+    assert _access_profile(r, CatalogConfig()) == "ReadOnly"
 
 
 def test_profile_write_when_change_verbs_present():
     # PutObject/CreateFunction 은 조회 동사가 아님 → 변경 비중 > 임계 → Write.
     r = _rec("arn:...:role/d", ["s3:GetObject", "s3:PutObject", "lambda:CreateFunction"])
-    assert _access_profile(r) == "Write"
+    assert _access_profile(r, CatalogConfig()) == "Write"
 
 
 def test_profile_admin_when_identity_write_and_broad():
     # iam 쓰기 + 서비스 폭 20+ → Admin(관리자 성격, 도메인 무시).
     actions = ["iam:CreateRole", "iam:AttachRolePolicy"] + [f"svc{i}:DoThing" for i in range(25)]
-    assert _access_profile(_rec("arn:...:role/admin", actions)) == "Admin"
+    assert _access_profile(_rec("arn:...:role/admin", actions), CatalogConfig()) == "Admin"
 
 
 # ── 축1: 지배 도메인(부수기능 디웨이팅) ─────────────────────────────────────
@@ -118,8 +118,8 @@ def test_admin_clusters_regardless_of_domain(tmp_path):
 
 
 def test_cluster_key_shapes():
-    assert _cluster_key(_rec("arn:...:role/x", ["ec2:DescribeInstances"])) == "ComputeReadOnly"
-    assert _cluster_key(_rec("arn:...:role/y", ["ec2:RunInstances", "ec2:StartInstances"])) == "ComputeWrite"
+    assert _cluster_key(_rec("arn:...:role/x", ["ec2:DescribeInstances"]), CatalogConfig()) == "ComputeReadOnly"
+    assert _cluster_key(_rec("arn:...:role/y", ["ec2:RunInstances", "ec2:StartInstances"]), CatalogConfig()) == "ComputeWrite"
 
 
 def test_exception_and_unused_excluded(tmp_path):
@@ -150,7 +150,7 @@ def test_actions_merged_and_included(tmp_path):
     actions = {a.action: a for a in cat[0].actions}
     assert set(actions) == {"s3:GetObject", "s3:ListBucket"}
     assert all(a.used and a.included for a in actions.values())
-    assert actions["s3:GetObject"].count_90d == 10  # 5+5 병합
+    assert actions["s3:GetObject"].count_observed == 10  # 5+5 병합
 
 
 def test_permission_gap_included_disabled(tmp_path):

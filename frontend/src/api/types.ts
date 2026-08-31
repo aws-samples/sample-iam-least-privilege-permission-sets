@@ -10,12 +10,17 @@ export type PrincipalKind = "human" | "service" | "unknown";
 export type RiskLevel = "critical" | "high" | "medium" | "low";
 export type ApprovalStatus = "draft" | "review" | "approved";
 export type RunStatus = "running" | "succeeded" | "failed" | "degraded";
-export type SynthesisSource = "access_analyzer" | "fallback_used_actions";
+// 합성 근거 신뢰도 등급. last_accessed_evidence = Access Advisor(서비스별 최종 사용) 또는
+// IAM Access Analyzer 미사용 발견이 기여함. 옛 이름 "access_analyzer" 는 근거가 Access
+// **Advisor** 인 경우까지 Access Analyzer 로 오표기했다(engine models.py 가 구값을 매핑해 준다).
+export type SynthesisSource = "last_accessed_evidence" | "fallback_used_actions";
 
 export interface UsedAction {
   action: string;
   last_used: string | null; // ISO8601, 미사용이면 null
-  count_90d: number;
+  // CloudTrail 이 **실제로 훑은 구간** 안의 호출 횟수. 옛 이름은 count_90d 였는데 90일을 측정하는
+  // 곳이 어디에도 없었다 — 실제 구간은 PrincipalRecord.observed_days 가 말한다.
+  count_observed: number;
 }
 
 export interface EscalationPath {
@@ -44,12 +49,16 @@ export interface PrincipalRecord {
   console_login: boolean; // 콘솔 로그인 가능 여부(MFA 관련성 — 서비스 계정 오탐 방지)
   has_managed_policies: boolean; // attached managed 정책 존재(미사용 role 판정 보강)
   access_key_age_days: number | null;
+  create_date: string | null; // principal 생성 시각(ISO8601). 미수집이면 null
+  age_days: number | null; // 생성 후 경과일. 신규 역할을 '미사용'으로 오판하지 않기 위한 근거
+  // 이 계정에서 CloudTrail 이 **실제로 훑은** 구간(일수 / 가장 오래된 이벤트 시각).
+  // null = CloudTrail 근거 없음(Access Advisor 만).
+  observed_days: number | null;
+  observed_from: string | null;
   escalation_paths: EscalationPath[];
   risk_score: number; // 0-100
   risk_level: RiskLevel;
   risk_reasons: string[];
-  persona: string | null;
-  persona_confidence: number; // 0-1
   is_exception: boolean;
   exception_type: string | null;
   source: string[]; // 어느 수집 소스에서 왔는지
@@ -93,6 +102,9 @@ export interface MetricsPoint {
   // 개선돼 미사용 수가 줄어든 것을 "정리됐다" 로 오독한다.
   undetermined_permissions: number;
   unused_roles: number;
+  // 생성 직후라 관측 기간 자체가 짧은 역할(unused_roles 에서 분리). 어제 만든 역할에 사용 기록이
+  // 없는 건 당연하므로 '삭제 후보' 로 세면 배포 중인 것을 지우게 한다.
+  new_unused_roles: number;
   long_lived_keys: number;
   no_mfa: number;
   over_privileged_principals: number;
@@ -117,11 +129,11 @@ export interface PolicyAction {
   action: string;
   used: boolean; // 실사용 여부 (기본 포함)
   included: boolean; // 최종 정책 포함 여부 (사용자 토글)
-  // used=false 의 이유가 "안 썼다"가 아니라 "알 수 없다"인 경우. '90일간 미사용' 이 아니라
+  // used=false 의 이유가 "안 썼다"가 아니라 "알 수 없다"인 경우. '미사용' 이 아니라
   // '근거 불명' 으로 표시해야 한다 — 근거 없이 제외를 권하면 워크로드가 깨진다.
   undetermined: boolean;
   last_used: string | null;
-  count_90d: number;
+  count_observed: number; // 관측 구간 내 호출 횟수(구간은 CatalogEntry.observed_window_days)
 }
 
 // persona 적용 대상 1건의 판별 근거(models.py MemberDetail 과 1:1).
@@ -144,12 +156,17 @@ export interface CatalogEntry {
   ai_suggested: boolean;
   synthesis_source: SynthesisSource; // 근거 신뢰도 등급(고신뢰/폴백)
   contributing_sources?: string[]; // 실제 기여한 수집 소스(access_advisor, cloudtrail 등)
+  // 이 persona 멤버들의 CloudTrail 관측 구간 중 **가장 짧은** 값(일). UI 는 "90d" 처럼 측정하지
+  // 않은 숫자를 쓰지 말고 이 값을 그대로 표시한다. null = CloudTrail 근거 없음.
+  observed_window_days?: number | null;
   actions: PolicyAction[]; // 정책 편집기의 좌측 체크리스트
 }
 
 export type CleanupType =
   | "unused_permission"
   | "unused_role"
+  // 생성 직후라 관측 기간이 짧은 역할. unused_role 과 갈라 둔다(삭제 권고 아님).
+  | "new_role_unused"
   | "long_lived_key"
   | "no_mfa"
   | "escalation_path";
@@ -204,7 +221,10 @@ export interface ExecSummary {
   accounts: number;
   principals: number;
   personas: number;
-  unused_permissions_removed: number;
+  // 옛 이름은 unused_permissions_removed 였다 — 아무것도 "제거" 하지 않는데(읽기 전용 도구)
+  // 제거된 수처럼 읽혔고, 값도 action 수가 아니라 principal 수였다. 둘로 나눈다.
+  unused_permission_principals: number;
+  unused_permission_actions: number;
   generated_at: string;
   account_id?: string; // "" 이면 전체
   by_account?: ExecSummary[]; // 계정별 분해(전체에만)

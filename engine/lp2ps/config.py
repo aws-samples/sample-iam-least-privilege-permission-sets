@@ -71,11 +71,17 @@ class CollectionConfig(BaseModel):
     # 계정·리전당 LookupEvents 페이지 상한. 페이지 **수**여야 한다(초 단위 예산으로 바꾸면
     # 실행 속도에 따라 절단 지점이 달라져 불변식 ②(결정론)가 깨진다).
     cloudtrail_max_pages: int = 200
+    # LookupEvents 에 **요청하는** 소급 기간(일). 상한(`cloudtrail_max_pages`)에 걸리면 실제로
+    # 덮는 구간은 이보다 훨씬 짧아진다 — 그 실측값이 raw 의 `coverage_start` 이고, 산출물은
+    # 요청값이 아니라 실측 구간을 표시한다(`PrincipalRecord.observed_days`).
+    cloudtrail_window_days: int = 90
 
     @model_validator(mode="after")
     def _check_budget(self) -> "CollectionConfig":
         if self.cloudtrail_max_pages < 1:
             raise ValueError("collection.cloudtrail_max_pages 는 1 이상이어야 합니다.")
+        if self.cloudtrail_window_days < 1:
+            raise ValueError("collection.cloudtrail_window_days 는 1 이상이어야 합니다.")
         return self
 
 
@@ -88,6 +94,11 @@ class RiskRules(BaseModel):
 
     # 임계치
     long_lived_key_days: int = 90
+    # "미사용이니 삭제하라"고 말하기 위해 필요한 **최소 관측 가능 기간**(일 = principal 생성 후 경과일).
+    # 이보다 어린 principal 은 사용 기록이 없는 게 당연하다 — 생성 3일 된 역할을 "미사용 역할, 삭제
+    # 후보" 로 내면 배포 중인 것을 지우라고 권하는 셈이다. M6 이 unused_role / new_role_unused 를
+    # 이 값으로 가른다. (오래 dead 키였다 — 값은 있는데 읽는 코드가 없었고, 그동안 화면의 "90일"은
+    # 어디서도 측정되지 않은 숫자였다.)
     unused_action_days: int = 90
     # 위험 가중치(각 규칙이 hit 하면 더해지는 점수)
     weight_long_lived_key: int = 20
@@ -138,9 +149,19 @@ class CatalogConfig(BaseModel):
             "cdk-*-lookup-role-*",
         ]
     )
-    # persona 신뢰도: CloudTrail(고신뢰) 기반이면 높게, fallback 이면 낮게.
-    confidence_access_analyzer: float = 0.9
-    confidence_fallback: float = 0.5
+    # 접근 성격(축2) 판정 임계치. 코드 리터럴이 아니라 config 여야 한다(불변식 ④) — 고객 환경마다
+    # "광범위"의 기준이 다르다(서비스 20종이 관리자인 계정도, 50종이 평범한 계정도 있다).
+    admin_min_services_with_identity: int = 20  # IAM/SSO/Organizations 쓰기 + 서비스 N종 이상 → Admin
+    admin_min_services: int = 50  # identity 쓰기 없어도 서비스 N종 이상 광범위 → Admin
+    write_ratio_threshold: float = 0.15  # 변경 동사 비중 ≥ 이 값이면 Write, 미만이면 ReadOnly
+
+    @model_validator(mode="after")
+    def _check_profile_thresholds(self) -> "CatalogConfig":
+        if self.admin_min_services_with_identity < 1 or self.admin_min_services < 1:
+            raise ValueError("catalog.admin_min_services* 는 1 이상이어야 합니다.")
+        if not 0.0 <= self.write_ratio_threshold <= 1.0:
+            raise ValueError("catalog.write_ratio_threshold 는 0.0~1.0 범위여야 합니다.")
+        return self
 
 
 class PermissionSetConfig(BaseModel):

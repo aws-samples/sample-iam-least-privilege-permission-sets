@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .config import RiskRules
+from .m6_reporter import is_too_new_to_judge, is_unused_role
 from .models import (
     CatalogEntry,
     MetricsPoint,
@@ -34,6 +36,7 @@ def write_snapshot(
     run: "RunContext",
     account_scope: int,
     status: RunStatus,
+    risk_rules: "RiskRules | None" = None,
 ) -> MetricsPoint:
     """run.json 기록 + metrics_timeseries append. 반환 = 이번 MetricsPoint."""
     records = storage.read_normalized()
@@ -48,7 +51,7 @@ def write_snapshot(
     )
     storage.write_json(RUN_NAME, run_row.model_dump())
 
-    point = _metrics(records, catalog, run)
+    point = _metrics(records, catalog, run, risk_rules or RiskRules())
     _append_timeseries(storage, point)
 
     # hosted 모드: DynamoDB runs/metrics 테이블에도 기록(테이블명이 env 로 주입된 경우에만).
@@ -118,14 +121,15 @@ def _to_ddb(obj: dict) -> dict:
 
 
 def _metrics(
-    records: list[PrincipalRecord], catalog: list[CatalogEntry], run: "RunContext"
+    records: list[PrincipalRecord], catalog: list[CatalogEntry], run: "RunContext",
+    risk_rules: "RiskRules",
 ) -> MetricsPoint:
     """전체(모든 계정 통합) MetricsPoint + 계정별 분해(by_account).
 
     account_id="" 인 total 에 by_account(계정별 MetricsPoint 목록)를 실어, 대시보드가 특정 계정
     선택 시 해당 분해를 쓴다. 결정론: by_account 는 account_id 오름차순.
     """
-    total = _metrics_for(records, catalog, run, account_id="")
+    total = _metrics_for(records, catalog, run, risk_rules, account_id="")
 
     # 계정별 분해 — persona 는 계정 교차라 계정별 persona 수는 "그 계정 principal 이 속한 persona 수"로.
     accounts = sorted({r.account_id for r in records})
@@ -134,7 +138,9 @@ def _metrics(
         for acct in accounts:
             acct_records = [r for r in records if r.account_id == acct]
             acct_catalog = _catalog_for_account(catalog, acct)
-            by_account.append(_metrics_for(acct_records, acct_catalog, run, account_id=acct))
+            by_account.append(
+                _metrics_for(acct_records, acct_catalog, run, risk_rules, account_id=acct)
+            )
         total.by_account = by_account
     return total
 
@@ -145,20 +151,32 @@ def _catalog_for_account(catalog: list[CatalogEntry], account_id: str) -> list[C
 
 
 def _metrics_for(
-    records: list[PrincipalRecord], catalog: list[CatalogEntry], run: "RunContext", account_id: str
+    records: list[PrincipalRecord], catalog: list[CatalogEntry], run: "RunContext",
+    risk_rules: "RiskRules", account_id: str,
 ) -> MetricsPoint:
     unused_permissions = sum(len([f for f in r.unused_findings if ":" in f]) for r in records)
     undetermined_permissions = sum(
         len([f for f in r.undetermined_findings if ":" in f]) for r in records
     )
-    # `used_services` 도 비어야 미사용 — action 세부가 없어 used_actions 만 빈 역할을 미사용으로
-    # 세면 지표가 부풀고, m6 백로그 건수와도 어긋난다(같은 판정식을 쓴다).
+    # m6 백로그와 **같은 함수**를 쓴다. 예전엔 여기 조건을 따로 적어 뒀고(`granted_actions` 만 봄,
+    # managed-only 역할 누락) 주석은 "같은 판정식" 이라고 주장했지만 실제로는 대시보드 40 vs
+    # 백로그 59로 어긋났다.
+    #
+    # 관측 기간이 짧아 판단 근거가 부족한 신규 역할은 여기서 뺀다 — 삭제 권고 대상이 아니므로
+    # "미사용 역할" 카운트에 넣으면 조치 가능 건수를 부풀린다(m6 은 new_role_unused 로 분리).
+    min_age = risk_rules.unused_action_days
     unused_roles = sum(
-        1
-        for r in records
-        if r.identity_type == "role" and not r.used_actions and not r.used_services and r.granted_actions
+        1 for r in records if is_unused_role(r) and not is_too_new_to_judge(r, min_age)
     )
-    long_lived_keys = sum(1 for r in records if r.access_key_age_days is not None and r.access_key_age_days >= 90)
+    new_unused_roles = sum(
+        1 for r in records if is_unused_role(r) and is_too_new_to_judge(r, min_age)
+    )
+    # 임계치는 config 에서(불변식 ④). 예전엔 여기에 90 이 박혀 있어 고객이
+    # `risk_rules.long_lived_key_days` 를 바꿔도 이 지표만 90 을 계속 썼다 — m4/m6 과 어긋난다.
+    long_lived_keys = sum(
+        1 for r in records
+        if r.access_key_age_days is not None and r.access_key_age_days >= risk_rules.long_lived_key_days
+    )
     # no_mfa: 콘솔 로그인 가능한 user 만(서비스 계정은 MFA 무관 — m4/m6 와 일치).
     no_mfa = sum(1 for r in records if r.identity_type == "user" and r.console_login and not r.mfa)
     over_privileged = sum(1 for r in records if r.risk_level in ("critical", "high"))
@@ -181,6 +199,7 @@ def _metrics_for(
         unused_permissions=unused_permissions,
         undetermined_permissions=undetermined_permissions,
         unused_roles=unused_roles,
+        new_unused_roles=new_unused_roles,
         long_lived_keys=long_lived_keys,
         no_mfa=no_mfa,
         over_privileged_principals=over_privileged,

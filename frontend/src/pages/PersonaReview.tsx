@@ -205,7 +205,7 @@ function catalogColumns(selectedAccount: string, openPanel: (e: CatalogEntry, ta
       id: "source", header: "합성 소스", minWidth: 160,
       cell: (e: CatalogEntry) => {
         const srcs = e.contributing_sources ?? [];
-        const highConf = e.synthesis_source === "access_analyzer";
+        const highConf = e.synthesis_source === "last_accessed_evidence";
         if (srcs.length === 0) {
           return highConf
             ? <StatusIndicator type="success">고신뢰</StatusIndicator>
@@ -262,6 +262,13 @@ function fmtLastUsed(iso: string | null): string {
   return iso.slice(0, 10); // YYYY-MM-DD
 }
 
+// CloudTrail 이 **실제로 훑은** 구간 문구. `observed_window_days` 는 측정값이다 — 요청한 90일이
+// 아니다(LookupEvents 는 최신순 페이지 상한이 있어 며칠만 덮이는 경우가 있다). 측정값이 없으면
+// 일수를 말하지 않는다: 화면에 "90일" 을 박아 두면 측정하지 않은 숫자를 근거처럼 보여준다.
+function windowText(days: number | null | undefined): string {
+  return days == null ? "관측 구간" : `최근 ${days.toLocaleString()}일`;
+}
+
 // ---- principal → persona 역방향 조회 ----
 // 운영자는 "이 역할에 무엇을 적용하나"로 접근한다(persona 목록에서 사람을 찾는 방향이 아니다).
 // 한 principal 은 정확히 하나의 persona 에 속한다(m5_catalog 가 배타적으로 군집) → 1:1 로 표시.
@@ -309,7 +316,7 @@ function PrincipalLookup({ catalog, onOpen }: { catalog: CatalogEntry[]; onOpen:
         />
         {searched && hits.length === 0 && (
           <Alert type="info" header="이 이름으로 카탈로그에 등록된 principal 이 없습니다">
-            persona 카탈로그는 <b>90일간 실사용 기록이 있는 principal</b> 만 담습니다. 검색 결과가 없다면
+            persona 카탈로그는 <b>실사용 기록이 관측된 principal</b> 만 담습니다. 검색 결과가 없다면
             추천이 없다는 뜻이 아니라, 대개 다음 중 하나입니다.
             <ul>
               <li><b>미사용</b> — 적용 대상이 아니라 회수 대상입니다. <b>조치 필요 항목</b> 화면에서 확인하세요.</li>
@@ -608,7 +615,7 @@ function PersonaEditorPanel({
         // 사람이 JSON 에 직접 타이핑한 action = 명시적 포함. 근거를 못 찾은 상태가 아니므로
         // undetermined=false 다(불명 배지를 붙이면 사용자 자신의 입력을 의심하는 화면이 된다).
         if (!known.has(act)) {
-          next.push({ action: act, used: false, included: true, undetermined: false, last_used: null, count_90d: 0 });
+          next.push({ action: act, used: false, included: true, undetermined: false, last_used: null, count_observed: 0 });
         }
       }
       return next;
@@ -666,7 +673,7 @@ function PersonaEditorPanel({
                 {approvedMsg && <Alert type="success" dismissible onDismiss={() => setApprovedMsg(null)}>{approvedMsg}</Alert>}
                 <Header
                   variant="h3"
-                  description="실사용=기본 포함 · 미사용(90일 기록 없음)=기본 제외 · 근거 불명(사용 여부를 확인할 수 없음)=기본 제외이나 삭제 전 담당자 확인 필요"
+                  description={`실사용=기본 포함 · 미사용(${windowText(entry.observed_window_days)} 기록 없음)=기본 제외 · 근거 불명(사용 여부를 확인할 수 없음)=기본 제외이나 삭제 전 담당자 확인 필요`}
                   actions={
                     <SpaceBetween direction="horizontal" size="xs">
                       <SegmentedControl
@@ -736,13 +743,18 @@ function PersonaEditorPanel({
                                     // 추적하지 않고 CloudTrail(단일 리전·관리 이벤트)에도 안 잡혔다.
                                     <StatusIndicator type="pending">사용 여부 확인 불가</StatusIndicator>
                                   ) : (
-                                    <StatusIndicator type="stopped">90일간 미사용</StatusIndicator>
+                                    <StatusIndicator type="stopped">{windowText(entry.observed_window_days)} 사용 기록 없음</StatusIndicator>
                                   ),
                               },
                               {
-                                id: "count", header: "횟수(90d)", width: 110, cell: (a: PolicyAction) =>
-                                  a.count_90d > 0 ? (
-                                    <Box>{a.count_90d.toLocaleString()}회</Box>
+                                id: "count",
+                                header: entry.observed_window_days == null
+                                  ? "관측 횟수"
+                                  : `횟수(${entry.observed_window_days}일)`,
+                                width: 110,
+                                cell: (a: PolicyAction) =>
+                                  a.count_observed > 0 ? (
+                                    <Box>{a.count_observed.toLocaleString()}회</Box>
                                   ) : a.used ? (
                                     <Box color="text-status-inactive" fontSize="body-s">집계 없음</Box>
                                   ) : (
@@ -802,7 +814,14 @@ function PersonaEditorPanel({
           {
             id: "targets",
             label: `적용 대상 (${rows.length})`,
-            content: <TargetsTab persona={entry.persona} rows={rows} download={download} />,
+            content: (
+              <TargetsTab
+                persona={entry.persona}
+                rows={rows}
+                download={download}
+                observedWindowDays={entry.observed_window_days}
+              />
+            ),
           },
         ]}
       />
@@ -948,10 +967,12 @@ function TargetsTab({
   persona,
   rows,
   download,
+  observedWindowDays,
 }: {
   persona: string;
   rows: TargetRow[];
   download: (filename: string, content: string, mime?: string) => void;
+  observedWindowDays: number | null | undefined;
 }) {
   const [query, setQuery] = useState("");
   const [kind, setKind] = useState<KindFilter>("all");
@@ -993,8 +1014,10 @@ function TargetsTab({
   return (
     <SpaceBetween size="s">
       <Alert type="info">
-        이 목록은 <b>{persona} 정책을 적용할 대상</b>입니다. 각 대상의 과거 90일 실사용 이력을 합집합으로
-        모은 것이 이 persona 의 정책이므로, 개별 대상 입장에서는 <b>필요 이상일 수 있어도 부족하지는 않습니다</b>.
+        이 목록은 <b>{persona} 정책을 적용할 대상</b>입니다. 각 대상의 <b>{windowText(observedWindowDays)}</b>{" "}
+        관측된 실사용 이력을 합집합으로 모은 것이 이 persona 의 정책이므로, 개별 대상 입장에서는{" "}
+        <b>필요 이상일 수 있습니다</b>. 반대로 <b>부족할 수도 있습니다</b> — 관측 구간 밖에서 쓴 action,
+        데이터 이벤트(기본 미기록), 추적되지 않는 action 은 합집합에 없습니다. 반영 전 검증하세요.
       </Alert>
       <SegmentedControl
         selectedId={kind}

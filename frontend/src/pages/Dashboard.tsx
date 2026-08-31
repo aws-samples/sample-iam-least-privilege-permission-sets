@@ -56,7 +56,7 @@ function scopeMetric(m: MetricsPoint, account: string): MetricsPoint {
   if (!account) return m;
   const found = m.by_account?.find((b) => b.account_id === account);
   return found ?? { ...m, by_account: [], account_id: account,
-    unused_permissions: 0, unused_roles: 0, long_lived_keys: 0, no_mfa: 0,
+    unused_permissions: 0, unused_roles: 0, new_unused_roles: 0, long_lived_keys: 0, no_mfa: 0,
     over_privileged_principals: 0, escalation_paths: 0, iam_users_pending_migration: 0,
     ps_migration_pct: 0, risk_dist: { critical: 0, high: 0, medium: 0, low: 0 } };
 }
@@ -374,9 +374,18 @@ export default function Dashboard() {
         {runErr && (
           <Flashbar items={[{ type: "error", header: "전체 조회", content: runErr, dismissible: true, onDismiss: () => setRunErr(null) }]} />
         )}
-        <Grid gridDefinition={[{ colspan: 3 }, { colspan: 3 }, { colspan: 3 }, { colspan: 3 }]}>
+        {/* KPI 5개 → 12 컬럼 그리드에 4·4·4 / 6·6 두 줄로 배치(3·3·3·3 에 5번째를 넣으면 넘친다). */}
+        <Grid gridDefinition={[{ colspan: 4 }, { colspan: 4 }, { colspan: 4 }, { colspan: 6 }, { colspan: 6 }]}>
           <Kpi label="미사용 권한" value={last.unused_permissions.toLocaleString()} onClick={() => navigate("/cleanup?type=unused_permission")} />
+          {/* 신규 역할(관측 기간 부족)은 이 숫자에서 빠져 있다 — 어제 만든 역할에 사용 기록이 없는
+              것은 당연하고, 삭제 후보로 세면 배포 중인 것을 지우게 한다. 별 KPI 로 노출한다. */}
           <Kpi label="미사용 역할" value={String(last.unused_roles)} onClick={() => navigate("/cleanup?type=unused_role")} />
+          <Kpi
+            label="신규 역할(판정 보류)"
+            value={String(last.new_unused_roles ?? 0)}
+            hint="생성 후 경과일이 짧아 '미사용' 으로 판정하지 않은 역할입니다(삭제 후보 아님)"
+            onClick={() => navigate("/cleanup?type=new_role_unused")}
+          />
           <Kpi label="장기 액세스키" value={String(last.long_lived_keys)} onClick={() => navigate("/cleanup?type=long_lived_key")} />
           {/* PS 전환율은 IdC 가 있어야 의미가 있다. IdC 미사용 배포에서는 분자(sso_ps)가 구조적으로
               0 이라 항상 0% 로 보이는데, 그건 "전환이 안 되고 있다" 가 아니라 "해당 없음" 이다.

@@ -1,7 +1,7 @@
 """M2 Normalizer — raw/** → normalized.parquet (`PrincipalRecord[]`).
 
 M1 수집 raw JSON 을 계정 단위로 읽어 principal 단위 `PrincipalRecord` 로 정규화한다:
-- granted_actions ← credential_report 의 inline 정책 문서(Allow Action)
+- granted_actions ← credential_report 의 inline ∪ 연결된 관리형 정책 ∪ (user)그룹 정책(Allow Action)
 - used_actions   ← access_advisor(action-level) ∪ cloudtrail(event → action 근사)
 - used_services  ← access_advisor 서비스 단위 last_authenticated(action 세부 없어도 "썼다"는 증거)
 - unused_findings ← analyzer_unused findings + (granted − used) 갭 중 **미사용이 확정되는 것**
@@ -28,13 +28,19 @@ M1 수집 raw JSON 을 계정 단위로 읽어 principal 단위 `PrincipalRecord
 불변식 ②(결정론): as_of(run.started_at) 기준으로만 시간 계산, 안정 정렬, wall-clock 미사용.
 risk_score/risk_level/persona 등은 후속 모듈(m4/m5)이 채운다 — 여기선 계약 기본값.
 
-한계(M1): attached **managed** 정책의 action 확장은 하지 않는다(문서 미수집). granted_actions 는
-inline 정책 기준이며, managed 확장은 후속에서 GetPolicyVersion 으로 보강한다(읽기전용 유지).
+granted_actions 범위: inline 정책 ∪ 연결된 관리형 정책(기본 버전 문서) ∪ user 의 그룹 정책.
+문서는 M1 이 같은 `GetAccountAuthorizationDetails` 응답에서 함께 받아 온다(추가 호출·권한 없음).
+관리형 정책 문서가 빠지면 관리형만 붙은 principal 이 "부여 권한 0" 으로 보이고, AdministratorAccess
+보유자가 risk=low 로 표시된다 — 라이브 계정에서 실제로 그랬다. 문서를 못 받으면 M1 이 degraded 로
+말하므로 여기서 조용히 0으로 넘어가지 않는다.
+
+한계: `Resource`/`Condition` 은 보지 않는다 — action 단위 최소권한만 다룬다. NotAction 도 확장하지
+않는다(부정 집합을 전체 action 목록 없이 펼칠 수 없다).
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from .collectors.access_advisor import SOURCE as ADVISOR
@@ -162,8 +168,13 @@ def _normalize_account(
     cred = raw.get(CRED_REPORT, {})
     inventory = {p["principal"]: p for p in (cred.get("principals", []) or [])}
     cred_by_arn = _index_credential_report(cred.get("credential_report", []) or [])
+    # 관리형 정책 문서(ARN→문서) · 그룹(이름→그룹). 구버전 raw(두 키가 없는 run)에서도 동작해야
+    # 하므로 없으면 빈 맵 — 그때 granted_actions 는 예전처럼 inline 만 담는다.
+    policy_docs = {p["arn"]: p.get("document") or {} for p in (cred.get("managed_policies") or [])}
+    groups_by_name = {g["name"]: g for g in (cred.get("groups") or [])}
 
     used_by_arn, used_sources_by_arn = _used_actions_by_principal(raw)
+    observed_days, observed_from = _observed_window(raw.get(CLOUDTRAIL, {}), as_of)
     analyzer_by_arn = _analyzer_findings_by_principal(raw.get(ANALYZER, {}))
     authed_svcs_by_arn, tracked_by_arn_svc, advisor_covered = _advisor_evidence(raw.get(ADVISOR, {}))
 
@@ -175,7 +186,7 @@ def _normalize_account(
     for arn in all_arns:
         p = inventory.get(arn)
         in_inventory = p is not None
-        granted = _granted_actions(p) if in_inventory else []
+        granted = _granted_actions(p, policy_docs, groups_by_name) if in_inventory else []
         used = used_by_arn.get(arn, [])
         used_action_names = {u.action for u in used}
 
@@ -242,6 +253,10 @@ def _normalize_account(
                 console_login=_console_login(cred_row),
                 has_managed_policies=has_managed,
                 access_key_age_days=_access_key_age_days(cred_row, as_of),
+                create_date=(p.get("create_date") if in_inventory else None),
+                age_days=_age_days(p.get("create_date") if in_inventory else None, as_of),
+                observed_days=observed_days,
+                observed_from=observed_from,
                 is_exception=exc_type is not None,
                 exception_type=exc_type,
                 source=sorted(contributing),
@@ -282,7 +297,7 @@ def _reserved_sso_usage(records: list[PrincipalRecord]) -> dict[str, list[UsedAc
                 bucket[u.action] = u.model_copy()
             else:
                 # 같은 action 이 여러 예약 역할에 있으면 호출수 합·최근 시각 채택(결정론).
-                prev.count_90d += u.count_90d
+                prev.count_observed += u.count_observed
                 prev.last_used = max_ts(prev.last_used, u.last_used)
     return {ps: sorted(b.values(), key=lambda u: u.action) for ps, b in by_ps.items()}
 
@@ -336,12 +351,33 @@ def _identity_from_arn(arn: str) -> str:
     return "role"
 
 
-# ---- granted actions (inline 정책) ----
-def _granted_actions(principal: dict) -> list[str]:
+# ---- granted actions (inline ∪ 관리형 ∪ 그룹) ----
+def _granted_actions(
+    principal: dict, policy_docs: dict[str, dict], groups_by_name: dict[str, dict]
+) -> list[str]:
+    """이 principal 에게 실제로 부여된 Allow action 전체.
+
+    세 경로를 합친다: inline 정책, 연결된 관리형 정책(기본 버전 문서), 그리고 user 의 소속 그룹이
+    가진 inline/관리형 정책. 관리형 문서가 `policy_docs` 에 없으면 그 정책분은 빠진다 —
+    그 상황은 M1(credential_report collector)이 degraded + note 로 이미 말한다.
+    """
     actions: set[str] = set()
-    for pol in principal.get("inline_policies", []) or []:
-        actions.update(_actions_from_document(pol.get("document", {})))
+    _add_holder_actions(actions, principal, policy_docs)
+    for group_name in principal.get("groups") or []:
+        group = groups_by_name.get(group_name)
+        if group:
+            _add_holder_actions(actions, group, policy_docs)
     return sorted(actions)
+
+
+def _add_holder_actions(out: set[str], holder: dict, policy_docs: dict[str, dict]) -> None:
+    """정책 보유자(principal 또는 group)의 inline + 연결 관리형 정책 action 을 out 에 더한다."""
+    for pol in holder.get("inline_policies") or []:
+        out.update(_actions_from_document(pol.get("document", {})))
+    for att in holder.get("attached_policies") or []:
+        doc = policy_docs.get(att.get("arn", ""))
+        if doc:
+            out.update(_actions_from_document(doc))
 
 
 def _actions_from_document(document: dict) -> set[str]:
@@ -365,6 +401,50 @@ def _actions_from_document(document: dict) -> set[str]:
 
 def _is_wildcard(action: str) -> bool:
     return "*" in action
+
+
+# ---- 관측 가능 기간 ----
+def _age_days(create_date: str | None, as_of: datetime) -> int | None:
+    """IAM 생성일 → as_of 기준 경과일. 값이 없으면 None(추정하지 않는다)."""
+    dt = _parse_dt(create_date)
+    if dt is None:
+        return None
+    return max((as_of - dt).days, 0)
+
+
+def _observed_window(ct_raw: dict, as_of: datetime) -> tuple[int | None, str | None]:
+    """CloudTrail raw → (실제로 훑은 구간의 일수, 그 구간 시작 시각). 근거 없으면 (None, None).
+
+    두 경우를 가른다:
+      - 페이지 상한에 걸림(`truncated`) → 실측값은 관측한 **가장 오래된 이벤트** 시각이다.
+        요청한 90일이 아니라 실제로 며칠뿐일 수 있다(라이브 575: 2일).
+      - 끝까지 훑음 → 요청한 창(`window_days`) 전체를 봤다. 이벤트가 하나도 없어도 그 구간은
+        "봤고 없었다" 는 근거다.
+
+    이 값을 표시하지 않으면 화면이 "90일" 을 주장하는데 그 90일은 어디서도 측정되지 않는다.
+    """
+    if not ct_raw or ct_raw.get("mode") != "lookup_events":
+        return None, None
+    window_days = ct_raw.get("window_days")
+    if ct_raw.get("truncated"):
+        start = _parse_dt(ct_raw.get("coverage_start"))
+        if start is None:
+            return None, None
+        return max((as_of - start).days, 0), ct_raw.get("coverage_start")
+    if not isinstance(window_days, int) or window_days < 0:
+        # 구버전 raw(window_days 없음) — 요청 창을 모르므로 주장하지 않는다.
+        return None, None
+    return window_days, (as_of - timedelta(days=window_days)).isoformat()
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 # ---- advisor 근거 인덱스(미사용 확정 vs 판정 불가 판별용) ----
@@ -466,12 +546,12 @@ def _merge_used(
     by_action = merged.setdefault(arn, {})
     existing = by_action.get(action)
     if existing is None:
-        by_action[action] = UsedAction(action=action, last_used=last_used, count_90d=count)
+        by_action[action] = UsedAction(action=action, last_used=last_used, count_observed=count)
         return
     # 병합: 더 최근 last_used, count 합산.
     newest = max_ts(existing.last_used, last_used)
     by_action[action] = UsedAction(
-        action=action, last_used=newest, count_90d=existing.count_90d + count
+        action=action, last_used=newest, count_observed=existing.count_observed + count
     )
 
 

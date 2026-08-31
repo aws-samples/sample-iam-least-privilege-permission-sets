@@ -80,11 +80,8 @@ _READ_VERB = re.compile(
 )
 
 # Admin(관리자) 판정: IAM·조직·SSO 쓰기가 있으면서 서비스 폭이 넓거나, 서비스 폭이 매우 넓은 경우.
+# 임계치(몇 종부터 '광범위'인가, 변경 비중 몇 %부터 Write 인가)는 config `catalog` 에 있다(불변식 ④).
 _IDENTITY_CONTROL_SERVICES = {"iam", "sso", "organizations"}
-_ADMIN_MIN_SERVICES_WITH_IDENTITY = 20  # IAM 쓰기 + 서비스 이만큼 이상 → Admin
-_ADMIN_MIN_SERVICES = 50  # IAM 쓰기 없어도 서비스 이만큼 이상 광범위 → Admin
-# Write 성격 판정: 변경 동사 비중이 이 이상이면 Write, 미만이면 ReadOnly.
-_WRITE_RATIO_THRESHOLD = 0.15
 
 
 def build_catalog(storage: "Storage", run: "RunContext", cfg: "CatalogConfig") -> list[CatalogEntry]:
@@ -105,7 +102,7 @@ def build_catalog(storage: "Storage", run: "RunContext", cfg: "CatalogConfig") -
     # 군집 키(도메인×성격) → principal 목록.
     clusters: dict[str, list[PrincipalRecord]] = {}
     for rec in active:
-        key = _cluster_key(rec)
+        key = _cluster_key(rec, cfg)
         clusters.setdefault(key, []).append(rec)
 
     entries: list[CatalogEntry] = []
@@ -173,7 +170,7 @@ def _dominant_domain(rec: PrincipalRecord) -> str:
     return sorted(weight.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
 
-def _access_profile(rec: PrincipalRecord) -> str:
+def _access_profile(rec: PrincipalRecord, cfg: "CatalogConfig") -> str:
     """principal 의 used action 동사 패턴 → 접근 성격: 'Admin' | 'Write' | 'ReadOnly'."""
     actions = [u.action for u in rec.used_actions if ":" in u.action]
     if not actions:
@@ -182,17 +179,17 @@ def _access_profile(rec: PrincipalRecord) -> str:
     identity_write = any(
         a.split(":", 1)[0] in _IDENTITY_CONTROL_SERVICES and _is_write(a) for a in actions
     )
-    if (identity_write and len(services) >= _ADMIN_MIN_SERVICES_WITH_IDENTITY) or (
-        len(services) >= _ADMIN_MIN_SERVICES
+    if (identity_write and len(services) >= cfg.admin_min_services_with_identity) or (
+        len(services) >= cfg.admin_min_services
     ):
         return "Admin"
     write_ratio = sum(1 for a in actions if _is_write(a)) / len(actions)
-    return "Write" if write_ratio >= _WRITE_RATIO_THRESHOLD else "ReadOnly"
+    return "Write" if write_ratio >= cfg.write_ratio_threshold else "ReadOnly"
 
 
-def _cluster_key(rec: PrincipalRecord) -> str:
+def _cluster_key(rec: PrincipalRecord, cfg: "CatalogConfig") -> str:
     """principal → 군집 키(도메인×성격). Admin 은 도메인 무관하게 'BroadAdmin' 하나로 모은다."""
-    profile = _access_profile(rec)
+    profile = _access_profile(rec, cfg)
     if profile == "Admin":
         return "BroadAdmin"
     return f"{_dominant_domain(rec)}{profile}"
@@ -221,15 +218,25 @@ def _entry_for(key: str, members: list[PrincipalRecord], cfg: "CatalogConfig") -
         for arn in member_arns
     ]
 
-    # synthesis_source: 멤버 중 하나라도 CloudTrail/analyzer 고신뢰면 access_analyzer, 아니면 fallback.
+    # synthesis_source: 멤버 중 하나라도 **last-accessed 계열 소스**(Access Advisor 서비스별
+    # 최종 사용 / IAM Access Analyzer 미사용 발견)를 가지면 고신뢰, 아니면 관측된 used action 뿐인
+    # 폴백. CloudTrail 은 여기 판정에 들어가지 않는다 — 과거 주석은 "CloudTrail/analyzer" 라고
+    # 적혀 있었지만 코드는 CloudTrail 을 보지 않는다(옛 라벨 'access_analyzer' 도 실제 근거가
+    # Access **Advisor** 인 경우까지 IAM Access Analyzer 로 오표기했다).
     high_conf = any("access_advisor" in r.source or "analyzer_unused" in r.source for r in members)
-    synthesis_source: SynthesisSource = "access_analyzer" if high_conf else "fallback_used_actions"
+    synthesis_source: SynthesisSource = (
+        "last_accessed_evidence" if high_conf else "fallback_used_actions"
+    )
 
     # 이 persona 에 실제 기여한 수집 소스(멤버들의 source 합집합, 결정론 정렬).
     contributing_sources = sorted({s for r in members for s in r.source})
 
     actions = _merge_actions(members)
     description = _describe(key, len(members))
+    # 관측 창은 멤버 중 **가장 좁은** 값으로 보고한다(계정마다 CloudTrail 페이지 상한에 걸린 지점이
+    # 달라 창 길이가 다르다). 넓은 쪽을 쓰면 근거가 없는 기간까지 관측한 것처럼 보인다.
+    windows = [r.observed_days for r in members if r.observed_days is not None]
+    observed_window_days = min(windows) if windows else None
 
     return CatalogEntry(
         persona=persona,
@@ -242,6 +249,7 @@ def _entry_for(key: str, members: list[PrincipalRecord], cfg: "CatalogConfig") -
         ai_suggested=False,
         synthesis_source=synthesis_source,
         contributing_sources=contributing_sources,
+        observed_window_days=observed_window_days,
         actions=actions,
     )
 
@@ -281,10 +289,10 @@ def _merge_actions(members: list[PrincipalRecord]) -> list[PolicyAction]:
             if existing is None:
                 merged[u.action] = PolicyAction(
                     action=u.action, used=True, included=True,
-                    last_used=u.last_used, count_90d=u.count_90d,
+                    last_used=u.last_used, count_observed=u.count_observed,
                 )
             else:
-                existing.count_90d += u.count_90d
+                existing.count_observed += u.count_observed
                 # 포맷 혼합 안전 비교(문자열 '>' 금지 — timeutil).
                 existing.last_used = max_ts(existing.last_used, u.last_used)
 
@@ -295,7 +303,7 @@ def _merge_actions(members: list[PrincipalRecord]) -> list[PolicyAction]:
                 continue  # action 형태만, 이미 used 로 잡힌 건 건너뜀.
             merged[finding] = PolicyAction(
                 action=finding, used=False, included=False,
-                last_used=None, count_90d=0,
+                last_used=None, count_observed=0,
             )
 
     # 3) 판정 불가 — used 도 아니고 미사용 확정도 아닌 것만(둘 다 우선).
@@ -305,7 +313,7 @@ def _merge_actions(members: list[PrincipalRecord]) -> list[PolicyAction]:
                 continue
             merged[finding] = PolicyAction(
                 action=finding, used=False, included=False, undetermined=True,
-                last_used=None, count_90d=0,
+                last_used=None, count_observed=0,
             )
     return sorted(merged.values(), key=lambda a: a.action)
 

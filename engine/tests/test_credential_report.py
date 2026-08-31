@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 
 from botocore.exceptions import ClientError
 
@@ -118,3 +119,173 @@ def test_permission_error_is_degraded(monkeypatch) -> None:
     assert r.status == "degraded"
     assert "AccessDenied" in r.note
     assert iam.get_calls == 1
+
+
+# ---- GetAccountAuthorizationDetails: 관리형 정책 문서 · 그룹 · 생성일 ----
+#
+# 예전 Filter 는 ["User","Role"] 이었다. 그러면 관리형 정책은 이름·ARN 만 오고 문서 본문이 없어
+# granted_actions 가 inline 정책만 담는다 — 라이브 계정에서 142개 중 62개(44%)가 부여 권한 0으로
+# 보였고, 그중 8개는 AdministratorAccess 를 들고도 risk=low·상승경로 0 이었다. 같은 응답에
+# 정책·그룹을 얹으면 추가 호출도 추가 IAM 권한도 없이 문서가 함께 온다.
+
+
+class _RecordingPaginator:
+    """paginate() 인자를 기록하는 paginator(고정 페이지 1장)."""
+
+    def __init__(self, page: dict, seen: dict) -> None:
+        self._page = page
+        self._seen = seen
+
+    def paginate(self, **kwargs):  # noqa: ANN001, ANN201
+        self._seen.update(kwargs)
+        return [self._page]
+
+
+class _AuthIAM(_FakeIAM):
+    """auth details 페이지를 지정할 수 있는 fake. credential report 는 즉시 성공."""
+
+    def __init__(self, page: dict) -> None:
+        super().__init__(in_progress=0)
+        self._page = page
+        self.paginate_kwargs: dict = {}
+
+    def get_paginator(self, name):  # noqa: ANN001, ANN201
+        return _RecordingPaginator(self._page, self.paginate_kwargs)
+
+
+_ADMIN_ARN = "arn:aws:iam::aws:policy/AdministratorAccess"
+_LOCAL_ARN = "arn:aws:iam::111122223333:policy/team-write"
+_ROLE_ARN = "arn:aws:iam::111122223333:role/managed-only"
+
+
+def _role(**over) -> dict:
+    role = {
+        "Arn": _ROLE_ARN,
+        "RoleName": "managed-only",
+        "CreateDate": datetime(2026, 8, 28, 8, 1, 0, tzinfo=timezone.utc),
+        "RolePolicyList": [],
+        "AttachedManagedPolicies": [{"PolicyName": "AdministratorAccess", "PolicyArn": _ADMIN_ARN}],
+        "Path": "/",
+        "AssumeRolePolicyDocument": {"Statement": [{"Effect": "Allow",
+                                                   "Principal": {"Service": "lambda.amazonaws.com"},
+                                                   "Action": "sts:AssumeRole"}]},
+        "Tags": [],
+    }
+    role.update(over)
+    return role
+
+
+def _admin_policy(default_version: str | None = "v2") -> dict:
+    """AdministratorAccess 흉내 — 버전 2개 중 하나만 기본. default_version=None 이면 기본 표시 없음."""
+    return {
+        "Arn": _ADMIN_ARN,
+        "PolicyName": "AdministratorAccess",
+        "PolicyVersionList": [
+            {"VersionId": "v1", "IsDefaultVersion": default_version == "v1",
+             "Document": {"Statement": [{"Effect": "Allow", "Action": "s3:GetObject",
+                                         "Resource": "*"}]}},
+            {"VersionId": "v2", "IsDefaultVersion": default_version == "v2",
+             "Document": {"Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}},
+        ],
+    }
+
+
+def test_auth_filter_requests_policies_and_groups(monkeypatch) -> None:
+    """Filter 에 정책·그룹이 없으면 문서 본문이 오지 않는다 — 요청 자체를 계약으로 잠근다."""
+    iam = _AuthIAM({"RoleDetailList": [_role()], "UserDetailList": [],
+                    "Policies": [_admin_policy()]})
+    _collect(iam, monkeypatch)
+    assert set(iam.paginate_kwargs["Filter"]) == {
+        "User", "Role", "Group", "AWSManagedPolicy", "LocalManagedPolicy"
+    }
+
+
+def test_managed_policy_default_version_document_collected(monkeypatch) -> None:
+    """관리형 정책은 **기본 버전** 문서만 싣는다(비기본 버전을 쓰면 없는 권한을 주장한다)."""
+    iam = _AuthIAM({"RoleDetailList": [_role()], "UserDetailList": [],
+                    "Policies": [_admin_policy(default_version="v2")]})
+    r = _collect(iam, monkeypatch)
+    assert r.status == "ok"
+    assert r.note == ""
+    docs = {p["arn"]: p["document"] for p in r.data["managed_policies"]}
+    assert docs[_ADMIN_ARN]["Statement"][0]["Action"] == "*", "기본 버전(v2) 문서여야 한다"
+
+    # 대조: 기본 버전이 v1 이면 v1 문서가 온다(무조건 마지막 버전을 고르는 게 아니다).
+    iam2 = _AuthIAM({"RoleDetailList": [_role()], "UserDetailList": [],
+                     "Policies": [_admin_policy(default_version="v1")]})
+    docs2 = {p["arn"]: p["document"] for p in _collect(iam2, monkeypatch).data["managed_policies"]}
+    assert docs2[_ADMIN_ARN]["Statement"][0]["Action"] == "s3:GetObject"
+
+
+def test_policy_without_default_version_is_reported_not_guessed(monkeypatch) -> None:
+    """기본 버전 표시가 없으면 임의로 고르지 않고 degraded + note 로 말한다.
+
+    임의로 한 버전을 고르면 실제와 다른 권한을 '부여 권한' 이라고 주장한다. 반대로 조용히
+    버리면 관리형만 붙은 principal 이 부여 권한 0 으로 보인다 — 그래서 못 읽었다고 말해야 한다.
+    """
+    iam = _AuthIAM({"RoleDetailList": [_role()], "UserDetailList": [],
+                    "Policies": [_admin_policy(default_version=None)]})
+    r = _collect(iam, monkeypatch)
+    assert r.data["managed_policies"] == [], "기본 버전을 특정할 수 없으면 싣지 않는다"
+    assert r.status == "degraded"
+    assert "과소 계상" in r.note and _ADMIN_ARN in r.note
+    assert "기본 버전 미표시" in r.note
+
+
+def test_attached_policy_missing_from_response_is_reported(monkeypatch) -> None:
+    """연결됐는데 응답에 문서가 아예 없는 정책도 note 로 드러낸다(권한 과소 계상 경고)."""
+    iam = _AuthIAM({"RoleDetailList": [_role()], "UserDetailList": [], "Policies": []})
+    r = _collect(iam, monkeypatch)
+    assert r.status == "degraded"
+    assert _ADMIN_ARN in r.note
+    # 기본 버전 미표시는 이 경로의 사유가 아니다 — 두 사유를 섞어 말하지 않는다.
+    assert "기본 버전 미표시" not in r.note
+
+
+def test_groups_and_membership_collected(monkeypatch) -> None:
+    """user 의 부여 권한은 그룹 경유분을 포함한다 → 그룹 정책과 소속을 함께 싣는다."""
+    iam = _AuthIAM({
+        "RoleDetailList": [],
+        "UserDetailList": [{
+            "Arn": "arn:aws:iam::111122223333:user/alice", "UserName": "alice",
+            "UserPolicyList": [], "AttachedManagedPolicies": [], "Path": "/", "Tags": [],
+            "GroupList": ["devs", "admins"],
+        }],
+        "GroupDetailList": [{
+            "GroupName": "devs", "Path": "/",
+            "GroupPolicyList": [{"PolicyName": "g", "PolicyDocument": {
+                "Statement": [{"Effect": "Allow", "Action": "sqs:SendMessage", "Resource": "*"}]}}],
+            "AttachedManagedPolicies": [{"PolicyName": "team-write", "PolicyArn": _LOCAL_ARN}],
+        }],
+        "Policies": [{"Arn": _LOCAL_ARN, "PolicyName": "team-write", "PolicyVersionList": [
+            {"VersionId": "v1", "IsDefaultVersion": True, "Document": {
+                "Statement": [{"Effect": "Allow", "Action": "kms:Decrypt", "Resource": "*"}]}}]}],
+    })
+    r = _collect(iam, monkeypatch)
+    assert r.status == "ok"
+    # 소속은 정렬해 싣는다(결정론).
+    assert r.data["principals"][0]["groups"] == ["admins", "devs"]
+    group = r.data["groups"][0]
+    assert group["name"] == "devs"
+    assert group["inline_policies"][0]["document"]["Statement"][0]["Action"] == "sqs:SendMessage"
+    assert group["attached_policies"][0]["arn"] == _LOCAL_ARN
+    # 그룹이 연결한 관리형 정책도 참조 대조에 들어간다 → 문서가 왔으니 note 없음.
+    assert r.note == ""
+
+
+def test_create_date_is_collected_as_iso(monkeypatch) -> None:
+    """생성일이 없으면 '기록 없음' 을 '삭제하라' 로 읽는 것을 막을 근거가 사라진다."""
+    iam = _AuthIAM({"RoleDetailList": [_role()], "UserDetailList": [],
+                    "Policies": [_admin_policy()]})
+    r = _collect(iam, monkeypatch)
+    assert r.data["principals"][0]["create_date"] == "2026-08-28T08:01:00+00:00"
+
+
+def test_missing_create_date_stays_none(monkeypatch) -> None:
+    """대조군 — CreateDate 가 없으면 None. 값 없음을 값으로 꾸미지 않는다(예: 에폭 0)."""
+    role = _role()
+    del role["CreateDate"]
+    iam = _AuthIAM({"RoleDetailList": [role], "UserDetailList": [],
+                    "Policies": [_admin_policy()]})
+    r = _collect(iam, monkeypatch)
+    assert r.data["principals"][0]["create_date"] is None

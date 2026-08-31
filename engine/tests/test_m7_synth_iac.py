@@ -44,7 +44,7 @@ def test_policy_has_used_actions_and_source(tmp_path):
     stmt = doc["Statement"][0]
     assert stmt["Effect"] == "Allow"
     assert set(stmt["Action"]) == {"s3:GetObject", "glue:StartJobRun"}
-    assert doc["_lp2ps"]["synthesis_source"] in ("access_analyzer", "fallback_used_actions")
+    assert doc["_lp2ps"]["synthesis_source"] in ("last_accessed_evidence", "fallback_used_actions")
 
 
 def test_excluded_action_not_in_policy(tmp_path):

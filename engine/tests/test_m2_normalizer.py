@@ -120,7 +120,7 @@ def test_normalize_derives_gap(tmp_path) -> None:
     assert used == {"s3:GetObject", "s3:PutObject"}  # advisor ∪ cloudtrail
     # cloudtrail count 반영.
     put = next(u for u in r.used_actions if u.action == "s3:PutObject")
-    assert put.count_90d == 12
+    assert put.count_observed == 12
     # granted − used = DeleteObject 가 미사용 갭(추적 목록에 있고 기록 없음 → 확정).
     assert r.unused_findings == ["s3:DeleteObject"]
     assert r.undetermined_findings == []
@@ -487,3 +487,190 @@ def _cfg_for_cleanup():
     return Config.model_validate(
         {"customer": "test", "region": "us-west-2", "cross_account": False, "accounts": ["self"]}
     )
+
+
+# ---- granted_actions = inline ∪ 관리형 ∪ 그룹 ----
+#
+# 관리형 정책 문서를 수집하기 전에는 여기서 inline 만 봤다. 그 결과 관리형만 붙은 principal 이
+# "부여 권한 0" 이 되어 granted−used 갭도 0, risk 도 0 이었다 — AdministratorAccess 보유자가
+# risk=low 로 표시됐다. 조용한 과소 계상이라 화면 어디에도 단서가 없었다.
+
+_USER = f"arn:aws:iam::{ACCOUNT}:user/alice"
+_MANAGED_ARN = "arn:aws:iam::aws:policy/DummyManaged"
+_GROUP_MANAGED_ARN = f"arn:aws:iam::{ACCOUNT}:policy/team-write"
+
+
+def _doc(*actions: str) -> dict:
+    return {"Statement": [{"Effect": "Allow", "Action": list(actions), "Resource": "*"}]}
+
+
+def _seed_user_with_managed_and_group(
+    storage: LocalFSStorage, *, managed_docs: bool = True, groups: bool = True
+) -> None:
+    """user 1명 = inline 1 + 연결 관리형 1 + 그룹(inline 1 + 관리형 1).
+
+    `managed_docs=False` 는 관리형 문서를 못 받은 상태(M1 이 degraded 로 말하는 상황) 재현.
+    """
+    storage.write_raw(ACCOUNT, "credential_report", {
+        "account_id": ACCOUNT,
+        "principals": [{
+            "principal": _USER, "name": "alice", "identity_type": "user",
+            "inline_policies": [{"name": "inline", "document": _doc("s3:GetObject")}],
+            "attached_policies": [{"name": "DummyManaged", "arn": _MANAGED_ARN}],
+            "path": "/", "groups": ["devs"] if groups else [],
+        }],
+        "credential_report": [],
+        "managed_policies": ([
+            {"arn": _MANAGED_ARN, "name": "DummyManaged", "document": _doc("dynamodb:Query")},
+            {"arn": _GROUP_MANAGED_ARN, "name": "team-write", "document": _doc("kms:Decrypt")},
+        ] if managed_docs else []),
+        "groups": [{
+            "name": "devs", "path": "/",
+            "inline_policies": [{"name": "g", "document": _doc("sqs:SendMessage")}],
+            "attached_policies": [{"name": "team-write", "arn": _GROUP_MANAGED_ARN}],
+        }],
+    })
+
+
+def test_granted_actions_union_inline_managed_group(tmp_path) -> None:
+    """네 경로(inline · 연결 관리형 · 그룹 inline · 그룹 관리형)가 모두 합집합에 들어와야 한다."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_user_with_managed_and_group(storage)
+    r = normalize(storage, RUN)[0]
+    assert r.granted_actions == [
+        "dynamodb:Query",     # 연결 관리형 정책 문서
+        "kms:Decrypt",        # 그룹이 연결한 관리형 정책 문서
+        "s3:GetObject",       # inline
+        "sqs:SendMessage",    # 그룹 inline
+    ]
+    assert r.has_managed_policies is True
+
+
+def test_group_actions_absent_when_not_a_member(tmp_path) -> None:
+    """대조군 — 소속이 아니면 그룹 정책은 부여 권한이 아니다(그룹 목록을 무조건 합치지 않는다)."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_user_with_managed_and_group(storage, groups=False)
+    r = normalize(storage, RUN)[0]
+    assert r.granted_actions == ["dynamodb:Query", "s3:GetObject"]
+
+
+def test_missing_managed_document_is_not_invented(tmp_path) -> None:
+    """문서를 못 받은 관리형 정책분은 합집합에서 빠진다 — 추측해 채우지 않는다.
+
+    이 상황은 M1(credential_report collector)이 degraded + note 로 말한다
+    (`test_credential_report.test_attached_policy_missing_from_response_is_reported`).
+    여기서 정책 이름으로 권한을 추정하면 부여하지 않은 권한을 부여했다고 주장하게 된다.
+    """
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_user_with_managed_and_group(storage, managed_docs=False)
+    r = normalize(storage, RUN)[0]
+    assert r.granted_actions == ["s3:GetObject", "sqs:SendMessage"], \
+        "관리형 문서 2건이 없으니 그 action 은 없어야 한다(그룹 inline 은 남는다)"
+
+
+def test_legacy_raw_without_managed_keys_still_normalizes(tmp_path) -> None:
+    """구버전 raw(managed_policies·groups 키 자체가 없음)도 완주해야 한다 — 이전 run 재분석 경로."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    storage.write_raw(ACCOUNT, "credential_report", {
+        "account_id": ACCOUNT,
+        "principals": [{
+            "principal": _USER, "name": "alice", "identity_type": "user",
+            "inline_policies": [{"name": "inline", "document": _doc("s3:GetObject")}],
+            "attached_policies": [{"name": "DummyManaged", "arn": _MANAGED_ARN}],
+            "path": "/",
+        }],
+        "credential_report": [],
+    })
+    r = normalize(storage, RUN)[0]
+    assert r.granted_actions == ["s3:GetObject"]
+
+
+# ---- 역할 나이 · 실측 관측 구간 ----
+#
+# "90일 사용 action 0" 이라는 화면 문구가 근거 없이 하드코딩되어 있었다. 두 값이 근거다:
+#   age_days      = 관측 **가능** 기간(생성 후 경과일). 어제 만든 역할에 기록이 없는 건 당연하다.
+#   observed_days = CloudTrail 이 **실제로 훑은** 구간. 요청은 90일이지만 페이지 상한에 걸려
+#                   라이브 575 에서는 2일이었다.
+
+
+def _seed_role_with_create_date(storage: LocalFSStorage, create_date: str | None) -> None:
+    storage.write_raw(ACCOUNT, "credential_report", {
+        "account_id": ACCOUNT,
+        "principals": [{
+            "principal": ARN, "name": "data-eng", "identity_type": "role",
+            "create_date": create_date,
+            "inline_policies": [{"name": "inline", "document": _doc("s3:GetObject")}],
+            "attached_policies": [], "path": "/",
+        }],
+        "credential_report": [],
+    })
+
+
+def test_age_days_from_create_date(tmp_path) -> None:
+    """경과일은 as_of(run.started_at) 기준으로 계산 — wall-clock 을 쓰지 않는다(불변식 ②)."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_role_with_create_date(storage, "2026-07-01T00:00:00+00:00")  # RUN=2026-07-15
+    r = normalize(storage, RUN)[0]
+    assert r.create_date == "2026-07-01T00:00:00+00:00"
+    assert r.age_days == 14
+
+
+def test_age_days_none_when_create_date_missing(tmp_path) -> None:
+    """대조군 — 생성일 미수집이면 None. 0(=오늘 생성)으로 꾸미면 전부 '신규 역할' 이 된다."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_role_with_create_date(storage, None)
+    r = normalize(storage, RUN)[0]
+    assert r.create_date is None
+    assert r.age_days is None
+
+
+def _seed_cloudtrail_window(storage: LocalFSStorage, ct: dict) -> None:
+    _seed_role_with_create_date(storage, "2026-01-01T00:00:00+00:00")
+    storage.write_raw(ACCOUNT, "cloudtrail", {"account_id": ACCOUNT, "usage": [], **ct})
+
+
+def test_observed_window_truncated_uses_measured_coverage(tmp_path) -> None:
+    """페이지 상한에 걸리면 실측값(가장 오래된 이벤트)이 관측 구간이다 — 요청한 90일이 아니다."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_cloudtrail_window(storage, {
+        "mode": "lookup_events", "window_days": 90, "max_pages": 200,
+        "truncated": True, "coverage_start": "2026-07-13T00:00:00+00:00",
+    })
+    r = normalize(storage, RUN)[0]
+    assert r.observed_days == 2, "실제로 훑은 구간은 2일이다(요청 90일이 아니다)"
+    assert r.observed_from == "2026-07-13T00:00:00+00:00"
+
+
+def test_observed_window_full_scan_uses_requested_window(tmp_path) -> None:
+    """대조군 — 끝까지 훑었으면 요청 창 전체가 근거다(이벤트가 0건이어도 '봤고 없었다')."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_cloudtrail_window(storage, {
+        "mode": "lookup_events", "window_days": 30, "max_pages": 200,
+        "truncated": False, "coverage_start": None,
+    })
+    r = normalize(storage, RUN)[0]
+    assert r.observed_days == 30
+    assert r.observed_from == "2026-06-15T00:00:00+00:00"
+
+
+def test_observed_window_unknown_when_truncated_without_coverage(tmp_path) -> None:
+    """상한에 걸렸는데 실측 시작점이 없으면 주장하지 않는다(요청값으로 대신 말하지 않는다)."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_cloudtrail_window(storage, {
+        "mode": "lookup_events", "window_days": 90, "max_pages": 200,
+        "truncated": True, "coverage_start": None,
+    })
+    r = normalize(storage, RUN)[0]
+    assert r.observed_days is None
+    assert r.observed_from is None
+
+
+def test_observed_window_unknown_for_legacy_and_disabled_cloudtrail(tmp_path) -> None:
+    """구버전 raw(window_days 없음)·CloudTrail 미사용(mode!=lookup_events) → 관측 구간 없음."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_cloudtrail_window(storage, {"mode": "lookup_events", "truncated": False})
+    assert normalize(storage, RUN)[0].observed_days is None
+
+    storage2 = LocalFSStorage(tmp_path / "b", "test", "run-fixed")
+    _seed_cloudtrail_window(storage2, {"mode": "none", "window_days": 90, "truncated": False})
+    assert normalize(storage2, RUN)[0].observed_days is None

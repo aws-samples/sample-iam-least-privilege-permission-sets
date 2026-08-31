@@ -26,8 +26,15 @@ from .models import PolicyArtifact
 COMMON_NOTES = [
     "정책의 Resource 는 \"*\" 입니다 — action 만 최소화했고 리소스 범위는 좁히지 않았습니다. "
     "운영 반영 전에 리소스 조건을 좁히는 것을 권장합니다.",
-    "이 정책은 이 persona 멤버 **전원의 실사용 action 합집합**입니다 — 개별 멤버에게는 필요 이상일 수 "
-    "있으나 부족하지는 않습니다.",
+    "이 정책은 이 persona 멤버 **전원의 관측된 실사용 action 합집합**입니다 — 개별 멤버에게는 필요 "
+    "이상일 수 있습니다.",
+    # 종전 문구는 "부족하지는 않습니다" 라고 **보장**했다. 근거가 없다: 합집합은 관측 창 안에서
+    # 수집된 것뿐이고, CloudTrail LookupEvents 는 관리 이벤트만·페이지 상한이 있으며(요청한 창보다
+    # 짧게 덮인다), 데이터 이벤트는 기본 미기록, Access Advisor 가 추적하지 않는 action 도 있다.
+    # 이 문장을 지우면 apply 후 권한 부족 장애의 책임 소재가 도구 쪽으로 넘어온다.
+    "**부족할 수 있습니다**: 관측 창(CloudTrail 페이지 상한·Access Advisor 추적 범위) 밖에서 쓴 "
+    "action, 데이터 이벤트(S3 객체 접근 등 — 기본 미기록), 추적되지 않는 action 은 합집합에 없습니다. "
+    "운영 반영 전 스테이징에서 검증하세요.",
     "다른 계정에 반영할 때는 계정마다 apply 하세요(provider alias 또는 Terraform workspace). "
     "LP2PS 는 계정 간 apply 를 수행하지 않습니다.",
 ]

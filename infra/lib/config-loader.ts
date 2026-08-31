@@ -52,12 +52,15 @@ export interface RiskRulesConfig {
 
 export interface CollectionConfig {
   cloudtrail_max_pages?: number;
+  cloudtrail_window_days?: number;
 }
 
 export interface CatalogClusterConfig {
   min_members_for_persona?: number;
-  confidence_access_analyzer?: number;
-  confidence_fallback?: number;
+  // 접근 성격(Admin/Write/ReadOnly) 판정 임계치. 코드 리터럴이 아니라 config 여야 한다(불변식 ④).
+  admin_min_services_with_identity?: number;
+  admin_min_services?: number;
+  write_ratio_threshold?: number;
 }
 
 export interface PermissionSetConfig {

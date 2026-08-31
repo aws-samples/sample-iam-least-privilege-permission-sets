@@ -116,7 +116,8 @@ POLICY
 // 되지만, 탭 라벨·target·notes 갯수 같은 **계약**은 맞춰야 화면 검증이 의미가 있다.
 const MOCK_COMMON_NOTES = [
   '정책의 Resource 는 "*" 입니다 — action 만 최소화했고 리소스 범위는 좁히지 않았습니다. 운영 반영 전에 리소스 조건을 좁히는 것을 권장합니다.',
-  "이 정책은 이 persona 멤버 전원의 실사용 action 합집합입니다 — 개별 멤버에게는 필요 이상일 수 있으나 부족하지는 않습니다.",
+  "이 정책은 이 persona 멤버 전원의 관측된 실사용 action 합집합입니다 — 개별 멤버에게는 필요 이상일 수 있습니다.",
+  "**부족할 수 있습니다**: 관측 창(CloudTrail 페이지 상한·Access Advisor 추적 범위) 밖에서 쓴 action, 데이터 이벤트(S3 객체 접근 등 — 기본 미기록), 추적되지 않는 action 은 합집합에 없습니다. 운영 반영 전 스테이징에서 검증하세요.",
   "다른 계정에 반영할 때는 계정마다 apply 하세요(provider alias 또는 Terraform workspace). LP2PS 는 계정 간 apply 를 수행하지 않습니다.",
 ];
 
@@ -219,7 +220,9 @@ const mockApi: Api = {
           sources: [
             { source: "access_advisor", status: "ok", note: "" },
             { source: "analyzer_unused", status: "skipped", note: "unused-access analyzer 미존재 — Access Advisor 로 대체(정상)" },
-            { source: "cloudtrail", status: "ok", note: "LookupEvents(90d) 관리 이벤트 기반." },
+            // 엔진 note 형식과 맞춘다(collectors/cloudtrail.py): 요청한 창과 **실제로 덮은** 구간을
+            // 구분해 말한다. "90d" 라고만 쓰면 90일을 훑은 것처럼 읽힌다.
+            { source: "cloudtrail", status: "ok", note: "LookupEvents(90일 요청) 관리 이벤트 기반. 데이터 이벤트는 미포함(Access Advisor 로 보완). 페이지 상한(200) 도달 — 이 계정의 CloudTrail 근거는 최근 3일이다(더 긴 기간의 미사용 판정은 Access Advisor 가 담당)." },
             { source: "credential_report", status: "ok", note: "" },
             { source: "idc_permission_sets", status: "ok", note: "" },
           ],

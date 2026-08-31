@@ -28,7 +28,7 @@ DOC = {
         {"Effect": "Allow", "Action": ["s3:GetObject", "glue:StartJobRun"], "Resource": "*"}
     ],
     # 메타 키 — 산출물에 새어나가면 apply 시 IAM 이 거부한다.
-    "_lp2ps": {"synthesis_source": "access_analyzer"},
+    "_lp2ps": {"synthesis_source": "last_accessed_evidence"},
 }
 EMPTY_DOC = {"Version": "2012-10-17", "Statement": []}
 

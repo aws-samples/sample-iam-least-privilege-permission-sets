@@ -13,6 +13,8 @@ M3 를 그 결과로 업그레이드(추후). 각 규칙은 MITRE ATT&CK 전술 
 
 from __future__ import annotations
 
+import re
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from .models import EscalationPath, PrincipalRecord
@@ -22,7 +24,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .storage import Storage
 
 # 규칙: (필요 action 집합, via 설명, 도달 대상, MITRE 전술).
-# action 은 정확 일치 또는 서비스 와일드카드('iam:*') 매칭. 모두 만족해야 hit.
+# action 은 정확 일치 또는 IAM 와일드카드 패턴('iam:*', 'iam:Create*', '*') 매칭. 모두 만족해야 hit.
 # MITRE: TA0004=Privilege Escalation, TA0003=Persistence.
 _RULES: tuple[tuple[frozenset[str], str, str, str], ...] = (
     (frozenset({"iam:CreateRole", "iam:AttachRolePolicy"}), "iam:CreateRole + AttachRolePolicy", "new-admin-role", "TA0004"),
@@ -71,18 +73,33 @@ def detect_escalations(storage: "Storage", run: "RunContext") -> list[PrincipalR
     return records
 
 
+@lru_cache(maxsize=4096)
+def _glob(pattern: str) -> re.Pattern[str]:
+    """IAM action 와일드카드 패턴 → 컴파일된 정규식(소문자 비교용).
+
+    IAM 은 action 매칭에서 대소문자를 구분하지 않고 `*`(0자 이상)·`?`(1자)만 와일드카드로 본다.
+    `fnmatch` 는 `[seq]` 문자클래스도 해석해 IAM 문법과 어긋나므로 직접 변환한다.
+    """
+    parts = ".*".join(
+        ".".join(re.escape(chunk) for chunk in segment.split("?"))
+        for segment in pattern.lower().split("*")
+    )
+    return re.compile(f"^{parts}$")
+
+
 def _paths_for(rec: PrincipalRecord) -> list[EscalationPath]:
     """principal 의 granted action 집합으로 매칭되는 상승경로 규칙을 찾는다(안정 정렬)."""
-    granted = set(rec.granted_actions)
-    # 와일드카드 확장: 'iam:*' 또는 '*' 는 모든 필요 action 을 만족시킨다.
-    has_full_wildcard = "*" in granted
-    service_wildcards = {a.split(":", 1)[0] for a in granted if a.endswith(":*")}
+    granted_exact = {a.lower() for a in rec.granted_actions if "*" not in a and "?" not in a}
+    # 와일드카드 패턴은 IAM 정책 문법(`*`=0자 이상, `?`=1자)으로 매칭한다.
+    # 관리형 정책 문서를 수집하기 시작하면서 'iam:Create*' 같은 **접두 와일드카드**가 실제로
+    # 들어온다 — 서비스 와일드카드('iam:*')만 확장하면 그런 정책을 놓친다.
+    patterns = [_glob(a) for a in rec.granted_actions if "*" in a or "?" in a]
 
     def _satisfied(action: str) -> bool:
-        if has_full_wildcard or action in granted:
+        lowered = action.lower()
+        if lowered in granted_exact:
             return True
-        service = action.split(":", 1)[0]
-        return service in service_wildcards
+        return any(p.match(lowered) for p in patterns)
 
     paths: list[EscalationPath] = []
     for needed, via, to, mitre in _RULES:

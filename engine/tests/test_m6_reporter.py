@@ -341,3 +341,101 @@ def test_sec018_backlog_escapes_injection(tmp_path):
     rows = list(csv.DictReader(io.StringIO(st.read_bytes(BACKLOG_NAME).decode())))
     assert rows[0]["id"].startswith("'="), "= 로 시작하는 id 는 ' 로 무력화돼야 함"
     assert rows[0]["detail"].startswith("'="), "= 로 시작하는 detail 은 ' 로 무력화돼야 함"
+
+
+# ---- 신규 역할은 '미사용 역할' 이 아니다 ----
+#
+# 라이브 575 에서 미사용 판정 59건 중 16건이 생성 90일 미만, 3건은 **당일 생성**이었다. 그런데
+# 백로그는 "미사용 역할 — 역할 삭제" 를 권했고 화면은 "90일 사용 action 0" 이라고 적었다. 그 90일은
+# 어디서도 측정되지 않았고, 어제 만든 역할에 사용 기록이 없는 건 당연하다. 배포 중인 역할을
+# 지우라고 권하는 것이라 유형을 갈라 둔다(new_role_unused, 삭제 권고 없음).
+
+
+def _rows_of_type(st, recs, ctype: str) -> list[dict]:
+    st.write_normalized(recs)
+    st.write_json("catalog.json", [])
+    build_reports(st, RUN, _cfg())
+    return [r for r in csv.DictReader(io.StringIO(st.read_bytes(BACKLOG_NAME).decode()))
+            if r["type"] == ctype]
+
+
+def test_new_role_is_not_recommended_for_deletion(tmp_path):
+    """생성 후 unused_action_days 미만인 미사용 역할 → new_role_unused + 삭제 권고 없음."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    rec = _role_rec(used_actions=[], used_services=[],
+                    create_date="2026-07-12T00:00:00+00:00", age_days=3)
+    rows = _rows_of_type(st, [rec], "new_role_unused")
+    assert len(rows) == 1, "3일 된 역할이 '미사용 역할' 로 분류되면 안 된다"
+    assert "삭제 권고 아님" in rows[0]["recommendation"]
+    assert "관측 기간" in rows[0]["detail"]
+    # 같은 레코드가 unused_role 로도 나오면 안 된다(이중 계상).
+    assert _rows_of_type(st, [rec], "unused_role") == []
+
+
+def test_old_unused_role_still_recommends_deletion(tmp_path):
+    """대조군 — 충분히 오래된 미사용 역할은 그대로 삭제 후보다.
+
+    이 대조가 없으면 위 테스트는 '전부 new_role_unused 로 밀어버려도' 통과한다. 그러면 이 도구의
+    본래 산출물(미사용 역할 정리)이 통째로 사라진다.
+    """
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    rec = _role_rec(used_actions=[], used_services=[],
+                    create_date="2025-01-01T00:00:00+00:00", age_days=560)
+    rows = _rows_of_type(st, [rec], "unused_role")
+    assert len(rows) == 1
+    assert "역할 삭제" in rows[0]["recommendation"]
+    assert _rows_of_type(st, [rec], "new_role_unused") == []
+
+
+def test_unknown_age_does_not_change_judgment(tmp_path):
+    """나이를 모르면(구버전 raw) 판정을 바꾸지 않고 증거에 '확인 불가' 로 남긴다.
+
+    모른다는 이유로 조치 대상을 늘리거나 줄이면, 근거가 없는 쪽으로 결론이 흔들린다.
+    """
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    rows = _rows_of_type(st, [_role_rec(used_actions=[], used_services=[])], "unused_role")
+    assert len(rows) == 1
+    evidence = json.loads(rows[0]["evidence"])
+    assert evidence["생성 후 경과"] == "확인 불가"
+    assert evidence["역할 생성일"] == "미수집"
+
+
+def test_unused_role_evidence_states_measured_window(tmp_path):
+    """증거는 '90일' 이라고 쓰지 않는다 — CloudTrail 실측 일수 + Advisor 는 AWS 사양임을 밝힌다."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    rec = _role_rec(used_actions=[], used_services=[], age_days=560,
+                    create_date="2025-01-01T00:00:00+00:00", observed_days=2,
+                    observed_from="2026-07-13T00:00:00+00:00")
+    rows = _rows_of_type(st, [rec], "unused_role")
+    evidence = json.loads(rows[0]["evidence"])
+    assert "CloudTrail 2일" in evidence["사용 근거"]
+    assert "AWS 사양" in evidence["사용 근거"], "측정하지 않은 400일을 실측처럼 적으면 안 된다"
+    assert evidence["삭제 판단 최소 경과"] == "90일"  # config risk_rules.unused_action_days
+    assert "CloudTrail 2일" in rows[0]["detail"]
+
+
+def test_unused_role_evidence_says_no_cloudtrail_when_absent(tmp_path):
+    """대조군 — CloudTrail 근거가 없으면 일수를 말하지 않고 '근거 없음' 이라고 쓴다."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    rec = _role_rec(used_actions=[], used_services=[], age_days=560,
+                    create_date="2025-01-01T00:00:00+00:00")
+    rows = _rows_of_type(st, [rec], "unused_role")
+    evidence = json.loads(rows[0]["evidence"])
+    # CloudTrail 부분은 일수를 포함하지 않아야 한다 — "CloudTrail None일" 같은 값이 새면 안 된다.
+    ct_part = evidence["사용 근거"].split(" + Access Advisor")[0]
+    assert ct_part == "없음(CloudTrail 근거 없음", ct_part
+
+
+def test_snapshot_splits_new_roles_out_of_unused_roles(tmp_path):
+    """대시보드 지표도 같은 기준으로 갈라야 한다 — 백로그와 어긋나면 사용자가 수를 재현할 수 없다."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    old = _role_rec(principal="arn:aws:iam::111122223333:role/old", used_actions=[],
+                    used_services=[], create_date="2025-01-01T00:00:00+00:00", age_days=560)
+    new = _role_rec(principal="arn:aws:iam::111122223333:role/new", used_actions=[],
+                    used_services=[], create_date="2026-07-12T00:00:00+00:00", age_days=3)
+    st.write_normalized([old, new])
+    st.write_json("catalog.json", [])
+    build_reports(st, RUN, _cfg())
+    point = write_snapshot(st, RUN, account_scope=1, status="succeeded")
+    assert point.unused_roles == 1, "신규 역할이 섞이면 조치 가능 건수가 부풀려진다"
+    assert point.new_unused_roles == 1

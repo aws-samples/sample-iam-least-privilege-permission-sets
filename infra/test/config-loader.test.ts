@@ -46,10 +46,14 @@ const full = loadConfig(
     BASE +
       `collection:
   cloudtrail_max_pages: 400
+  cloudtrail_window_days: 30
 risk_rules:
   unused_action_days: 45
 catalog:
   min_members_for_persona: 3
+  admin_min_services_with_identity: 12
+  admin_min_services: 40
+  write_ratio_threshold: 0.3
 permission_sets:
   session_duration: PT4H
 `,
@@ -58,11 +62,18 @@ permission_sets:
 assert(full.collection?.cloudtrail_max_pages === 400, "collection.cloudtrail_max_pages 가 로더를 통과한다");
 assert(full.risk_rules?.unused_action_days === 45, "risk_rules 가 로더를 통과한다");
 assert(full.catalog?.min_members_for_persona === 3, "catalog 가 로더를 통과한다");
+// 아래 4개는 최근에 코드 리터럴에서 config 로 옮긴 값들이다(불변식 ④). 로더에 필드를 추가하지 않으면
+// yaml 에 써도 조용히 사라져 엔진이 기본값으로 돌아간다 — 그 실패는 라이브에서만 드러난다.
+assert(full.collection?.cloudtrail_window_days === 30, "collection.cloudtrail_window_days 가 로더를 통과한다");
+assert(full.catalog?.admin_min_services_with_identity === 12, "catalog.admin_min_services_with_identity 가 통과한다");
+assert(full.catalog?.admin_min_services === 40, "catalog.admin_min_services 가 통과한다");
+assert(full.catalog?.write_ratio_threshold === 0.3, "catalog.write_ratio_threshold 가 통과한다");
 assert(full.permission_sets?.session_duration === "PT4H", "permission_sets 가 로더를 통과한다");
 
 // Lambda 로 실제 전달되는 형태(JSON) 에도 남아 있어야 한다 — 엔진은 이 문자열만 본다.
 const inline = JSON.parse(JSON.stringify(full));
 assert(inline.collection?.cloudtrail_max_pages === 400, "직렬화된 LP2PS_CONFIG_INLINE 에 collection 이 남는다");
+assert(inline.catalog?.write_ratio_threshold === 0.3, "직렬화된 LP2PS_CONFIG_INLINE 에 catalog 임계치가 남는다");
 
 // --- 대조군: yaml 에 없으면 키를 만들지 않는다 ---
 const bare = loadConfig(writeConfig(BASE));

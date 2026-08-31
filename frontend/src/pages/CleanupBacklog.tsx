@@ -33,6 +33,7 @@ const PAGE_TITLE = "조치 필요 항목";
 const TYPE_LABEL: Record<CleanupType, string> = {
   unused_permission: "미사용 권한",
   unused_role: "미사용 역할",
+  new_role_unused: "신규 역할(관측 기간 부족)",
   long_lived_key: "장기 액세스키",
   no_mfa: "MFA 미설정",
   escalation_path: "상승 경로",
@@ -187,7 +188,7 @@ interface Group {
   dist: Record<RiskLevel, number>; // 미조치 항목의 위험도 분포(남은 위험)
 }
 
-const VALID_TYPES: CleanupType[] = ["unused_permission", "unused_role", "long_lived_key", "no_mfa", "escalation_path"];
+const VALID_TYPES: CleanupType[] = ["unused_permission", "unused_role", "new_role_unused", "long_lived_key", "no_mfa", "escalation_path"];
 
 export default function CleanupBacklog() {
   const { data, loading, reload } = useAsync<CleanupItem[]>(() => api.getCleanup());

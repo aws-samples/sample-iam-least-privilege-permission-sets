@@ -1,6 +1,6 @@
 """CloudTrail 수집 — 실제 사용 이벤트(누가 어떤 API 를 언제).
 
-**LookupEvents(90d) 단일 소스.** 기본 CloudTrail 의 LookupEvents 로 관리 이벤트(management events)를
+**LookupEvents 단일 소스.** 기본 CloudTrail 의 LookupEvents 로 관리 이벤트(management events)를
 집계한다. CloudTrail Lake(Event Data Store)는 **사용하지 않는다** — Lake 는 수집·저장·조회 비용이
 추가되고, 이 도구는 실시간이 아니라 배치 분석이라 무료 LookupEvents 로 충분하다(고객 비용 부담 회피).
 
@@ -9,8 +9,13 @@
 최소권한 분석에 충분하므로 LookupEvents 정상 수집을 **ok** 로 본다(Lake 없음은 더 이상 저하 아님).
 
 read-only: `LookupEvents` 는 allowlist 접두(가드 통과). 계정 미변경.
-결정론: 90일 창은 `context["as_of"]`(run.started_at 파생) 기준 — collector 는 `datetime.now()`
+결정론: 소급 창은 `context["as_of"]`(run.started_at 파생) 기준 — collector 는 `datetime.now()`
 를 호출하지 않는다(불변식 ②). as_of 미제공 시 시간 필터 없이 최근 이벤트만.
+
+**요청한 창 ≠ 덮은 창.** `collection.cloudtrail_window_days`(기본 90) 를 StartTime 으로 요청하지만
+페이지 상한에 걸리면 실제로 덮는 구간은 며칠로 줄어든다(라이브 575: 400페이지 = 2.5일). raw 는
+요청값(`window_days`)과 실측값(`coverage_start`·`truncated`)을 **둘 다** 싣는다 — 하류가 요청값을
+관측값처럼 표시하면 화면이 측정하지 않은 숫자를 주장하게 된다.
 """
 
 from __future__ import annotations
@@ -29,6 +34,8 @@ if TYPE_CHECKING:  # pragma: no cover
 
 SOURCE = "cloudtrail"
 
+# 소급 창 기본값(일). 실제 값은 `config.collection.cloudtrail_window_days` 에서 오고
+# 이 상수는 context 에 값이 없을 때의 폴백일 뿐이다(불변식 ④ — 임계치는 config).
 _WINDOW_DAYS = 90
 # 페이지 상한 기본값(계정·리전당). 실제 값은 `config.collection.cloudtrail_max_pages` 에서 오고
 # 이 상수는 context 에 값이 없을 때의 폴백일 뿐이다(불변식 ④ — 임계치는 config).
@@ -50,28 +57,32 @@ class CloudTrailCollector(Collector):
     def collect(self, account: "AccountSession", context: dict) -> CollectorResult:
         as_of = _parse_as_of(context.get("as_of"))
         max_pages = int(context.get("cloudtrail_max_pages") or _LOOKUP_MAX_PAGES)
+        window_days = int(context.get("cloudtrail_window_days") or _WINDOW_DAYS)
 
         try:
             ct = account.client("cloudtrail")
-            events, truncated, coverage_start = _lookup_events(ct, as_of, max_pages)
+            events, truncated, coverage_start = _lookup_events(ct, as_of, max_pages, window_days)
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "Unknown")
             return CollectorResult(
                 source=SOURCE,
                 status="skipped",
-                data={"account_id": account.account_id, "mode": "none", "usage": []},
+                data={"account_id": account.account_id, "mode": "none", "usage": [],
+                      "truncated": False, "coverage_start": None,
+                      "window_days": window_days, "max_pages": max_pages},
                 note=f"CloudTrail LookupEvents 사용 불가({code}) — 정규화 단계는 Access Advisor 에만 의존",
             )
 
         # 수집되면 항상 ok — LookupEvents 는 관리 이벤트만 주는 부분 소스이고 Access Advisor 가
         # 보완하므로 '가능한 만큼=정상'. 상한 도달(truncated)은 note 로만 알림(상태는 ok).
-        note = "LookupEvents(90d) 관리 이벤트 기반. 데이터 이벤트는 미포함(Access Advisor 로 보완)."
+        note = (f"LookupEvents({window_days}일 요청) 관리 이벤트 기반. "
+                f"데이터 이벤트는 미포함(Access Advisor 로 보완).")
         if truncated:
             # 실제로 덮은 기간을 말한다 — "일부 미수집" 만으로는 그게 89일인지 하루인지 알 수 없고,
             # 활동이 많은 계정에서는 실제로 하루 수준이 된다. 최신순 수집이라 잘린 쪽은 과거다.
             span = _coverage_span(coverage_start, as_of)
             note += (f" 페이지 상한({max_pages}) 도달 — 이 계정의 CloudTrail 근거는 {span}이다"
-                     f"(90일 미사용 판정은 Access Advisor 가 담당).")
+                     f"(더 긴 기간의 미사용 판정은 Access Advisor 가 담당).")
         return CollectorResult(
             source=SOURCE,
             status="ok",
@@ -80,6 +91,9 @@ class CloudTrailCollector(Collector):
                   # 관측한 가장 오래된 이벤트 시각. 이벤트에서 파생된 값이라 wall-clock 이 아니다
                   # (불변식 ②). 소비자는 이걸로 CloudTrail 근거의 유효 창을 알 수 있다.
                   "coverage_start": coverage_start,
+                  # 요청한 창. truncated=False 면 이 창을 끝까지 훑었다는 뜻이므로 하류가
+                  # 관측 구간으로 쓸 수 있다. truncated=True 면 coverage_start 가 실측값이다.
+                  "window_days": window_days,
                   "max_pages": max_pages,
                   "usage": events},
             note=note,
@@ -97,10 +111,10 @@ def _parse_as_of(as_of) -> datetime | None:
         return None
 
 
-def _window_start(as_of: datetime | None) -> datetime | None:
+def _window_start(as_of: datetime | None, window_days: int) -> datetime | None:
     if as_of is None:
         return None
-    return as_of - timedelta(days=_WINDOW_DAYS)
+    return as_of - timedelta(days=window_days)
 
 
 def _coverage_span(coverage_start: str | None, as_of: datetime | None) -> str:
@@ -121,7 +135,9 @@ def _coverage_span(coverage_start: str | None, as_of: datetime | None) -> str:
     return f"최근 {int(hours // 24)}일분"
 
 
-def _lookup_events(ct, as_of: datetime | None, max_pages: int) -> tuple[list[dict], bool, str | None]:
+def _lookup_events(
+    ct, as_of: datetime | None, max_pages: int, window_days: int = _WINDOW_DAYS
+) -> tuple[list[dict], bool, str | None]:
     """LookupEvents — (집계 행 목록, 페이지 상한 도달 여부, 관측 최고(最古) 시각) 반환.
 
     (principal, event_name) 별 카운트/최근시각 집계.
@@ -133,7 +149,7 @@ def _lookup_events(ct, as_of: datetime | None, max_pages: int) -> tuple[list[dic
       - IAMUser/Root → userIdentity.arn
       - AWSService 등 → principal 없음(스킵)
     """
-    start = _window_start(as_of)
+    start = _window_start(as_of, window_days)
     kwargs: dict = {}
     if start is not None:
         kwargs["StartTime"] = start
@@ -185,7 +201,7 @@ def _lookup_events(ct, as_of: datetime | None, max_pages: int) -> tuple[list[dic
         pages += 1
         next_token = page.get("NextToken")
         if not next_token:
-            break  # 마지막 페이지 — 90일 창 전체 수집 완료.
+            break  # 마지막 페이지 — 요청한 창 전체 수집 완료.
         if pages >= max_pages:
             truncated = True  # 상한 도달, 후속 토큰 남음 → 더 과거 일부 미수집.
             break
