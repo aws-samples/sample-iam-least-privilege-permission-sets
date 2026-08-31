@@ -19,6 +19,11 @@ M1 수집 raw JSON 을 계정 단위로 읽어 principal 단위 `PrincipalRecord
   3. ns 는 인증했는데 A 가 추적 목록에 없다 → **판정 불가**. Access Advisor 의 action-level 추적은
      서비스·action 별로 지원 범위가 다르고, CloudTrail 은 관리 이벤트·단일 리전만 본다. 여기서
      "미사용" 이라고 부르면 실제로 쓰이는 권한을 지우라고 권하게 된다.
+  0. (위 3단보다 먼저) 이 principal 의 Access Advisor 근거가 **아예 없다** → **판정 불가**.
+     2번은 "advisor 가 이 principal 을 조회했고 그 서비스 인증 기록이 없었다" 일 때만 성립한다.
+     조회가 실패했거나 소스가 degraded 여서 데이터가 없는 것을 "서비스를 안 썼다" 로 읽으면,
+     근거 0인 상태에서 전 권한을 삭제 권고하게 된다(라이브 실행에서 실제로 1개 principal 이
+     이 경로로 '미사용 확정' 판정을 받았다). 근거 부재는 증거가 아니다.
 
 불변식 ②(결정론): as_of(run.started_at) 기준으로만 시간 계산, 안정 정렬, wall-clock 미사용.
 risk_score/risk_level/persona 등은 후속 모듈(m4/m5)이 채운다 — 여기선 계약 기본값.
@@ -160,7 +165,7 @@ def _normalize_account(
 
     used_by_arn, used_sources_by_arn = _used_actions_by_principal(raw)
     analyzer_by_arn = _analyzer_findings_by_principal(raw.get(ANALYZER, {}))
-    authed_svcs_by_arn, tracked_by_arn_svc = _advisor_evidence(raw.get(ADVISOR, {}))
+    authed_svcs_by_arn, tracked_by_arn_svc, advisor_covered = _advisor_evidence(raw.get(ADVISOR, {}))
 
     # principal 집합 = 인벤토리 ∪ used ∪ analyzer. credential_report 가 degraded 여도 다른 소스가
     # 본 principal 은 최소 레코드로 살린다(그렇지 않으면 이 소스 하나 실패로 전체가 비어버림).
@@ -179,10 +184,15 @@ def _normalize_account(
         authed_svcs = authed_svcs_by_arn.get(arn, frozenset())
         confirmed_unused: list[str] = []
         undetermined: list[str] = []
+        # advisor 근거가 없는 principal 은 ②(서비스 미인증)를 주장할 수 없다 — 근거 부재와
+        # "안 썼다는 근거" 는 다르다. 이 principal 은 전부 판정 불가로 간다.
+        has_advisor = arn in advisor_covered
         for action in gap:
             ns, _, name = action.partition(":")
             if name in tracked_by_arn_svc.get((arn, ns), frozenset()):
                 confirmed_unused.append(action)   # ① AWS 가 추적 중인데 기록 없음
+            elif not has_advisor:
+                undetermined.append(action)       # ⓞ advisor 근거 자체가 없음(조회 실패·소스 degraded)
             elif ns not in authed_svcs:
                 confirmed_unused.append(action)   # ② 서비스 자체를 인증한 적 없음
             else:
@@ -360,24 +370,33 @@ def _is_wildcard(action: str) -> bool:
 # ---- advisor 근거 인덱스(미사용 확정 vs 판정 불가 판별용) ----
 def _advisor_evidence(
     advisor_raw: dict,
-) -> tuple[dict[str, frozenset[str]], dict[tuple[str, str], frozenset[str]]]:
-    """Access Advisor raw → (principal→인증한 서비스 집합, (principal,서비스)→추적 action 이름 집합).
+) -> tuple[dict[str, frozenset[str]], dict[tuple[str, str], frozenset[str]], frozenset[str]]:
+    """Access Advisor raw → (principal→인증한 서비스 집합, (principal,서비스)→추적 action 이름 집합,
+    advisor 근거가 실제로 있는 principal 집합).
 
     두 값의 역할이 다르다:
       - 인증한 서비스(`last_authenticated` 존재): "이 서비스를 썼다" 는 증거. action 세부를 못 줘도
         남는다 → 미사용 판정을 막는 근거.
+      - 근거 있는 principal(covered): advisor 응답에 **서비스 행이 하나라도** 있는 principal.
+        AWS 는 정상 응답이면 계정이 접근 가능한 서비스 목록 전체를 돌려주므로, 서비스 행이 0개인
+        entry 는 "안 썼다" 가 아니라 "못 받았다"(조회 실패·잡 미완료)다. 이걸 구분하지 않으면
+        근거 0인 principal 의 전 권한이 '미사용 확정' 이 된다.
       - 추적 action 이름: `TrackedActionsLastAccessed` 에 **올라온 이름 전체**(last_accessed 가 비어
         있는 것도 포함). AWS 가 추적하는 action 인지 여부를 알려주므로, 기록 없음을 "안 썼다" 로
         확정할 수 있는지 가른다. 목록에 아예 없는 action 은 추적 대상이 아니라 근거가 없는 것이다.
     """
     authed: dict[str, frozenset[str]] = {}
     tracked: dict[tuple[str, str], frozenset[str]] = {}
+    covered: set[str] = set()
     for entry in advisor_raw.get("last_accessed", []) or []:
         arn = entry.get("principal", "")
         if not arn:
             continue
+        rows = entry.get("services", []) or []
+        if rows:
+            covered.add(arn)
         svcs: set[str] = set()
-        for svc in entry.get("services", []) or []:
+        for svc in rows:
             ns = svc.get("service", "")
             if not ns:
                 continue
@@ -388,7 +407,7 @@ def _advisor_evidence(
             if names:
                 tracked[(arn, ns)] = frozenset(names)
         authed[arn] = frozenset(svcs)
-    return authed, tracked
+    return authed, tracked, frozenset(covered)
 
 
 # ---- used actions (access advisor ∪ cloudtrail) ----

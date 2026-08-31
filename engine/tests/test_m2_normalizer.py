@@ -206,6 +206,36 @@ def test_gap_in_never_authenticated_service_is_unused(tmp_path) -> None:
     assert r.used_services == []
 
 
+def test_no_advisor_coverage_is_undetermined_not_unused(tmp_path) -> None:
+    """advisor 응답의 서비스 행이 0개면(조회 실패·잡 미완료) 그 principal 은 전부 판정 불가.
+
+    라이브 실행에서 실제로 새어나간 경로다: 142개 중 1개 principal 의 Access Advisor 조회가 실패했고,
+    데이터가 없으니 "서비스를 인증한 적 없다"(②)로 읽혀 granted 전부가 '미사용 확정' 이 됐다.
+    소스 전체가 실패하면 전 계정의 전 권한에 삭제 권고가 붙는다 — 근거 부재는 증거가 아니다.
+    """
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_one_role(storage, ["s3:GetObject", "dynamodb:DeleteTable"], [])  # 조회 실패 재현
+    r = normalize(storage, RUN)[0]
+    assert r.unused_findings == []
+    assert r.undetermined_findings == ["dynamodb:DeleteTable", "s3:GetObject"]
+
+
+def test_advisor_coverage_with_no_authentication_stays_unused(tmp_path) -> None:
+    """대조: 같은 principal 에 advisor 서비스 행이 **있고** 인증 기록만 없으면 미사용 확정이다.
+
+    이 대조가 없으면 위 테스트는 '전부 판정 불가로 밀어버려도' 통과한다. 근거 있는 미사용 판정을
+    죽이면 도구의 본래 산출물(미사용 권한 정리)이 통째로 사라진다.
+    """
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_one_role(storage, ["s3:GetObject", "dynamodb:DeleteTable"], [
+        {"service": "s3", "last_authenticated": None, "actions": []},
+        {"service": "dynamodb", "last_authenticated": None, "actions": []},
+    ])
+    r = normalize(storage, RUN)[0]
+    assert r.unused_findings == ["dynamodb:DeleteTable", "s3:GetObject"]
+    assert r.undetermined_findings == []
+
+
 def test_analyzer_findings_are_labels_not_actions(tmp_path) -> None:
     """analyzer finding 은 finding_type 라벨이라 3단 판정과 겹치지 않는다.
 
@@ -263,7 +293,12 @@ def test_normalize_is_deterministic(tmp_path) -> None:
 
 
 def test_normalize_bare_account_no_used(tmp_path) -> None:
-    """used 소스가 전부 없어도(granted 만) 완주 — granted 전부가 미사용 갭."""
+    """used 소스가 전부 없어도(granted 만) 완주 — granted 전부가 갭.
+
+    단 그 갭은 **미사용 확정이 아니라 판정 불가**다: Access Advisor raw 가 아예 없으면
+    "이 서비스를 인증한 적 없다" 는 주장의 근거가 없다. 예전엔 이걸 미사용 확정으로 냈고,
+    그래서 advisor 조회가 실패한 principal 의 전 권한에 삭제 권고가 붙었다.
+    """
     storage = LocalFSStorage(tmp_path, "test", "run-fixed")
     storage.write_raw(
         ACCOUNT,
@@ -294,7 +329,8 @@ def test_normalize_bare_account_no_used(tmp_path) -> None:
     records = normalize(storage, RUN)
     r = records[0]
     assert r.used_actions == []
-    assert r.unused_findings == ["s3:GetObject"]
+    assert r.unused_findings == []
+    assert r.undetermined_findings == ["s3:GetObject"]
     assert r.source == ["credential_report"]
     assert r.access_key_age_days is None
 

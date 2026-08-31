@@ -64,9 +64,16 @@ class AccessAdvisorCollector(Collector):
         for arn, job_id in jobs:
             try:
                 services = _retrieve(iam, job_id)
-                entries.append({"principal": arn, "services": services})
             except ClientError:
                 failures += 1
+                continue
+            if not services:
+                # 잡이 아직 IN_PROGRESS 거나 FAILED 면 서비스 행이 비어 온다. 정상 응답은 계정이
+                # 접근 가능한 서비스 목록 전체를 담으므로 빈 목록은 "안 썼다" 가 아니라 "못 받았다"다.
+                # entry 로 실으면 M2 가 그 principal 의 전 권한을 '미사용 확정' 으로 읽는다.
+                failures += 1
+                continue
+            entries.append({"principal": arn, "services": services})
         entries.sort(key=lambda e: e["principal"])
 
         status = "ok"
