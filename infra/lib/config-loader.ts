@@ -50,6 +50,10 @@ export interface RiskRulesConfig {
   level_medium?: number;
 }
 
+export interface CollectionConfig {
+  cloudtrail_max_pages?: number;
+}
+
 export interface CatalogClusterConfig {
   min_members_for_persona?: number;
   confidence_access_analyzer?: number;
@@ -78,6 +82,7 @@ export interface Lp2psConfig {
   risk_rules?: RiskRulesConfig;
   catalog?: CatalogClusterConfig;
   permission_sets?: PermissionSetConfig;
+  collection?: CollectionConfig;
 }
 
 const DEFAULTS = {
@@ -116,6 +121,10 @@ export function loadConfig(configPath: string): Lp2psConfig {
   if (raw.risk_rules != null) cfg.risk_rules = raw.risk_rules as RiskRulesConfig;
   if (raw.catalog != null) cfg.catalog = raw.catalog as CatalogClusterConfig;
   if (raw.permission_sets != null) cfg.permission_sets = raw.permission_sets as PermissionSetConfig;
+  // collection 을 빠뜨리면 collector 가 모듈 기본값으로 **조용히** 폴백한다(수집은 성공하고 상태도
+  // ok 라 어디에도 안 드러난다). 실제로 그렇게 새어나갔다: config 에 400 을 넣고 배포했는데 라이브
+  // 실행의 소스 상태에는 "페이지 상한(200) 도달" 이 찍혔다 — 엔진 쪽 배선 테스트만으로는 못 잡는다.
+  if (raw.collection != null) cfg.collection = raw.collection as CollectionConfig;
 
   validate(cfg);
   return cfg;

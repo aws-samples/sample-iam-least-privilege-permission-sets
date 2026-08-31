@@ -11,7 +11,7 @@
     "synth": "cdk synth",
     "deploy": "cdk deploy",
     "destroy": "cdk destroy",
-    "test": "ts-node test/data-stack.test.ts && ts-node test/web-stack.test.ts && ts-node test/api-stack.test.ts && ts-node test/teardown.test.ts"
+    "test": "ts-node test/config-loader.test.ts && ts-node test/data-stack.test.ts && ts-node test/web-stack.test.ts && ts-node test/api-stack.test.ts && ts-node test/teardown.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
