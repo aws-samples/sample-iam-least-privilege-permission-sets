@@ -415,6 +415,11 @@ def _parquet_schema():
             ("access_key_age_days", pa.int64()),
             ("create_date", pa.string()),
             ("age_days", pa.int64()),
+            # IAM 이 추적한 역할 활동(RoleLastUsed) — 스키마에 없으면 정규화 라운드트립에서
+            # **조용히 사라진다**(미사용 기간 표기가 이 값에 걸려 있다).
+            ("role_last_used", pa.string()),
+            ("role_last_used_region", pa.string()),
+            ("unused_days", pa.int64()),
             ("observed_days", pa.int64()),
             ("observed_from", pa.string()),
             ("escalation_paths", pa.list_(escalation)),

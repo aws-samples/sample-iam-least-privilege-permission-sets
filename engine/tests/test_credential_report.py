@@ -289,3 +289,30 @@ def test_missing_create_date_stays_none(monkeypatch) -> None:
                     "Policies": [_admin_policy()]})
     r = _collect(iam, monkeypatch)
     assert r.data["principals"][0]["create_date"] is None
+
+
+def test_role_last_used_is_collected(monkeypatch) -> None:
+    """RoleLastUsed 는 같은 응답에 이미 온다 — 버리면 미사용 기간을 말할 근거가 사라진다.
+
+    이 값이 IAM 콘솔의 "Last activity" 이고 **전 리전**을 아우른다(CloudTrail 수집은 리전별).
+    """
+    role = _role(RoleLastUsed={"LastUsedDate": datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc),
+                               "Region": "ap-northeast-1"})
+    iam = _AuthIAM({"RoleDetailList": [role], "UserDetailList": [],
+                    "Policies": [_admin_policy()]})
+    p = _collect(iam, monkeypatch).data["principals"][0]
+    assert p["role_last_used"] == "2026-08-30T12:00:00+00:00"
+    assert p["role_last_used_region"] == "ap-northeast-1"
+
+
+def test_missing_role_last_used_stays_none(monkeypatch) -> None:
+    """대조군 — 활동 기록이 없으면 None. **부재가 정보다**(미사용 기간의 하한).
+
+    IAM 은 활동이 없던 역할에 RoleLastUsed 를 아예 안 실어 보내거나 빈 dict 로 보낸다. 어느
+    쪽이든 생성일 같은 다른 값으로 메꾸면 "이 날 썼다" 는 거짓을 화면이 주장한다.
+    """
+    iam = _AuthIAM({"RoleDetailList": [_role(), _role(RoleLastUsed={})], "UserDetailList": [],
+                    "Policies": [_admin_policy()]})
+    for p in _collect(iam, monkeypatch).data["principals"]:
+        assert p["role_last_used"] is None
+        assert p["role_last_used_region"] is None

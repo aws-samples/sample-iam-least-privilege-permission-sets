@@ -624,6 +624,45 @@ def test_age_days_none_when_create_date_missing(tmp_path) -> None:
     assert r.age_days is None
 
 
+def _seed_role_last_used(storage: LocalFSStorage, last_used: str | None, region: str | None) -> None:
+    storage.write_raw(ACCOUNT, "credential_report", {
+        "account_id": ACCOUNT,
+        "principals": [{
+            "principal": ARN, "name": "data-eng", "identity_type": "role",
+            "create_date": "2026-01-01T00:00:00+00:00",
+            "role_last_used": last_used, "role_last_used_region": region,
+            "inline_policies": [{"name": "inline", "document": _doc("s3:GetObject")}],
+            "attached_policies": [], "path": "/",
+        }],
+        "credential_report": [],
+    })
+
+
+def test_role_last_used_passthrough_and_unused_days(tmp_path) -> None:
+    """IAM 활동 기록은 그대로 보존하고, 미사용 일수는 as_of 기준으로 센다(wall-clock 금지)."""
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_role_last_used(storage, "2026-07-01T00:00:00+00:00", "ap-northeast-1")  # RUN=2026-07-15
+    r = normalize(storage, RUN)[0]
+    assert r.role_last_used == "2026-07-01T00:00:00+00:00"
+    assert r.role_last_used_region == "ap-northeast-1"
+    assert r.unused_days == 14
+
+
+def test_unused_days_none_when_no_iam_record(tmp_path) -> None:
+    """대조군 — 활동 기록이 없으면 unused_days 도 None.
+
+    생성일로 메꾸면(age_days 재사용) "이만큼 안 썼다" 를 실측처럼 주장하게 된다. 하한 서술은
+    소비자(m6_reporter._unused_period)의 몫이고, 여기서 숫자를 만들지 않는다.
+    """
+    storage = LocalFSStorage(tmp_path, "test", "run-fixed")
+    _seed_role_last_used(storage, None, None)
+    r = normalize(storage, RUN)[0]
+    assert r.role_last_used is None
+    assert r.role_last_used_region is None
+    assert r.unused_days is None
+    assert r.age_days == 195, "생성 후 경과는 그대로 계산돼야 한다(대조)"
+
+
 def _seed_cloudtrail_window(storage: LocalFSStorage, ct: dict) -> None:
     _seed_role_with_create_date(storage, "2026-01-01T00:00:00+00:00")
     storage.write_raw(ACCOUNT, "cloudtrail", {"account_id": ACCOUNT, "usage": [], **ct})

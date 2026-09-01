@@ -149,6 +149,13 @@ def _role_record(role: dict) -> dict:
         # 생성일. "실사용 기록 없음" 을 "안 쓰는 역할이라 삭제하라" 로 읽으려면 관측 가능 기간이
         # 있어야 한다 — 어제 만든 역할에 기록이 없는 건 당연하고, 삭제 근거가 아니다.
         "create_date": _iso(role.get("CreateDate")),
+        # IAM 자신이 추적하는 역할 활동 시각(`RoleLastUsed`). 같은 응답에 이미 들어 있어 추가 호출도
+        # 추가 권한도 없는데 그동안 버리고 있었다. 이 값이 우리가 가진 가장 넓은 사용 근거다:
+        # **전 리전**을 아우르고(CloudTrail LookupEvents 는 리전별·페이지 상한), 콘솔의
+        # "Last activity" 가 바로 이 값이다. 없으면 추적 창 안에 활동이 없었다는 뜻이므로
+        # "얼마나 안 쓰였나" 의 하한을 준다 — 값 부재 자체가 정보다.
+        "role_last_used": _iso((role.get("RoleLastUsed") or {}).get("LastUsedDate")),
+        "role_last_used_region": (role.get("RoleLastUsed") or {}).get("Region") or None,
         "inline_policies": _inline(role.get("RolePolicyList", [])),
         "attached_policies": _attached(role.get("AttachedManagedPolicies", [])),
         "path": role.get("Path", "/"),

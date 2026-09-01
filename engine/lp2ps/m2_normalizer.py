@@ -254,7 +254,10 @@ def _normalize_account(
                 has_managed_policies=has_managed,
                 access_key_age_days=_access_key_age_days(cred_row, as_of),
                 create_date=(p.get("create_date") if in_inventory else None),
-                age_days=_age_days(p.get("create_date") if in_inventory else None, as_of),
+                age_days=_days_since(p.get("create_date") if in_inventory else None, as_of),
+                role_last_used=(p.get("role_last_used") if in_inventory else None),
+                role_last_used_region=(p.get("role_last_used_region") if in_inventory else None),
+                unused_days=_days_since(p.get("role_last_used") if in_inventory else None, as_of),
                 observed_days=observed_days,
                 observed_from=observed_from,
                 is_exception=exc_type is not None,
@@ -404,9 +407,11 @@ def _is_wildcard(action: str) -> bool:
 
 
 # ---- 관측 가능 기간 ----
-def _age_days(create_date: str | None, as_of: datetime) -> int | None:
-    """IAM 생성일 → as_of 기준 경과일. 값이 없으면 None(추정하지 않는다)."""
-    dt = _parse_dt(create_date)
+def _days_since(iso_ts: str | None, as_of: datetime) -> int | None:
+    """ISO8601 시각 → as_of 기준 경과일. 값이 없으면 None(추정하지 않는다).
+
+    생성일(age_days)과 마지막 활동(unused_days) 둘 다 이 계산이다."""
+    dt = _parse_dt(iso_ts)
     if dt is None:
         return None
     return max((as_of - dt).days, 0)

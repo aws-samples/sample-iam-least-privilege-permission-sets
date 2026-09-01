@@ -107,6 +107,9 @@ def test_normalized_roundtrip_preserves_age_and_window(tmp_path) -> None:
     rec.age_days = 3
     rec.observed_days = 2
     rec.observed_from = "2026-07-13T04:05:06+00:00"
+    rec.role_last_used = "2026-07-14T01:02:03+00:00"
+    rec.role_last_used_region = "ap-northeast-1"
+    rec.unused_days = 1
     st.write_normalized([rec])
 
     got = st.read_normalized()[0]
@@ -114,6 +117,10 @@ def test_normalized_roundtrip_preserves_age_and_window(tmp_path) -> None:
     assert got.age_days == 3
     assert got.observed_days == 2
     assert got.observed_from == "2026-07-13T04:05:06+00:00"
+    # IAM 활동 기록(RoleLastUsed) — 이게 죽으면 미사용 기간 표기가 통째로 사라진다.
+    assert got.role_last_used == "2026-07-14T01:02:03+00:00"
+    assert got.role_last_used_region == "ap-northeast-1"
+    assert got.unused_days == 1
 
 
 def test_normalized_roundtrip_keeps_unmeasured_as_null(tmp_path) -> None:
@@ -127,6 +134,10 @@ def test_normalized_roundtrip_keeps_unmeasured_as_null(tmp_path) -> None:
     assert got.age_days is None
     assert got.observed_days is None
     assert got.observed_from is None
+    # 활동 기록 부재는 **정보다**(미사용 기간의 하한). 0 으로 왕복하면 "오늘 썼다" 가 된다.
+    assert got.role_last_used is None
+    assert got.role_last_used_region is None
+    assert got.unused_days is None
 
 
 def _roundtrip_single(st: LocalFSStorage, rec: PrincipalRecord) -> PrincipalRecord:

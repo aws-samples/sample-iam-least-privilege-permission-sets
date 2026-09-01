@@ -8,7 +8,7 @@ import json
 import re
 
 from lp2ps.config import Config
-from lp2ps.m6_reporter import BACKLOG_NAME, EXEC_SUMMARY_NAME, build_reports
+from lp2ps.m6_reporter import BACKLOG_NAME, EXEC_SUMMARY_NAME, _unused_period, build_reports
 from lp2ps.models import CatalogEntry, EscalationPath, PrincipalRecord, UsedAction
 from lp2ps.runctx import RunContext
 from lp2ps.snapshot import write_snapshot
@@ -411,7 +411,9 @@ def test_unused_role_evidence_states_measured_window(tmp_path):
     assert "CloudTrail 2일" in evidence["사용 근거"]
     assert "AWS 사양" in evidence["사용 근거"], "측정하지 않은 400일을 실측처럼 적으면 안 된다"
     assert evidence["삭제 판단 최소 경과"] == "90일"  # config risk_rules.unused_action_days
-    assert "CloudTrail 2일" in rows[0]["detail"]
+    # detail 은 판정 창이 아니라 **미사용 기간**을 말한다(사용자가 목록에서 먼저 보는 값).
+    # 판정 창은 위 '사용 근거' 가 이미 싣고 있어, 한 줄에 둘을 겹쳐 쓰면 둘 다 안 읽힌다.
+    assert "미사용 최소 400일 이상" in rows[0]["detail"]
 
 
 def test_unused_role_evidence_says_no_cloudtrail_when_absent(tmp_path):
@@ -424,6 +426,118 @@ def test_unused_role_evidence_says_no_cloudtrail_when_absent(tmp_path):
     # CloudTrail 부분은 일수를 포함하지 않아야 한다 — "CloudTrail None일" 같은 값이 새면 안 된다.
     ct_part = evidence["사용 근거"].split(" + Access Advisor")[0]
     assert ct_part == "없음(CloudTrail 근거 없음", ct_part
+
+
+# ---- 미사용 기간 표기 ----
+#
+# "90일간 미사용" 리터럴을 지운 뒤 실제 값을 채우지 않아 기간 표기가 **아예 사라졌다**(사용자 지적).
+# 실제 값은 이미 받아오던 GetAccountAuthorizationDetails 응답의 RoleLastUsed 에 있었다.
+
+
+def test_unused_role_reports_lower_bound_period(tmp_path):
+    """IAM 활동 기록이 없으면 기간을 **하한**으로 말한다 — 생성 후 경과를 넘지 않는다.
+
+    추적 창(400일)을 그대로 쓰면 200일 된 역할에 "최소 400일 미사용" 이라고 적어, 존재하지도
+    않던 기간을 주장하게 된다.
+    """
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    rec = _role_rec(used_actions=[], used_services=[], age_days=200,
+                    create_date="2026-02-13T00:00:00+00:00")
+    rows = _rows_of_type(st, [rec], "unused_role")
+    evidence = json.loads(rows[0]["evidence"])
+    assert evidence["마지막 활동"] == "IAM 활동 기록 없음"
+    assert evidence["미사용 기간"] == "최소 200일 이상", "하한은 생성 후 경과로 잘라야 한다"
+    assert "미사용 최소 200일 이상" in rows[0]["detail"]
+
+
+def test_new_role_does_not_get_a_period_lower_bound(tmp_path):
+    """관측 기간이 부족한 역할은 기간을 말하지 않는다 — 라이브에서 '최소 0일 이상' 이 나왔다.
+
+    참이지만 아무 정보가 없고, 숫자가 판단처럼 읽힌다.
+    """
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    rec = _role_rec(used_actions=[], used_services=[], age_days=0,
+                    create_date="2026-07-15T00:00:00+00:00")
+    evidence = json.loads(_rows_of_type(st, [rec], "new_role_unused")[0]["evidence"])
+    assert "일 이상" not in evidence["미사용 기간"], evidence["미사용 기간"]
+    assert evidence["미사용 기간"].startswith("판단 보류")
+
+
+def test_unused_role_period_capped_at_tracking_window(tmp_path):
+    """대조군 — 생성 후 경과가 추적 창보다 길면 하한은 추적 창에서 멈춘다.
+
+    이 대조가 없으면 위 테스트는 min() 을 age_days 로 바꿔치기해도 통과한다. 그러면 5년 된
+    역할에 "최소 1800일 미사용" 이라고 적는데, IAM 은 400일 밖을 추적하지 않아 근거가 없다.
+    """
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    rec = _role_rec(used_actions=[], used_services=[], age_days=1800,
+                    create_date="2021-09-01T00:00:00+00:00")
+    evidence = json.loads(_rows_of_type(st, [rec], "unused_role")[0]["evidence"])
+    assert evidence["미사용 기간"] == "최소 400일 이상"
+
+
+def test_unknown_age_does_not_invent_a_period(tmp_path):
+    """나이를 모르면 하한도 말하지 않는다 — 숫자를 만들지 않는다."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    evidence = json.loads(
+        _rows_of_type(st, [_role_rec(used_actions=[], used_services=[])], "unused_role")[0]["evidence"])
+    assert re.search(r"\d+일 이상", evidence["미사용 기간"]) is None, evidence["미사용 기간"]
+    assert "확인 불가" in evidence["미사용 기간"]
+
+
+def test_role_with_iam_last_used_is_not_unused(tmp_path):
+    """IAM 이 활동을 기록한 역할은 미사용이 아니다 — 다른 층위 근거가 비어 있어도 그렇다.
+
+    RoleLastUsed 는 **전 리전**을 아우른다. CloudTrail 은 리전별·페이지 상한이고 Access Advisor
+    는 action 세부를 안 줄 수 있어, 다른 리전에서만 쓰이는 역할은 두 층위 모두 빈다. 그때
+    "사용 기록 없음, 삭제" 라고 권하면 IAM 이 반대로 말하는 것을 화면이 주장한다.
+    """
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    rec = _role_rec(used_actions=[], used_services=[], age_days=560,
+                    create_date="2025-01-01T00:00:00+00:00",
+                    role_last_used="2026-08-20T01:02:03+00:00", role_last_used_region="ap-northeast-1",
+                    unused_days=12)
+    types = _backlog_types(st, [rec])
+    assert "unused_role" not in types
+    assert "new_role_unused" not in types
+    point = write_snapshot(st, RUN, account_scope=1, status="succeeded")
+    assert point.unused_roles == 0, "지표도 같은 판정식을 써야 백로그와 어긋나지 않는다"
+
+
+def test_measured_period_uses_iam_record(tmp_path):
+    """기록이 있으면 정확한 경과일과 **활동 리전**을 그대로 쓴다(하한 문구 아님).
+
+    `is_unused_role` 가드가 이 경우를 백로그에서 제외하므로 헬퍼를 직접 부른다 — 표기 로직은
+    unused_permission 증거와, 판정 규칙이 '미사용 N일 이상' 으로 바뀔 때 살아 있는 경로다.
+    """
+    rec = _role_rec(role_last_used="2026-08-20T01:02:03+00:00",
+                    role_last_used_region="ap-northeast-1", unused_days=12)
+    assert _unused_period(rec) == ("2026-08-20T01:02:03+00:00 (ap-northeast-1)", "12일")
+    # 리전을 모르면 괄호를 만들지 않는다(빈 괄호는 값이 있다고 오해시킨다).
+    assert _unused_period(_role_rec(role_last_used="2026-08-20T01:02:03+00:00",
+                                    unused_days=12))[0] == "2026-08-20T01:02:03+00:00"
+
+
+def test_unused_permission_evidence_carries_last_activity(tmp_path):
+    """역할의 미사용 권한 항목에도 마지막 활동을 싣는다 — user 에는 싣지 않는다.
+
+    user 는 RoleLastUsed 가 애초에 없어서, '기록 없음' 을 함께 적으면 '안 쓰였다' 로 읽힌다.
+    """
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    role = _role_rec(used_actions=[UsedAction(action="s3:GetObject")],
+                     unused_findings=["s3:DeleteObject"],
+                     role_last_used="2026-08-20T01:02:03+00:00",
+                     role_last_used_region="us-east-1", unused_days=12)
+    evidence = json.loads(_rows_of_type(st, [role], "unused_permission")[0]["evidence"])
+    assert evidence["마지막 활동"] == "2026-08-20T01:02:03+00:00 (us-east-1)"
+    assert "미사용 기간" not in evidence, "실사용 action 이 있는 항목에 미사용 기간을 적으면 자기모순이다"
+
+    user = PrincipalRecord(account_id="111122223333", principal="arn:aws:iam::111122223333:user/u",
+                           identity_type="user", granted_actions=["s3:DeleteObject"],
+                           unused_findings=["s3:DeleteObject"], risk_level="low", run_id="run-x")
+    st2 = LocalFSStorage(tmp_path / "u", "test", "run-x")
+    ev_user = json.loads(_rows_of_type(st2, [user], "unused_permission")[0]["evidence"])
+    assert "마지막 활동" not in ev_user
 
 
 def test_snapshot_splits_new_roles_out_of_unused_roles(tmp_path):

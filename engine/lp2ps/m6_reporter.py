@@ -72,11 +72,19 @@ def is_unused_role(rec: PrincipalRecord) -> bool:
     (스냅샷은 `granted_actions` 만, m6 은 `granted_actions or has_managed_policies`) 그 결과
     대시보드 "미사용 역할 40" 과 백로그 59건이 어긋났다 — 주석은 "같은 판정식" 이라고 적혀
     있었지만 사실이 아니었다.
+
+    `role_last_used` 를 함께 보는 이유: IAM 자신이 이 역할의 활동을 추적하며(콘솔 "Last activity")
+    그 기록은 **전 리전**을 아우른다. Access Advisor 가 action·서비스를 안 주고 CloudTrail 이
+    다른 리전이라 못 본 역할이라도, 이 값이 있으면 그 역할은 **쓰인 적이 있다**. 그걸 무시하고
+    "사용 기록 없음" 이라고 부르면 IAM 이 반대로 말하는 것을 화면이 주장하게 된다.
+    (기록이 오래된 역할까지 살려 두는 것은 `used_services` 와 같은 처리다 — 이 판정식은 "얼마나
+    오래 안 썼나" 가 아니라 "쓴 증거가 어느 층위에도 없나" 를 묻는다.)
     """
     return (
         rec.identity_type == "role"
         and not rec.used_actions
         and not rec.used_services
+        and rec.role_last_used is None
         and (bool(rec.granted_actions) or rec.has_managed_policies)
     )
 
@@ -90,6 +98,12 @@ def is_too_new_to_judge(rec: PrincipalRecord, min_age_days: int) -> bool:
     return rec.age_days is not None and rec.age_days < min_age_days
 
 
+# IAM 이 last-accessed/last-used 정보를 유지하는 추적 창(일). **AWS 사양이며 조정 대상이 아니다** —
+# config 로 빼지 않는 이유가 이것이다(불변식 ④ 는 고객별 임계치를 config 로 옮기라는 규칙이고,
+# 이 값은 우리가 고를 수 있는 값이 아니다). 여기서만 정의해 문구가 서로 어긋나지 않게 한다.
+_IAM_TRACKING_DAYS = 400
+
+
 def _window_phrase(rec: PrincipalRecord) -> str:
     """이 principal 의 미사용 판정 근거 창을 **실측값**으로 서술.
 
@@ -99,7 +113,31 @@ def _window_phrase(rec: PrincipalRecord) -> str:
     Advisor 쪽은 측정값이 아니라 **AWS 사양**임을 문구로 드러낸다.
     """
     ct = f"CloudTrail {rec.observed_days}일" if rec.observed_days is not None else "CloudTrail 근거 없음"
-    return f"{ct} + Access Advisor 추적 창(AWS 사양: 최대 400일)"
+    return f"{ct} + Access Advisor 추적 창(AWS 사양: 최대 {_IAM_TRACKING_DAYS}일)"
+
+
+def _unused_period(rec: PrincipalRecord) -> tuple[str, str]:
+    """(마지막 활동, 미사용 기간) 표기. **실측값과 하한을 문구로 구분한다.**
+
+    이 자리에 예전엔 "90일간 미사용" 이 있었다. 그 90일은 어디서도 측정되지 않은 리터럴이었고,
+    지운 뒤 실제 값을 채워 넣지 않아 기간 표기가 **아예 사라졌다**(사용자 지적). 실제 값은
+    이미 우리가 받아오는 `GetAccountAuthorizationDetails` 응답의 `RoleLastUsed` 에 있었다.
+
+    두 경우를 다르게 말한다:
+      - 기록 있음 → as_of 기준 정확한 경과일. 활동이 있던 **리전**도 함께 보여 준다(그 리전이
+        CloudTrail 수집 리전과 다르면, 왜 CloudTrail 에 안 잡혔는지가 그 자리에서 설명된다).
+      - 기록 없음 → 정확한 기간은 **알 수 없다**. 다만 IAM 이 추적 창 내내 기록하지 않았으므로
+        "최소 N일 이상" 이라는 하한은 말할 수 있다. N = min(생성 후 경과, 추적 창) — 생성 후
+        200일 된 역할에 "최소 400일" 이라고 하면 존재하지도 않던 기간을 주장하는 것이 된다.
+        나이를 모르면 하한도 말하지 않는다(숫자를 만들지 않는다).
+    """
+    if rec.role_last_used:
+        region = f" ({rec.role_last_used_region})" if rec.role_last_used_region else ""
+        days = f"{rec.unused_days}일" if rec.unused_days is not None else "확인 불가"
+        return f"{rec.role_last_used}{region}", days
+    if rec.age_days is None:
+        return "IAM 활동 기록 없음", f"확인 불가(IAM 추적 창 {_IAM_TRACKING_DAYS}일 내 활동 없음)"
+    return "IAM 활동 기록 없음", f"최소 {min(rec.age_days, _IAM_TRACKING_DAYS)}일 이상"
 
 
 def cleanup_finding_key(ctype: str, account_id: str, principal: str, extra: str = "") -> str:
@@ -207,13 +245,23 @@ def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[Cleanu
             min_age = cfg.risk_rules.unused_action_days
             too_new = is_too_new_to_judge(rec, min_age)
             ctype: CleanupType = "new_role_unused" if too_new else "unused_role"
+            last_activity, unused_period = _unused_period(rec)
+            if too_new:
+                # 관측 기간 자체가 부족한 역할에 하한을 적으면 안 된다. 라이브 575 에서 당일 생성
+                # 역할이 "미사용 최소 0일 이상" 으로 나왔다 — 참이지만 아무 정보가 없고, 숫자가
+                # 판단처럼 읽힌다. 이 유형에서 정확한 말은 "아직 판단할 수 없다" 다.
+                unused_period = f"판단 보류(생성 후 {rec.age_days}일 — 관측 기간 부족)"
             detail = (f"생성 후 미사용(생성 {rec.age_days}일 경과 — 관측 기간 부족)"
-                      if too_new else f"미사용 역할({_window_phrase(rec)} 근거로 사용 기록 없음)")
+                      if too_new else f"미사용 역할(미사용 {unused_period} — {last_activity})")
             items.append(_item(ctype, rec, rec.risk_level, detail,
                                _recommendation(ctype, uses_idc),
                                evidence={
                                    "식별 유형": "role",
                                    "부여된 action 수": str(len(rec.granted_actions)),
+                                   # 기간과 근거를 나눠 싣는다: '미사용 기간' 은 IAM 이 추적한
+                                   # 역할 활동 기준, '사용 근거' 는 action 단위 판정에 쓴 창이다.
+                                   "마지막 활동": last_activity,
+                                   "미사용 기간": unused_period,
                                    "사용 근거": f"없음({_window_phrase(rec)})",
                                    "사용 흔적 서비스": "없음",
                                    "역할 생성일": rec.create_date or "미수집",
@@ -230,16 +278,22 @@ def _cleanup_items(records: list[PrincipalRecord], cfg: "Config") -> list[Cleanu
         undetermined = [f for f in rec.undetermined_findings if ":" in f]
         if action_gaps:
             detail = f"granted 이나 미사용: {action_gaps[0]} 외 {max(0, len(action_gaps) - 1)}건"
+            evidence = {
+                "부여된 action 수": str(len(rec.granted_actions)),
+                "실사용 action 수": str(len(rec.used_actions)),
+                "미사용 action 수": str(len(action_gaps)),
+                "근거 불명 action 수": str(len(undetermined)),
+                "대표 미사용": ", ".join(action_gaps[:5]),
+                "수집 소스": ", ".join(rec.source) or "-",
+            }
+            if rec.identity_type == "role":
+                # 역할이면 IAM 이 추적한 마지막 활동 시각을 함께 싣는다(전 리전). user 에는 넣지
+                # 않는다 — user 에는 RoleLastUsed 가 애초에 없어서 '기록 없음' 이 '안 쓰였다' 로
+                # 잘못 읽힌다. 기간(하한)은 여기서 말하지 않는다: 실사용 action 이 있는 항목에
+                # "최소 N일 미사용" 을 붙이면 같은 화면이 서로 반대를 주장한다.
+                evidence["마지막 활동"] = _unused_period(rec)[0]
             items.append(_item("unused_permission", rec, rec.risk_level, detail,
-                               _recommendation("unused_permission", uses_idc),
-                               evidence={
-                                   "부여된 action 수": str(len(rec.granted_actions)),
-                                   "실사용 action 수": str(len(rec.used_actions)),
-                                   "미사용 action 수": str(len(action_gaps)),
-                                   "근거 불명 action 수": str(len(undetermined)),
-                                   "대표 미사용": ", ".join(action_gaps[:5]),
-                                   "수집 소스": ", ".join(rec.source) or "-",
-                               }))
+                               _recommendation("unused_permission", uses_idc), evidence=evidence))
 
         # long_lived_key
         if rec.access_key_age_days is not None and rec.access_key_age_days >= cfg.risk_rules.long_lived_key_days:

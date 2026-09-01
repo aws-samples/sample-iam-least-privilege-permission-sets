@@ -88,6 +88,13 @@ class PrincipalRecord(BaseModel):
     # 관측 가능 기간이 필요하다 — 생성 3일 된 역할에 기록이 없는 건 당연하다.
     create_date: str | None = None
     age_days: int | None = None
+    # IAM 이 직접 추적하는 역할 활동 시각·리전(`RoleLastUsed`, 전 리전 대상). 콘솔 "Last activity".
+    # None = **추적 창 안에 활동 기록이 없다**(부재가 정보다 — 미사용 기간의 하한을 준다).
+    role_last_used: str | None = None
+    role_last_used_region: str | None = None
+    # as_of − role_last_used(일). role_last_used 가 없으면 None — 하한은 소비자가 age_days 와
+    # AWS 추적 창으로 서술한다(m6_reporter._unused_period). 여기서 추정값을 채우지 않는다.
+    unused_days: int | None = None
     # 이 계정에서 CloudTrail 이 **실제로 훑은** 구간(일수 / 가장 오래된 이벤트 시각).
     # LookupEvents 는 최신순 페이지 상한이 있어 요청한 90일이 아니라 며칠만 덮일 수 있다.
     # None = CloudTrail 근거 없음(Access Advisor 만).

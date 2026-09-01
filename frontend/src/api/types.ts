@@ -51,6 +51,11 @@ export interface PrincipalRecord {
   access_key_age_days: number | null;
   create_date: string | null; // principal 생성 시각(ISO8601). 미수집이면 null
   age_days: number | null; // 생성 후 경과일. 신규 역할을 '미사용'으로 오판하지 않기 위한 근거
+  // IAM 이 직접 추적하는 역할 활동 시각·리전(RoleLastUsed, 전 리전). 콘솔 "Last activity".
+  // null = 추적 창(AWS 사양 최대 400일) 안에 활동 기록 없음 → 미사용 기간의 하한을 준다.
+  role_last_used: string | null;
+  role_last_used_region: string | null;
+  unused_days: number | null; // as_of − role_last_used(일). role_last_used 가 없으면 null
   // 이 계정에서 CloudTrail 이 **실제로 훑은** 구간(일수 / 가장 오래된 이벤트 시각).
   // null = CloudTrail 근거 없음(Access Advisor 만).
   observed_days: number | null;
