@@ -18,7 +18,19 @@ from pydantic import ValidationError
 
 from .auth import require_auth
 from .repositories import OverridePayloadUnavailable
-from .routers import accounts, assistant, catalog, cleanup, iac, metrics, reports, runs, schedule, settings
+from .routers import (
+    accounts,
+    assistant,
+    catalog,
+    cleanup,
+    iac,
+    metrics,
+    reports,
+    runs,
+    schedule,
+    service_roles,
+    settings,
+)
 
 # 감사·앱 로거 레벨을 엔트리포인트에서 명시한다.
 #
@@ -110,6 +122,7 @@ app.include_router(accounts.router, dependencies=_auth)
 app.include_router(metrics.router, dependencies=_auth)
 app.include_router(catalog.router, dependencies=_auth)
 app.include_router(cleanup.router, dependencies=_auth)
+app.include_router(service_roles.router, dependencies=_auth)
 app.include_router(reports.router, dependencies=_auth)
 app.include_router(assistant.router, dependencies=_auth)
 app.include_router(iac.router, dependencies=_auth)

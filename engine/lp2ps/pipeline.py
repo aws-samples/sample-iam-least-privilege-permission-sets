@@ -39,21 +39,67 @@ def _require(storage: "Storage", relpath: str, stage: str) -> None:
 
 
 def run_analyze(storage: "Storage", run: "RunContext", cfg: "Config") -> dict:
-    """normalize → escalation → risk → catalog. 반환 요약 dict."""
+    """normalize → escalation → risk → tracks → catalog → service_roles. 반환 요약 dict."""
     from .m2_normalizer import normalize
     from .m3_escalation import detect_escalations
     from .m4_risk_scorer import score_risks
     from .m5_catalog import build_catalog
+    from .m5_service_roles import build_service_roles
+    from .m5_tracks import assign_tracks
 
     _require(storage, MANIFEST_NAME, "analyze")  # collect 산출물 필요
-    records = normalize(storage, run)
+    records = normalize(
+        storage, run, cfg.risk_rules,
+        account_groups=_tenancy_of(storage, cfg),
+        tooling_account_id=_tooling_account_id(storage),
+    )
 
     _require(storage, NORMALIZED_NAME, "escalation")
     detect_escalations(storage, run)
     score_risks(storage, run, cfg.risk_rules)
+    # 트랙 배정은 **카탈로그보다 먼저**다. M5·M6 은 대상 선별을 각자 다시 하지 않고 이 결과를 읽는다
+    # (두 곳이 각자 조건을 갖게 되면 화면이 "제외" 라고 말한 대상이 persona 에 들어 있게 된다).
+    tracks = assign_tracks(storage, run, cfg)
     catalog = build_catalog(storage, run, cfg.catalog)
+    service_roles = build_service_roles(storage, run, cfg)
 
-    return {"principals": len(records), "personas": len(catalog)}
+    return {
+        "principals": len(records),
+        "personas": len(catalog),
+        "service_roles": len(service_roles),
+        "tracks": tracks,
+    }
+
+
+def _tenancy_of(storage: "Storage", cfg: "Config") -> dict[str, str]:
+    """이번 run 이 **실제로 수집한** 계정의 테넌트 그룹 맵(R5).
+
+    config 선언이 아니라 산출물 기준이어야 한다. `cross_account=false` 모드의 `accounts` 는
+    `["self"]` 라서 config 만 보면 자기 계정조차 맵에 없고, 그러면 자기 계정을 신뢰하는 모든 역할이
+    `unconfirmed`(소유자 확인)로 밀린다. 반대로 맵에 없는 계정을 기본 그룹으로 채워 주지도 않는다 —
+    들여다본 적 없는 계정을 내부라고 말하면 fail-safe 가 뒤집힌다(`Config.tenant_group_of` 가 범위 밖
+    계정에 `""` 를 주는 것과 같은 이유다).
+    """
+    from .config import DEFAULT_TENANT_GROUP
+
+    return {
+        account_id: cfg.tenant_group_of(account_id) or DEFAULT_TENANT_GROUP
+        for account_id in storage.list_accounts()
+    }
+
+
+def _tooling_account_id(storage: "Storage") -> str:
+    """manifest 에 M1 이 기록한 호출자(관제) 계정 ID. 없으면 빈 문자열(모른다).
+
+    config 키로 두지 않는 이유: 관제 계정은 `accounts` 에 없을 수 있고(권장 구성), 선언은 배포가
+    옮겨지면 조용히 틀린 값이 된다. M1 이 `sts:GetCallerIdentity` 로 **측정한** 사실을 쓴다.
+    """
+    manifest = storage.read_manifest()
+    if isinstance(manifest, dict):
+        value = manifest.get("tooling_account_id")
+        if isinstance(value, str):
+            return value
+    return ""
 
 
 def run_synth(storage: "Storage", run: "RunContext", cfg: "Config") -> dict:
@@ -76,7 +122,7 @@ def run_report(storage: "Storage", run: "RunContext", cfg: "Config", account_sco
     _require(storage, "catalog.json", "report")
     summary = build_reports(storage, run, cfg)
     point = write_snapshot(storage, run, account_scope=account_scope, status=status,
-                           risk_rules=cfg.risk_rules)
+                           risk_rules=cfg.risk_rules, cfg=cfg)
     return {
         "personas": summary.personas,
         "unused_permission_principals": summary.unused_permission_principals,

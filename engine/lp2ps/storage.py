@@ -403,6 +403,14 @@ def _parquet_schema():
             ("identity_type", pa.string()),
             ("principal_kind", pa.string()),
             ("trust_principals", pa.list_(pa.string())),
+            # 실사용 기반 사용 주체(신뢰정책 판정과 별개 축). session_name_shape 는 **분류값만** —
+            # 세션 이름 원문은 개인정보(SSO 가 이메일을 쓴다)라 저장하지 않는다.
+            ("usage_subject", pa.string()),
+            ("usage_subject_basis", pa.string()),
+            ("session_name_shape", pa.string()),
+            ("tenant_group", pa.string()),
+            ("trust_scope", pa.string()),
+            ("trust_wildcard", pa.bool_()),
             ("tags", pa.string()),  # 정렬된 JSON 문자열(_JSON_COLUMNS)
             ("granted_actions", pa.list_(pa.string())),
             ("used_actions", pa.list_(used_action)),
@@ -420,12 +428,19 @@ def _parquet_schema():
             ("role_last_used", pa.string()),
             ("role_last_used_region", pa.string()),
             ("unused_days", pa.int64()),
+            # 무엇부터 셌나 / 등급. basis 가 죽으면 화면이 "AWS 추적 보장 400일" 한계 문구를 붙일지
+            # 말지를 판단할 수 없어, 생성일 기준 추정을 AWS 가 기록한 사실처럼 표시한다.
+            ("unused_days_basis", pa.string()),
+            ("unused_tier", pa.string()),
             ("observed_days", pa.int64()),
             ("observed_from", pa.string()),
             ("escalation_paths", pa.list_(escalation)),
             ("risk_score", pa.int64()),
             ("risk_level", pa.string()),
             ("risk_reasons", pa.list_(pa.string())),
+            ("wildcard_grants", pa.list_(pa.string())),
+            ("track", pa.string()),
+            ("excluded_reason", pa.string()),
             ("is_exception", pa.bool_()),
             ("exception_type", pa.string()),
             ("source", pa.list_(pa.string())),

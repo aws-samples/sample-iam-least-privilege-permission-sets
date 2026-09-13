@@ -94,13 +94,44 @@ def _request_id(exc: Exception) -> str:
     return ""
 
 
+@dataclass
+class ResolvedScope:
+    """수집 대상 세션 + **호출자(관제) 계정 ID**.
+
+    호출자 계정을 따로 내는 이유(R5 `trust_scope="tooling"`): 멤버 계정의 역할들은 이 도구의
+    read-only role 을 포함해 관제 계정을 신뢰한다. 그 신뢰는 **정상 운영 경로**이므로 라벨만
+    붙이고 조치 대상으로 올리지 않는다. 이 값이 없으면 관제 계정이 `accounts` 에 없는 배포에서
+    모든 멤버 계정의 도구 역할이 `unconfirmed`(소유자 확인)로 올라가 계정 수만큼 노이즈가 된다.
+
+    `sessions` 만으로는 알 수 없다 — 관제 계정이 분석 대상 목록에 없을 수 있고, 그게 오히려
+    권장 구성이다. 추가 API 호출은 없다(이미 부르는 `sts:GetCallerIdentity` 결과를 버리지 않는 것뿐).
+    """
+
+    sessions: list[AccountSession]
+    tooling_account_id: str
+
+
 def resolve_sessions(
     config: "Config",
     base_session: "Session | None" = None,
     *,
     run_id: str | None = None,
 ) -> list[AccountSession]:
-    """config 에 따라 대상 계정 세션 목록을 만든다.
+    """config 에 따라 대상 계정 세션 목록을 만든다(`resolve_scope().sessions`).
+
+    호출자 계정까지 필요하면 `resolve_scope` 를 쓴다. 이 함수는 세션만 쓰는 호출부·테스트를 위해
+    남겨 둔다.
+    """
+    return resolve_scope(config, base_session, run_id=run_id).sessions
+
+
+def resolve_scope(
+    config: "Config",
+    base_session: "Session | None" = None,
+    *,
+    run_id: str | None = None,
+) -> ResolvedScope:
+    """config 에 따라 대상 계정 세션 목록 + 호출자 계정을 만든다.
 
     cross_account=false → ambient 자격증명으로 단일 세션(현재 계정 자신).
     cross_account=true  → 각 계정에 readonly_role 을 assume.
@@ -114,7 +145,10 @@ def resolve_sessions(
 
     if not config.cross_account:
         account_id = _caller_account_id(session, config.region)
-        return [AccountSession(account_id=account_id, region=config.region, session=session)]
+        return ResolvedScope(
+            sessions=[AccountSession(account_id=account_id, region=config.region, session=session)],
+            tooling_account_id=account_id,
+        )
 
     # 관제 계정(호출자 자신)이 accounts 에 포함될 수 있다 — 자기 계정은 assume 하지 않고 ambient
     # 자격증명을 그대로 쓴다(자기 계정 role 을 자기 엔진 role 로 assume 하는 건 불필요·불가). 멤버
@@ -185,4 +219,4 @@ def resolve_sessions(
             aws_session_token=creds["SessionToken"],
         )
         sessions.append(AccountSession(account_id=account_id, region=config.region, session=assumed))
-    return sessions
+    return ResolvedScope(sessions=sessions, tooling_account_id=caller_account)

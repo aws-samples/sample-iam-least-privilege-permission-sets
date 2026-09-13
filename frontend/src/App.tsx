@@ -16,6 +16,7 @@ import Login from "@/auth/Login";
 import Dashboard from "@/pages/Dashboard";
 import PersonaReview from "@/pages/PersonaReview";
 import CleanupBacklog from "@/pages/CleanupBacklog";
+import ServiceRoles from "@/pages/ServiceRoles";
 import Reports from "@/pages/Reports";
 import Assistant from "@/pages/Assistant";
 import Runs from "@/pages/Runs";
@@ -29,6 +30,9 @@ const NAV_ITEMS = [
   { type: "link" as const, text: "대시보드", href: "/dashboard" },
   { type: "link" as const, text: "Persona 검토", href: "/personas" },
   { type: "link" as const, text: "조치 필요 항목", href: "/cleanup" },
+  // 트랙② — 기계가 쓰는 현역 역할. persona(사람)와 조치 성격이 완전히 다르다: 권한을 줄이면
+  // 장애로 직결되고 묶어서 정책을 낼 수도 없다. 그래서 Persona 검토와 같은 화면에 두지 않는다.
+  { type: "link" as const, text: "서비스 역할 정리", href: "/service-roles" },
   { type: "link" as const, text: "리포트", href: "/reports" },
   { type: "link" as const, text: "Assistant", href: "/assistant" },
   { type: "divider" as const },
@@ -188,6 +192,7 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/personas" element={<PersonaReview />} />
             <Route path="/cleanup" element={<CleanupBacklog />} />
+            <Route path="/service-roles" element={<ServiceRoles />} />
             <Route path="/reports" element={<Reports />} />
             <Route path="/assistant" element={<Assistant />} />
             <Route path="/runs" element={<Runs />} />

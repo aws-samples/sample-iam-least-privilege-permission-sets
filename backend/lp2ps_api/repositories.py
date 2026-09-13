@@ -14,7 +14,15 @@ from typing import Any
 import boto3
 from boto3.dynamodb.conditions import Key
 
-from lp2ps.models import CatalogEntry, CleanupItem, MetricsPoint, PolicyAction, Run
+from lp2ps.m5_service_roles import SERVICE_ROLES_NAME
+from lp2ps.models import (
+    CatalogEntry,
+    CleanupItem,
+    MetricsPoint,
+    PolicyAction,
+    Run,
+    ServiceRoleEntry,
+)
 from lp2ps.storage import S3Storage
 
 from .deps import Settings
@@ -292,6 +300,23 @@ class Repositories:
         key = f"policies/{persona}.json"
         return storage.read_json(key) if storage.exists(key) else None  # type: ignore[return-value]
 
+    # ---- 트랙② 서비스 역할 (S3 json of latest run) ----
+    def get_service_roles(self, run_id: str | None = None) -> list[ServiceRoleEntry]:
+        """`service_roles.json`(M5) — 기계가 쓰는 현역 역할의 서비스 단위 접기 산출물.
+
+        접기 계산은 **엔진에서** 끝난다(결정론 코어). 여기서 다시 세거나 정렬하지 않는다 — 같은
+        권한이 화면과 산출물에서 다르게 읽히는 것을 막기 위해서다. 파일이 없으면 빈 목록이다
+        (트랙② 대상이 0 인 배포도 정상이고, 404 는 "고장" 으로 읽힌다).
+        """
+        rid = run_id or self.latest_run_id()
+        if not rid:
+            return []
+        storage = self._storage(rid)
+        if not storage.exists(SERVICE_ROLES_NAME):
+            return []
+        raw = storage.read_json(SERVICE_ROLES_NAME)
+        return [ServiceRoleEntry.model_validate(e) for e in raw]  # type: ignore[union-attr]
+
     # ---- cleanup backlog (S3 csv of latest run) ----
     def get_cleanup(self, run_id: str | None = None) -> list[CleanupItem]:
         import csv
@@ -486,6 +511,11 @@ def _cleanup_row(row: dict[str, Any]) -> dict[str, Any]:
     import json
 
     out = dict(row)
+    # group·track 은 빈 문자열이면 '미분류'(None)로 넘긴다 — `""` 는 닫힌 리터럴 집합에 없어서
+    # 그대로 두면 행 하나 때문에 전체 검증이 터지고 화면이 통째로 비어 보인다.
+    for key in ("group", "track"):
+        if not out.get(key):
+            out[key] = None
     reasons = out.get("risk_reasons")
     out["risk_reasons"] = reasons.split("|") if reasons else []
     if not out.get("risk_score"):

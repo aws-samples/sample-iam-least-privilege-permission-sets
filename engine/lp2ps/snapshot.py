@@ -13,17 +13,39 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .config import RiskRules
-from .m6_reporter import is_too_new_to_judge, is_unused_role
+from .m6_reporter import (
+    cleanup_items,
+    is_deletion_reviewable,
+    is_new_unused_role,
+    is_unused_role,
+    summarize_exclusions,
+    summarize_groups,
+)
 from .models import (
+    ActionGroupMetrics,
     CatalogEntry,
+    ExclusionEntry,
     MetricsPoint,
     PrincipalRecord,
     RiskDist,
     Run,
     RunStatus,
+    UnusedTierDist,
 )
 
-if TYPE_CHECKING:  # pragma: no cover
+# 이 코드가 계산하는 지표 **정의**의 버전. `unused_role` 이 "사용 근거 전무" → "미사용 N일 이상" 으로
+# 바뀌었으므로 이전 run 과 숫자를 직접 비교할 수 없다. UI 가 이 값의 변화 지점에 경계선을 그린다 —
+# 없으면 정의 변경으로 숫자가 줄어든 것을 고객이 "정리됐다" 로 읽는다(같은 함정을 '판정 불가' 분리
+# 때 한 번 겪었다). 정의를 또 바꾸면 이 숫자를 올린다.
+#
+# 3 = 미사용 판정이 사용 근거의 **부재**가 아니라 **마지막 활동 시각**을 본다(`is_idle_beyond`).
+# 오래 전에 쓰인 뒤 방치된 역할이 이제 미사용에 든다 → 라이브 실측에서 삭제 검토 대상이 84개 늘고
+# 같은 수만큼 권한 축소에서 빠졌다. 숫자가 **늘어난** 방향의 정의 변경이라 경계선이 더 필요하다:
+# 없으면 고객이 "지난주보다 미사용이 84개 늘었다" 를 실제 악화로 읽는다.
+DEFINITION_VERSION = 3
+
+if TYPE_CHECKING:
+    from .config import Config  # pragma: no cover
     from .runctx import RunContext
     from .storage import Storage
 
@@ -37,8 +59,14 @@ def write_snapshot(
     account_scope: int,
     status: RunStatus,
     risk_rules: "RiskRules | None" = None,
+    cfg: "Config | None" = None,
 ) -> MetricsPoint:
-    """run.json 기록 + metrics_timeseries append. 반환 = 이번 MetricsPoint."""
+    """run.json 기록 + metrics_timeseries append. 반환 = 이번 MetricsPoint.
+
+    `cfg` 는 3그룹 카드(`action_groups`)·제외 내역(`exclusions`)을 채우기 위해 받는다. 그 숫자는
+    **백로그 항목 목록에서** 세야 하고, 항목을 만들려면 config(IdC 사용 여부·임계치)가 필요하다.
+    없으면 두 필드를 빈 목록으로 둔다 — 0 세 개를 채우면 "할 일이 없다" 는 거짓을 말하게 된다.
+    """
     records = storage.read_normalized()
     catalog = _load_catalog(storage)
 
@@ -51,7 +79,8 @@ def write_snapshot(
     )
     storage.write_json(RUN_NAME, run_row.model_dump())
 
-    point = _metrics(records, catalog, run, risk_rules or RiskRules())
+    point = _metrics(records, catalog, run, risk_rules or (cfg.risk_rules if cfg else RiskRules()),
+                     cfg=cfg)
     _append_timeseries(storage, point)
 
     # hosted 모드: DynamoDB runs/metrics 테이블에도 기록(테이블명이 env 로 주입된 경우에만).
@@ -122,14 +151,14 @@ def _to_ddb(obj: dict) -> dict:
 
 def _metrics(
     records: list[PrincipalRecord], catalog: list[CatalogEntry], run: "RunContext",
-    risk_rules: "RiskRules",
+    risk_rules: "RiskRules", cfg: "Config | None" = None,
 ) -> MetricsPoint:
     """전체(모든 계정 통합) MetricsPoint + 계정별 분해(by_account).
 
     account_id="" 인 total 에 by_account(계정별 MetricsPoint 목록)를 실어, 대시보드가 특정 계정
     선택 시 해당 분해를 쓴다. 결정론: by_account 는 account_id 오름차순.
     """
-    total = _metrics_for(records, catalog, run, risk_rules, account_id="")
+    total = _metrics_for(records, catalog, run, risk_rules, account_id="", cfg=cfg)
 
     # 계정별 분해 — persona 는 계정 교차라 계정별 persona 수는 "그 계정 principal 이 속한 persona 수"로.
     accounts = sorted({r.account_id for r in records})
@@ -139,7 +168,7 @@ def _metrics(
             acct_records = [r for r in records if r.account_id == acct]
             acct_catalog = _catalog_for_account(catalog, acct)
             by_account.append(
-                _metrics_for(acct_records, acct_catalog, run, risk_rules, account_id=acct)
+                _metrics_for(acct_records, acct_catalog, run, risk_rules, account_id=acct, cfg=cfg)
             )
         total.by_account = by_account
     return total
@@ -152,7 +181,7 @@ def _catalog_for_account(catalog: list[CatalogEntry], account_id: str) -> list[C
 
 def _metrics_for(
     records: list[PrincipalRecord], catalog: list[CatalogEntry], run: "RunContext",
-    risk_rules: "RiskRules", account_id: str,
+    risk_rules: "RiskRules", account_id: str, cfg: "Config | None" = None,
 ) -> MetricsPoint:
     unused_permissions = sum(len([f for f in r.unused_findings if ":" in f]) for r in records)
     undetermined_permissions = sum(
@@ -164,12 +193,35 @@ def _metrics_for(
     #
     # 관측 기간이 짧아 판단 근거가 부족한 신규 역할은 여기서 뺀다 — 삭제 권고 대상이 아니므로
     # "미사용 역할" 카운트에 넣으면 조치 가능 건수를 부풀린다(m6 은 new_role_unused 로 분리).
-    min_age = risk_rules.unused_action_days
-    unused_roles = sum(
-        1 for r in records if is_unused_role(r) and not is_too_new_to_judge(r, min_age)
-    )
+    unused_roles = sum(1 for r in records if is_unused_role(r, risk_rules.unused_role_days))
     new_unused_roles = sum(
-        1 for r in records if is_unused_role(r) and is_too_new_to_judge(r, min_age)
+        1 for r in records if is_new_unused_role(r, risk_rules.new_principal_days)
+    )
+    # 위 `unused_roles` 중 **삭제를 권고하지 않는** 몫(트랙③-b). 백로그와 같은 판정식
+    # (`is_deletion_reviewable`)을 쓴다 — 이 지표가 백로그 유형과 다른 조건을 갖는 순간
+    # 대시보드와 목록이 어긋나고, 그 어긋남은 화면에서 '숫자가 틀렸다' 로만 보인다.
+    owner_review_roles = sum(
+        1 for r in records
+        if is_unused_role(r, risk_rules.unused_role_days) and not is_deletion_reviewable(r)
+    )
+    # 미사용 등급 분포. `unused_roles`(=cleanup 경계 이상)만 보면 "곧 넘어올 것"(watch/review)이
+    # 안 보인다. 등급을 셀 근거가 없는 것은 0 이 아니라 **미측정**(ungraded)으로 따로 센다.
+    tier_dist = UnusedTierDist()
+    for r in records:
+        key = r.unused_tier or "ungraded"
+        setattr(tier_dist, key, getattr(tier_dist, key) + 1)
+    # 전 권한(`*`) 보유 대상 수(R4). 이들은 미사용 개수가 0 으로 잡혀 `unused_permissions` 에
+    # 기여하지 못한다 — 이 지표가 없으면 가장 위험한 대상이 대시보드에서 사라진다.
+    wildcard_grant_principals = sum(1 for r in records if r.wildcard_grants)
+    # 테넌트 경계 위반 의심(R5). 이 도구가 스스로 찾기 가장 어려운 종류의 문제라 지표로 올린다 —
+    # 개수가 0 이 아니면 그 자체로 조사 사유다.
+    cross_tenant_trust_roles = sum(1 for r in records if r.trust_scope == "cross_tenant")
+    # 트랙②(기계가 쓰는 현역 역할)의 규모. 실측에서 계정 과권한의 가장 큰 덩어리이고, 예전에는
+    # persona 단계에서 조용히 사라져 화면에 아예 나오지 않았다.
+    service_role_targets = sum(1 for r in records if r.track == "service_role")
+    service_role_unused_actions = sum(
+        len([f for f in r.unused_findings if ":" in f])
+        for r in records if r.track == "service_role"
     )
     # 임계치는 config 에서(불변식 ④). 예전엔 여기에 90 이 박혀 있어 고객이
     # `risk_rules.long_lived_key_days` 를 바꿔도 이 지표만 90 을 계속 썼다 — m4/m6 과 어긋난다.
@@ -193,6 +245,16 @@ def _metrics_for(
     for r in records:
         setattr(dist, r.risk_level, getattr(dist, r.risk_level) + 1)
 
+    # 3그룹 카드 + 제외 내역. 🔴 **백로그 항목 목록에서** 센다 — 여기서 레코드를 다시 훑어
+    # 자기 기준으로 세면 카드 숫자와 그 카드가 여는 목록의 행 수가 어긋난다(실제로 났던 결함:
+    # KPI 는 action 41,451 을 세고 목록은 principal 329 행을 셌다).
+    action_groups: list[ActionGroupMetrics] = []
+    exclusions: list[ExclusionEntry] = []
+    if cfg is not None:
+        _items = cleanup_items(records, cfg)
+        action_groups = summarize_groups(_items, records)
+        exclusions = summarize_exclusions(records, cfg)
+
     return MetricsPoint(
         run_id=run.run_id,
         ts=run.started_at,
@@ -200,6 +262,7 @@ def _metrics_for(
         undetermined_permissions=undetermined_permissions,
         unused_roles=unused_roles,
         new_unused_roles=new_unused_roles,
+        owner_review_roles=owner_review_roles,
         long_lived_keys=long_lived_keys,
         no_mfa=no_mfa,
         over_privileged_principals=over_privileged,
@@ -208,6 +271,14 @@ def _metrics_for(
         iam_users_pending_migration=len(iam_users),
         ps_migration_pct=ps_migration_pct,
         risk_dist=dist,
+        unused_tier_dist=tier_dist,
+        wildcard_grant_principals=wildcard_grant_principals,
+        cross_tenant_trust_roles=cross_tenant_trust_roles,
+        service_role_targets=service_role_targets,
+        service_role_unused_actions=service_role_unused_actions,
+        definition_version=DEFINITION_VERSION,
+        action_groups=action_groups,
+        exclusions=exclusions,
         account_id=account_id,
     )
 

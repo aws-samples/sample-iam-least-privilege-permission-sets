@@ -94,6 +94,10 @@ class RiskCriteria(BaseModel):
     level_high: int
     level_medium: int
     rules: list[RiskRuleInfo]
+    # 미사용 등급 경계(`risk_rules.unused_tier_days`). 화면의 등급 라벨이 "90일 이상 미사용" 처럼
+    # **숫자를 말하는 문장**이라 이 값이 필요하다 — 프런트에 30/60/90 을 박으면 경계를 조정한
+    # 고객(불변식 ④)의 화면이 거짓을 말한다.
+    unused_tier_days: list[int]
 
 
 def _risk_rules() -> RiskRules:
@@ -128,5 +132,5 @@ def get_risk_criteria() -> RiskCriteria:
     ]
     return RiskCriteria(
         level_critical=r.level_critical, level_high=r.level_high, level_medium=r.level_medium,
-        rules=rules,
+        rules=rules, unused_tier_days=list(r.unused_tier_days),
     )

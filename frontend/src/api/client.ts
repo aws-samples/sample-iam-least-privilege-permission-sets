@@ -19,6 +19,7 @@ import type {
   ReportRef,
   RiskCriteria,
   Run,
+  ServiceRoleEntry,
   RunSources,
   ScheduleState,
   TerraformArtifact,
@@ -26,7 +27,11 @@ import type {
 import * as mock from "@/mocks/data";
 import { getIdToken } from "@/auth/cognito";
 
-const USE_MOCKS = import.meta.env.VITE_USE_MOCKS !== "false"; // 기본 mock
+// 🔴 fail-closed: **명시적으로 "true"** 일 때만 목데이터다. 이전엔 `!== "false"` 였는데, 그러면
+// 플래그를 잊은 빌드가 목데이터로 뜨고 — 더 나쁘게 — `USING_MOCKS` 가 **인증 게이트를 우회**한다
+// (`App.tsx` 의 auth gate). 실 배포 스크립트가 값을 넣어주므로 라이브는 정상이었지만, 기본값이
+// 위험한 쪽을 향하고 있었다. dev 는 `frontend/.env` 가 true 를 준다.
+const USE_MOCKS = import.meta.env.VITE_USE_MOCKS === "true";
 
 // mock 응답을 살짝 지연시켜 로딩 상태를 실제처럼 확인 가능하게.
 function delay<T>(value: T, ms = 220): Promise<T> {
@@ -66,6 +71,9 @@ export interface Api {
   // 2차 확인 후: tooling-IdC 에 PS 정의 생성(assignment 제외).
   provisionPermissionSet(persona: string): Promise<ProvisionResult>;
   getCleanup(): Promise<CleanupItem[]>;
+  // 트랙②(기계가 쓰는 현역 역할)의 서비스 단위 접기 산출물. 최신 run 기준.
+  // 빈 배열 = 대상 0(정상 상태). 실패는 예외로 던진다 — 화면이 0 과 '못 읽었다' 를 구분해야 한다.
+  getServiceRoles(): Promise<ServiceRoleEntry[]>;
   // 조치 상태 표시. 실제 조치는 사람이 AWS 에서 수행하고 여기엔 그 사실만 기록한다.
   // findingKey 가 빈 항목(구 형식 산출물)은 호출하면 안 된다 — 상태를 붙일 대상을 특정할 수 없다.
   setCleanupStatus(findingKey: string, status: CleanupStatus, note: string): Promise<CleanupStatusRecord>;
@@ -252,6 +260,7 @@ const mockApi: Api = {
       900,
     ),
   getCleanup: () => delay(mock.CLEANUP.map((c) => ({ ...c }))),
+  getServiceRoles: () => delay(structuredClone(mock.SERVICE_ROLES)),
   // mock 은 모듈 상태를 그 자리에서 갱신한다 — 표시 후 재조회했을 때 값이 유지되는지(=화면이
   // 낙관적 갱신에만 의존하지 않는지)까지 확인할 수 있어야 한다.
   setCleanupStatus: (findingKey, status, note) => {
@@ -326,6 +335,7 @@ const realApi: Api = {
   provisionPermissionSet: (persona) =>
     real(`/catalog/${encodeURIComponent(persona)}/provision-ps`, { method: "POST" }),
   getCleanup: () => real("/cleanup-backlog"),
+  getServiceRoles: () => real("/service-roles"),
   setCleanupStatus: (findingKey, status, note) =>
     real(`/cleanup-backlog/${encodeURIComponent(findingKey)}/status`, {
       method: "PUT",

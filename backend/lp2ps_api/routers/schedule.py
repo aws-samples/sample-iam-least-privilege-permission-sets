@@ -4,8 +4,12 @@
 Functions 파이프라인으로 배선돼 있으므로, 여기서는 **cron 식과 활성/비활성만** 바꾼다. 멤버계정은
 전혀 건드리지 않는다(불변식① — 쓰기는 도구 소유 EventBridge 규칙 한정).
 
-프론트는 빈도 프리셋(daily/weekly/…)을 보내고, 백엔드가 결정론적으로 cron 식으로 변환한다. 고급
-사용자는 cron 식을 직접 보낼 수도 있다(mode=custom). 저장된 규칙은 항상 cron 으로 조회된다.
+프론트는 빈도 프리셋(daily/weekly/…)을 보내고, 백엔드가 결정론적으로 cron 식으로 변환한다.
+🔴 **조회는 그 변환을 되돌린다**(`_from_cron`). 예전에는 `frequency="custom"` 을 무조건 돌려줘서
+"매일 02:00 KST" 로 저장한 예약을 다시 열면 프리셋이 사라지고 UTC cron 원문이 떠 있었다 —
+고급 기능이 아니라 왕복(save→reload) 결함이었다. `_to_cron` 이 만드는 형태는 결정론적이므로
+역매핑도 결정론적이다. 우리 형태와 안 맞는 cron(손으로 만든 규칙)만 `custom` 으로 남긴다 —
+API 는 읽기 호환을 위해 `custom` 을 계속 받아들이고, 화면에서만 감춘다.
 """
 
 from __future__ import annotations
@@ -61,6 +65,37 @@ def _to_cron(s: ScheduleState) -> str:
     raise HTTPException(422, "지원하지 않는 frequency 입니다.")
 
 
+def _from_cron(cron: str) -> ScheduleState:
+    """cron 6필드 → 프리셋 복원(`_to_cron` 의 역함수). 우리 형태가 아니면 `custom`.
+
+    우리가 만드는 형태는 세 가지뿐이다:
+      daily   `0 {h} * * ? *`
+      weekly  `0 {h} ? * {dow} *`
+      monthly `0 {h} {dom} * ? *`
+    분이 0 이 아니거나 월/연이 `*` 가 아니면 우리 것이 아니다 → `custom` 으로 둔다(422 를 내지
+    않는다. 손으로 만든 규칙을 조회만 하다가 화면이 깨지면 예약을 고칠 방법이 없어진다).
+    """
+    base = ScheduleState(enabled=False, frequency="custom", cron=cron)
+    parts = cron.split()
+    if len(parts) != 6:
+        return base
+    minute, hour, dom, month, dow, year = parts
+    if minute != "0" or month != "*" or year != "*" or not hour.isdigit():
+        return base
+    h = int(hour)
+    if not 0 <= h <= 23:
+        return base
+    if dom == "*" and dow == "?":
+        return ScheduleState(enabled=False, frequency="daily", hour_utc=h, cron=cron)
+    if dom == "?" and dow.isdigit() and 1 <= int(dow) <= 7:
+        return ScheduleState(enabled=False, frequency="weekly", hour_utc=h,
+                             day_of_week=int(dow), cron=cron)
+    if dow == "?" and dom.isdigit() and 1 <= int(dom) <= 28:
+        return ScheduleState(enabled=False, frequency="monthly", hour_utc=h,
+                             day_of_month=int(dom), cron=cron)
+    return base
+
+
 def _events_client():
     return boto3.client("events", region_name=get_settings().region)
 
@@ -82,11 +117,9 @@ def get_schedule() -> ScheduleState:
     # `cron(...)` → 안쪽 6필드만.
     expr = r.get("ScheduleExpression", "")
     cron = expr[5:-1] if expr.startswith("cron(") and expr.endswith(")") else ""
-    return ScheduleState(
-        enabled=r.get("State") == "ENABLED",
-        frequency="custom",  # 저장된 규칙은 cron 원본만 보존 — 편집 시 프리셋 재선택 가능.
-        cron=cron,
-    )
+    state = _from_cron(cron)
+    state.enabled = r.get("State") == "ENABLED"
+    return state
 
 
 @router.put("/schedule")

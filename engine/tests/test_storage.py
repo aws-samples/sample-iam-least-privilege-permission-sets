@@ -140,6 +140,91 @@ def test_normalized_roundtrip_keeps_unmeasured_as_null(tmp_path) -> None:
     assert got.unused_days is None
 
 
+def test_session_name_shape_rejects_raw_value(tmp_path) -> None:
+    """R1-a fail-closed — `session_name_shape` 에 세션 이름 **원문**을 넣을 수 없어야 한다.
+
+    사람 판정의 가장 강한 근거(세션 이름)가 개인정보다 — SSO 는 이메일을, 자동화는 계정 ID 를
+    세션 이름에 쓴다. 열린 str 이면 구현 실수 한 번에 원문이 산출물로 새어 나가고, S3 에 쓰인
+    다음에는 되돌릴 수 없다. 닫힌 라벨 집합 + 대입 검증으로 **쓰기 전에** 막는다.
+    """
+    import pydantic
+    import pytest
+
+    rec = _rec("111122223333", "arn:a")
+    with pytest.raises(pydantic.ValidationError):
+        rec.session_name_shape = "someone@example.com"  # 원문(이메일)
+    with pytest.raises(pydantic.ValidationError):
+        rec.session_name_shape = "finops-cost-111122223333"  # 원문(계정 ID 포함)
+    with pytest.raises(pydantic.ValidationError):
+        PrincipalRecord(
+            account_id="111122223333", principal="arn:a", identity_type="role",
+            run_id="run-x", session_name_shape="someone@example.com",
+        )
+    # 대조군 — 정상 라벨은 통과한다(위 어서션이 무조건 실패하는 것이 아님을 증명).
+    rec.session_name_shape = "email_like"
+    assert rec.session_name_shape == "email_like"
+
+
+def test_normalized_roundtrip_preserves_subject_tenant_and_track(tmp_path) -> None:
+    """사용 주체·테넌트·등급·와일드카드·트랙 필드가 parquet 왕복에서 살아남아야 한다.
+
+    스키마 대조는 컬럼 **존재**만 본다. 이 값들이 죽으면 (a) 사람이 쓰는 역할이 다시 전부
+    '판별 불가' 로 표시되고 (b) 다른 고객 계정을 신뢰하는 역할이 internal 로 보이며
+    (c) 전 권한 보유자가 다시 findings 0 으로 가장 깨끗하게 보인다.
+    """
+    st = LocalFSStorage(tmp_path, "acme", "run-1")
+    rec = _rec("111122223333", "arn:a")
+    rec.usage_subject = "human"
+    rec.usage_subject_basis = "mfa_session"
+    rec.session_name_shape = "email_like"
+    rec.tenant_group = "customerA"
+    rec.trust_scope = "cross_tenant"
+    rec.trust_wildcard = True
+    rec.unused_days = 1076
+    rec.unused_days_basis = "create_date"
+    rec.unused_tier = "cleanup"
+    rec.wildcard_grants = ["*", "s3:*"]
+    rec.track = "owner_review"
+    rec.excluded_reason = None
+    got = _roundtrip_single(st, rec)
+
+    assert got.usage_subject == "human"
+    assert got.usage_subject_basis == "mfa_session"
+    # 분류값만 남는다 — 원문(이메일)은 애초에 담지 않는다(R1-a).
+    assert got.session_name_shape == "email_like"
+    assert got.tenant_group == "customerA"
+    assert got.trust_scope == "cross_tenant"
+    assert got.trust_wildcard is True
+    assert got.unused_days == 1076
+    assert got.unused_days_basis == "create_date"
+    assert got.unused_tier == "cleanup"
+    assert got.wildcard_grants == ["*", "s3:*"]
+    assert got.track == "owner_review"
+
+
+def test_normalized_roundtrip_keeps_subject_defaults_fail_safe(tmp_path) -> None:
+    """대조군 — 판정하지 않은 축은 **추정값이 아니라 fail-safe 기본값**으로 왕복해야 한다.
+
+    `usage_subject="none"`(사람도 기계도 아니라고 말하지 않는다) · `trust_scope="unconfirmed"`
+    (모르면 소유자 확인) · `track=None`(미배정과 '정상 제외' 는 다르다) · 등급 None(미측정).
+    여기서 `track` 이 "excluded" 로 왕복하면 배정 버그가 정상 제외로 위장된다.
+    """
+    st = LocalFSStorage(tmp_path, "acme", "run-1")
+    got = _roundtrip_single(st, _rec("111122223333", "arn:a"))
+
+    assert got.usage_subject == "none"
+    assert got.usage_subject_basis == ""
+    assert got.session_name_shape is None
+    assert got.tenant_group == ""
+    assert got.trust_scope == "unconfirmed"
+    assert got.trust_wildcard is False
+    assert got.unused_days_basis is None
+    assert got.unused_tier is None
+    assert got.wildcard_grants == []
+    assert got.track is None
+    assert got.excluded_reason is None
+
+
 def _roundtrip_single(st: LocalFSStorage, rec: PrincipalRecord) -> PrincipalRecord:
     st.write_normalized([rec])
     return st.read_normalized()[0]

@@ -27,6 +27,9 @@ def _seed(st) -> None:
         # 미사용 role + 미사용 권한 + escalation.
         PrincipalRecord(account_id="111122223333", principal="arn:aws:iam::111122223333:role/idle",
                         identity_type="role", granted_actions=["s3:DeleteBucket"],
+                        # 신뢰 대상이 내부로 확인된 역할 → 삭제 검토(`unused_role`). 명시하지 않으면
+                        # 모델 기본값 `unconfirmed` 라 유형이 `unconfirmed_trust_role` 로 갈린다(R5).
+                        trust_scope="internal",
                         unused_findings=["s3:DeleteBucket"], risk_level="high",
                         escalation_paths=[EscalationPath(via="iam:*", to="x", mitre="TA0004")],
                         run_id="run-x"),
@@ -63,9 +66,14 @@ def test_backlog_has_five_types(tmp_path):
 
 
 def _role_rec(**kw) -> PrincipalRecord:
+    # `trust_scope="internal"` 을 기본값으로 둔다: 이 파일의 미사용 역할 테스트는 **일수·문구**를
+    # 검증하는 것이고, 신뢰 축은 유형을 `unused_role` / `unconfirmed_trust_role` 로 가른다(R5).
+    # 모델 기본값은 fail-safe 인 `unconfirmed` 이므로 명시하지 않으면 전부 삭제 권고가 없는 쪽으로
+    # 가고, 그러면 "삭제 권고" 를 검증하는 대조군이 통째로 죽는다. 신뢰 축 자체의 검증은
+    # test_tracks_and_tenancy.py 가 담당한다.
     base = dict(account_id="111122223333", principal="arn:aws:iam::111122223333:role/repl",
                 identity_type="role", granted_actions=["s3:ReplicateObject"],
-                risk_level="low", run_id="run-x")
+                trust_scope="internal", risk_level="low", run_id="run-x")
     base.update(kw)
     return PrincipalRecord(**base)
 
@@ -163,7 +171,7 @@ def test_unused_role_detected_via_managed_only(tmp_path):
     st.write_normalized([
         PrincipalRecord(account_id="111122223333", principal="arn:aws:iam::111122223333:role/mgd",
                         identity_type="role", granted_actions=[], has_managed_policies=True,
-                        risk_level="low", run_id="run-x"),
+                        trust_scope="internal", risk_level="low", run_id="run-x"),
     ])
     st.write_json("catalog.json", [])
     build_reports(st, RUN, _cfg())
@@ -405,15 +413,17 @@ def test_unused_role_evidence_states_measured_window(tmp_path):
     st = LocalFSStorage(tmp_path, "test", "run-x")
     rec = _role_rec(used_actions=[], used_services=[], age_days=560,
                     create_date="2025-01-01T00:00:00+00:00", observed_days=2,
-                    observed_from="2026-07-13T00:00:00+00:00")
+                    observed_from="2026-07-13T00:00:00+00:00",
+                    unused_days=560, unused_days_basis="create_date")
     rows = _rows_of_type(st, [rec], "unused_role")
     evidence = json.loads(rows[0]["evidence"])
-    assert "CloudTrail 2일" in evidence["사용 근거"]
-    assert "AWS 사양" in evidence["사용 근거"], "측정하지 않은 400일을 실측처럼 적으면 안 된다"
-    assert evidence["삭제 판단 최소 경과"] == "90일"  # config risk_rules.unused_action_days
+    assert "CloudTrail 2일" in evidence["수집된 사용 흔적"]
+    assert "AWS 사양" in evidence["수집된 사용 흔적"], "측정하지 않은 400일을 실측처럼 적으면 안 된다"
+    # 임계치는 config(risk_rules.unused_role_days)에서 온다 — 리터럴이 아니다.
+    assert evidence["삭제 검토 임계"] == "미사용 90일 이상"
     # detail 은 판정 창이 아니라 **미사용 기간**을 말한다(사용자가 목록에서 먼저 보는 값).
-    # 판정 창은 위 '사용 근거' 가 이미 싣고 있어, 한 줄에 둘을 겹쳐 쓰면 둘 다 안 읽힌다.
-    assert "미사용 최소 400일 이상" in rows[0]["detail"]
+    # 판정 창은 위 '수집된 사용 흔적' 이 이미 싣고 있어, 한 줄에 둘을 겹쳐 쓰면 둘 다 안 읽힌다.
+    assert "생성 후 560일" in rows[0]["detail"]
 
 
 def test_unused_role_evidence_says_no_cloudtrail_when_absent(tmp_path):
@@ -424,7 +434,7 @@ def test_unused_role_evidence_says_no_cloudtrail_when_absent(tmp_path):
     rows = _rows_of_type(st, [rec], "unused_role")
     evidence = json.loads(rows[0]["evidence"])
     # CloudTrail 부분은 일수를 포함하지 않아야 한다 — "CloudTrail None일" 같은 값이 새면 안 된다.
-    ct_part = evidence["사용 근거"].split(" + Access Advisor")[0]
+    ct_part = evidence["수집된 사용 흔적"].split(" + Access Advisor")[0]
     assert ct_part == "없음(CloudTrail 근거 없음", ct_part
 
 
@@ -434,20 +444,24 @@ def test_unused_role_evidence_says_no_cloudtrail_when_absent(tmp_path):
 # 실제 값은 이미 받아오던 GetAccountAuthorizationDetails 응답의 RoleLastUsed 에 있었다.
 
 
-def test_unused_role_reports_lower_bound_period(tmp_path):
-    """IAM 활동 기록이 없으면 기간을 **하한**으로 말한다 — 생성 후 경과를 넘지 않는다.
+def test_period_from_create_date_says_what_it_counted(tmp_path):
+    """IAM 활동 기록이 없으면 **무엇부터 센 일수인지**를 문구에 담는다(R2 ②).
 
-    추적 창(400일)을 그대로 쓰면 200일 된 역할에 "최소 400일 미사용" 이라고 적어, 존재하지도
-    않던 기간을 주장하게 된다.
+    예전엔 "최소 200일 이상" 이라고 썼다. 그 값이 IAM 이 측정한 미사용 기간인지 우리가 생성일부터
+    센 것인지 구분되지 않아, 둘 다 같은 문장으로 읽혔다. 추적 창(400일)을 그대로 쓰는 것도
+    금지다 — 200일 된 역할에 "최소 400일" 이면 존재하지도 않던 기간을 주장한다.
     """
     st = LocalFSStorage(tmp_path, "test", "run-x")
     rec = _role_rec(used_actions=[], used_services=[], age_days=200,
-                    create_date="2026-02-13T00:00:00+00:00")
+                    create_date="2026-02-13T00:00:00+00:00",
+                    unused_days=200, unused_days_basis="create_date")
     rows = _rows_of_type(st, [rec], "unused_role")
     evidence = json.loads(rows[0]["evidence"])
     assert evidence["마지막 활동"] == "IAM 활동 기록 없음"
-    assert evidence["미사용 기간"] == "최소 200일 이상", "하한은 생성 후 경과로 잘라야 한다"
-    assert "미사용 최소 200일 이상" in rows[0]["detail"]
+    assert evidence["미사용 기간"] == "생성 후 200일 · 사용 기록 없음(AWS 추적 보장 400일)"
+    assert "400일" not in evidence["미사용 기간"].split("(")[0], "경과일 자리에 추적 창이 새면 안 된다"
+    assert evidence["일수 근거"] == "생성일(활동 기록 없음)"
+    assert "생성 후 200일" in rows[0]["detail"]
 
 
 def test_new_role_does_not_get_a_period_lower_bound(tmp_path):
@@ -463,17 +477,19 @@ def test_new_role_does_not_get_a_period_lower_bound(tmp_path):
     assert evidence["미사용 기간"].startswith("판단 보류")
 
 
-def test_unused_role_period_capped_at_tracking_window(tmp_path):
-    """대조군 — 생성 후 경과가 추적 창보다 길면 하한은 추적 창에서 멈춘다.
+def test_period_from_create_date_is_not_capped_but_flags_tracking_window(tmp_path):
+    """대조군 — 추적 창으로 **자르지 않는다**. 대신 그 창을 문구로 밝힌다.
 
-    이 대조가 없으면 위 테스트는 min() 을 age_days 로 바꿔치기해도 통과한다. 그러면 5년 된
-    역할에 "최소 1800일 미사용" 이라고 적는데, IAM 은 400일 밖을 추적하지 않아 근거가 없다.
+    예전엔 min(생성 후 경과, 400)으로 잘랐다. 자르면 5년 된 역할과 400일 된 역할이 같은 문장이
+    되어 정리 우선순위가 사라진다. 생성 후 1800일은 사실이므로 그대로 말하고, 그 안에 IAM 이
+    보장하는 추적 범위가 400일뿐이라는 한계를 같은 줄에 붙인다.
     """
     st = LocalFSStorage(tmp_path, "test", "run-x")
     rec = _role_rec(used_actions=[], used_services=[], age_days=1800,
-                    create_date="2021-09-01T00:00:00+00:00")
+                    create_date="2021-09-01T00:00:00+00:00",
+                    unused_days=1800, unused_days_basis="create_date")
     evidence = json.loads(_rows_of_type(st, [rec], "unused_role")[0]["evidence"])
-    assert evidence["미사용 기간"] == "최소 400일 이상"
+    assert evidence["미사용 기간"] == "생성 후 1800일 · 사용 기록 없음(AWS 추적 보장 400일)"
 
 
 def test_unknown_age_does_not_invent_a_period(tmp_path):
@@ -553,3 +569,118 @@ def test_snapshot_splits_new_roles_out_of_unused_roles(tmp_path):
     point = write_snapshot(st, RUN, account_scope=1, status="succeeded")
     assert point.unused_roles == 1, "신규 역할이 섞이면 조치 가능 건수가 부풀려진다"
     assert point.new_unused_roles == 1
+
+
+# ---------------------------------------------------------------------------
+# 고객이 읽는 문구 — 계약값(cleanup/TA0004/rule id)을 그대로 노출하지 않는다.
+#
+# 라이브에서 실제로 났던 일이다: 증거 모달에 `미사용 등급: cleanup` 과
+# `iam:PassRole + lambda:CreateFunction → lambda-exec-role (TA0004)` 이 원문으로 떠 있었다.
+# 우리에겐 규칙 식별자지만 고객에겐 해독 대상이고, `cleanup` 은 "지워도 되는 것" 으로 읽힌다.
+# ---------------------------------------------------------------------------
+
+
+def _row_of_type(st, recs, ctype: str, cfg: Config | None = None) -> dict:
+    st.write_normalized(recs)
+    st.write_json("catalog.json", [])
+    build_reports(st, RUN, cfg or _cfg())
+    rows = [r for r in csv.DictReader(io.StringIO(st.read_bytes(BACKLOG_NAME).decode()))
+            if r["type"] == ctype]
+    assert len(rows) == 1, f"{ctype} 행이 {len(rows)}개다(전제 실패 — 문구를 측정할 수 없다)"
+    return rows[0]
+
+
+def _idle_role(**kw):
+    base = dict(used_actions=[], used_services=[], age_days=560,
+                create_date="2025-01-01T00:00:00+00:00", unused_days=147,
+                unused_days_basis="role_last_used", unused_tier="cleanup")
+    base.update(kw)
+    return _role_rec(**base)
+
+
+def test_tier_evidence_is_a_sentence_not_the_contract_value(tmp_path):
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    ev = json.loads(_row_of_type(st, [_idle_role()], "unused_role")["evidence"])
+    assert ev["미사용 등급"] == "90일 이상 미사용"
+    for raw in ("cleanup", "watch", "review", "active"):
+        assert raw not in ev["미사용 등급"]
+
+
+def test_tier_evidence_follows_config_boundaries(tmp_path):
+    """경계를 조정한 고객(불변식 ④)의 증거가 90 을 말하면 안 된다.
+
+    문구에 숫자를 박으면 이 테스트가 FAIL 한다 — 그것이 이 테스트의 존재 이유다.
+    """
+    cfg = Config.model_validate({
+        "customer": "test", "region": "us-west-2", "cross_account": False, "accounts": ["self"],
+        "risk_rules": {"unused_tier_days": [10, 20, 45], "unused_role_days": 45},
+    })
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    ev = json.loads(_row_of_type(st, [_idle_role()], "unused_role", cfg)["evidence"])
+    assert ev["미사용 등급"] == "45일 이상 미사용"
+
+
+def test_ungraded_tier_says_unmeasured_not_zero(tmp_path):
+    """등급 없음은 0 이 아니라 미측정이다 — 문구에서도 그 구분을 잃지 않는다."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    ev = json.loads(_row_of_type(st, [_idle_role(unused_tier=None)], "unused_role")["evidence"])
+    assert ev["미사용 등급"].startswith("미측정")
+
+
+def test_escalation_labels_cover_every_rule():
+    """규칙을 추가하고 문구를 안 붙이면 화면이 조용히 원문 폴백으로 돌아간다 — 여기서 잡는다."""
+    from lp2ps.m3_escalation import _RULES
+    from lp2ps.m6_reporter import _ESCALATION_LABEL, _MITRE_LABEL
+
+    missing = [(via, to) for _needed, via, to, _mitre in _RULES if (via, to) not in _ESCALATION_LABEL]
+    assert not missing, f"상승 경로 문구가 없는 규칙: {missing}"
+    tactics = {mitre for _needed, _via, _to, mitre in _RULES}
+    assert tactics <= set(_MITRE_LABEL), f"뜻을 안 붙인 MITRE 코드: {tactics - set(_MITRE_LABEL)}"
+
+
+def test_escalation_evidence_explains_what_the_attacker_can_do(tmp_path):
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    rec = _role_rec(escalation_paths=[EscalationPath(
+        via="iam:PassRole + lambda:CreateFunction", to="lambda-exec-role", mitre="TA0004")])
+    row = _row_of_type(st, [rec], "escalation_path")
+    ev = json.loads(row["evidence"])
+    # 결론이 문장으로 있다.
+    assert "Lambda 함수" in ev["무엇이 가능한가"] and ev["무엇이 가능한가"].endswith("다.")
+    # 목록 행(detail)도 규칙 식별자가 아니다.
+    assert "iam:PassRole" not in row["detail"] and "TA0004" not in row["detail"]
+    # 🔴 그러면서 원문 추적은 끊기지 않는다 — 고객이 정책에서 찾을 문자열과 규칙 식별자·코드가 남아 있다.
+    assert ev["필요한 권한(정책에서 찾을 문자열)"] == "iam:PassRole + lambda:CreateFunction"
+    assert "lambda-exec-role" in ev["도달 대상"]
+    assert ev["MITRE ATT&CK"].startswith("TA0004") and "권한 상승" in ev["MITRE ATT&CK"]
+
+
+def test_unlabeled_escalation_rule_falls_back_to_the_raw_rule(tmp_path):
+    """문구가 없는 조합은 항목을 빠뜨리지 않고 원문으로 낸다(설명이 없다고 감추면 더 나쁘다)."""
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    rec = _role_rec(escalation_paths=[EscalationPath(via="iam:*", to="x", mitre="TA0004")])
+    row = _row_of_type(st, [rec], "escalation_path")
+    assert row["detail"] == "iam:* → x"
+    assert json.loads(row["evidence"])["도달 대상"] == "x (x)"
+
+
+def test_every_recommendation_stays_a_short_verb_phrase() -> None:
+    """🔴 권고문 **전 조합**(유형 × 그룹 × IdC 사용여부)이 짧은 동사구다 — F18 의 요구는 길이다.
+
+    이 전수 검사가 없던 동안 `needs_confirmation` 접두문이 문장으로 남아 라이브 백로그 42행이
+    **76~83자 두 문장**이었다(2026-09-11 CSV 전수 실측). 유형별 문구는 단위 테스트가 봤지만 **접두문이
+    붙은 합성문**은 아무도 재지 않았다 — 그래서 개별 문구만 압축하고 합성문은 그대로 통과했다.
+    바(60자)는 라이브 하네스(`live-check.mjs` F18 스텝)와 같은 값이다.
+    """
+    from typing import get_args
+
+    from lp2ps.m6_reporter import _recommendation
+    from lp2ps.models import CleanupGroup, CleanupType
+
+    bad = []
+    for ctype in get_args(CleanupType):
+        for group in (*get_args(CleanupGroup), None):
+            for uses_idc in (True, False):
+                text = _recommendation(ctype, uses_idc, group)
+                if len(text) > 60 or "—" in text or "\n" in text:
+                    bad.append((ctype, group, uses_idc, len(text), text))
+    assert not bad, bad

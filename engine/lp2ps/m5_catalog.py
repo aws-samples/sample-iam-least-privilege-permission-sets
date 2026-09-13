@@ -12,6 +12,12 @@ ec2/lambda 를 쓰지만 동사(Create vs Describe)가 다르기 때문. 그래�
 군집 키 = Admin 이면 `BroadAdmin`(도메인 무시), 아니면 `{도메인}{성격}`(예: ComputeWrite,
 DataReadOnly). 결정론 명명 → 사람이 검토·승인(approval_status=draft).
 
+**여기에 테넌트 그룹이 축으로 하나 더 붙는다**(R8): 군집은 그룹 안에서만 이뤄진다. 여러 고객 계정을
+한 배포에서 관리할 때, 축이 없으면 A 고객 정책이 B 고객 사용 실태에서 파생되고 A 에게 주는 산출물에
+B 계정 ARN 이 들어간다. 화면 필터로는 해결되지 않는다 — 표시를 걸러도 정책 내용은 합쳐진 상태다.
+
+대상 선별은 이 모듈이 하지 않는다. `m5_tracks` 가 배정한 `track == "persona"` 만 읽는다.
+
 `member_count` = 접근 패턴을 공유하는 principal ARN 수.
 
 불변식 ②(결정론): 동사·도메인 규칙과 정렬만으로 군집, wall-clock/random 없음 → 같은 입력 → 같은 catalog.
@@ -87,42 +93,61 @@ _IDENTITY_CONTROL_SERVICES = {"iam", "sso", "organizations"}
 def build_catalog(storage: "Storage", run: "RunContext", cfg: "CatalogConfig") -> list[CatalogEntry]:
     """normalized.parquet → persona 카탈로그(catalog.json). 반환 = CatalogEntry[]."""
     records = storage.read_normalized()
+    active = [r for r in records if _is_persona_member(r, cfg)]
 
-    # 예외/미사용 principal 은 persona 대상에서 제외(사용 실태 기반 최소권한 카탈로그).
-    active = [r for r in records if r.used_actions and not r.is_exception]
-    # 서비스 실행 역할 제외(기본 켜짐) — 신뢰정책 근거. `unknown`(Principal.AWS 만)은 남긴다:
-    # 신뢰정책만으로 갈릴 수 없으므로 추측으로 버리지 않고 사람이 볼 수 있게 카탈로그에 둔다.
-    if cfg.exclude_service_roles:
-        active = [r for r in active if r.principal_kind != "service"]
-    # IaC 배포 전용 역할 제외(이름 패턴). 신뢰정책이 `Principal.AWS` 뿐이라 위 필터를 통과하는
-    # CDK/Terraform 배포 역할을 걸러낸다 — 사람이 assume 하는 역할이 아니므로 persona 대상이 아니다.
-    if cfg.exclude_principal_patterns:
-        active = [r for r in active if not _matches_pattern(r.principal, cfg.exclude_principal_patterns)]
-
-    # 군집 키(도메인×성격) → principal 목록.
-    clusters: dict[str, list[PrincipalRecord]] = {}
+    # 군집 키(**테넌트 그룹** × 도메인 × 성격) → principal 목록. 테넌트 축이 없으면 A 고객 정책이
+    # B 고객 사용 실태에서 파생되고 A 에게 주는 산출물에 B 계정 ARN 이 들어간다(R8).
+    clusters: dict[tuple[str, str], list[PrincipalRecord]] = {}
     for rec in active:
-        key = _cluster_key(rec, cfg)
-        clusters.setdefault(key, []).append(rec)
+        clusters.setdefault((rec.tenant_group, _cluster_key(rec, cfg)), []).append(rec)
 
     entries: list[CatalogEntry] = []
-    small_members: list[PrincipalRecord] = []
+    # 소수 군집을 합치는 'General' 도 **그룹별로** 따로 모은다. 하나로 합치면 격리가 여기서 새고,
+    # 그 경로가 가장 눈에 안 띈다(정상 군집은 분리됐는데 기타 묶음만 섞인다).
+    small_by_group: dict[str, list[PrincipalRecord]] = {}
     # 군집 키를 정렬해 결정론 순서로 처리.
-    for key in sorted(clusters):
-        members = clusters[key]
+    for group, key in sorted(clusters):
+        members = clusters[(group, key)]
         if len(members) < cfg.min_members_for_persona:
             # 최소 인원 미만 군집은 버리지 않고 'General'(기타)로 합친다 → persona 과다분할 방지.
-            small_members.extend(members)
+            small_by_group.setdefault(group, []).extend(members)
             continue
-        entries.append(_entry_for(key, members, cfg))
+        entries.append(_entry_for(key, members, cfg, group))
 
-    if small_members:
-        entries.append(_entry_for("General", small_members, cfg))
+    for group in sorted(small_by_group):
+        entries.append(_entry_for("General", small_by_group[group], cfg, group))
 
     # persona 명 정렬(결정론).
     entries.sort(key=lambda e: e.persona)
     _write_catalog(storage, entries)
     return entries
+
+
+def _is_persona_member(rec: PrincipalRecord, cfg: "CatalogConfig") -> bool:
+    """이 principal 이 persona 묶음 대상인가.
+
+    배정이 끝난 레코드(`track` 채워짐)는 **다시 판정하지 않는다** — 트랙은 `m5_tracks` 가 한 곳에서
+    정하고(제외 사유까지 함께 남긴다) 여기서 조건을 또 쓰면 화면이 "제외" 라고 말한 대상이 persona
+    에 들어 있는 어긋남이 생긴다.
+
+    `track` 이 없을 때만 예전 규칙으로 내려간다. 두 경우가 있다: 이 필드가 없던 시절의
+    `normalized.parquet` 을 다시 읽는 경우, 그리고 `assign_tracks` 없이 이 함수를 직접 부르는 경우.
+    """
+    if rec.track is not None:
+        return rec.track == "persona"
+    # 예외/실사용 근거 없는 principal 은 대상 아님(사용 실태 기반 최소권한 카탈로그).
+    if not rec.used_actions or rec.is_exception:
+        return False
+    # 서비스 실행 역할 제외(기본 켜짐) — 신뢰정책 근거. `unknown`(Principal.AWS 만)은 남긴다:
+    # 신뢰정책만으로 갈릴 수 없으므로 추측으로 버리지 않고 사람이 볼 수 있게 카탈로그에 둔다.
+    if cfg.exclude_service_roles and rec.principal_kind == "service":
+        return False
+    # IaC 배포 전용 역할 제외(이름 패턴). 신뢰정책이 `Principal.AWS` 뿐이라 위 필터를 통과하는
+    # CDK/Terraform 배포 역할을 걸러낸다 — 사람이 assume 하는 역할이 아니므로 persona 대상이 아니다.
+    return not (
+        cfg.exclude_principal_patterns
+        and _matches_pattern(rec.principal, cfg.exclude_principal_patterns)
+    )
 
 
 def _matches_pattern(arn: str, patterns: list[str]) -> bool:
@@ -202,8 +227,28 @@ _PROFILE_DESC = {
 }
 
 
-def _entry_for(key: str, members: list[PrincipalRecord], cfg: "CatalogConfig") -> CatalogEntry:
-    persona = f"{key}Persona"
+def _persona_name(key: str, tenant_group: str) -> str:
+    """군집 키 → persona 명. 기본 그룹은 접두를 **붙이지 않는다**.
+
+    격리를 디렉터리 층위가 아니라 이름으로 하는 이유: `policies/{persona}.json` 경로를 persona
+    **이름에서 다시 만드는** 호출부가 셋이다(`m7_iac_emitter` · `m7_policy_synth` ·
+    백엔드 repositories). 층위를 넣으면 세 곳이 조용히 엇갈린 경로를 만든다.
+
+    기본 그룹에 접두를 안 붙이는 것은 하위호환이다 — 단일 그룹 배포(문자열 목록 config)는 persona
+    명과 정책 경로가 이전과 **바이트 동일**하게 유지되고, 승인 상태·Permission Set 이름이 이름으로
+    이어져 있어서 접두가 붙으면 전부 새 persona 로 보인다.
+    """
+    from .config import DEFAULT_TENANT_GROUP
+
+    if not tenant_group or tenant_group == DEFAULT_TENANT_GROUP:
+        return f"{key}Persona"
+    return f"{tenant_group}_{key}Persona"
+
+
+def _entry_for(
+    key: str, members: list[PrincipalRecord], cfg: "CatalogConfig", tenant_group: str = ""
+) -> CatalogEntry:
+    persona = _persona_name(key, tenant_group)
     by_arn = {r.principal: r for r in members}
     member_arns = sorted(by_arn)
     # 판별 근거를 members 와 동일 순서로 실어 보낸다(UI 배지·사람/서비스 필터용). 사람의 분류를
@@ -214,6 +259,12 @@ def _entry_for(key: str, members: list[PrincipalRecord], cfg: "CatalogConfig") -
             principal_kind=by_arn[arn].principal_kind,
             trust_principals=list(by_arn[arn].trust_principals),
             tags=dict(by_arn[arn].tags),
+            # 실사용 축(R1)과 계정. 이게 유일하게 principal 단위 근거가 화면에 닿는 경로다 —
+            # `PrincipalRecord` 는 프론트에서 쓰이지 않는다. 이 세 값이 없으면 배지는 신뢰정책만
+            # 보고 사람이 쓰는 역할을 전부 '판별 불가' 로 표시한다.
+            usage_subject=by_arn[arn].usage_subject,
+            usage_subject_basis=by_arn[arn].usage_subject_basis,
+            account_id=by_arn[arn].account_id,
         )
         for arn in member_arns
     ]
@@ -240,6 +291,7 @@ def _entry_for(key: str, members: list[PrincipalRecord], cfg: "CatalogConfig") -
 
     return CatalogEntry(
         persona=persona,
+        tenant_group=tenant_group,
         description=description,
         members=member_arns,
         member_details=member_details,
@@ -250,6 +302,7 @@ def _entry_for(key: str, members: list[PrincipalRecord], cfg: "CatalogConfig") -
         synthesis_source=synthesis_source,
         contributing_sources=contributing_sources,
         observed_window_days=observed_window_days,
+        count_min_observed_days=cfg.count_min_observed_days,
         actions=actions,
     )
 

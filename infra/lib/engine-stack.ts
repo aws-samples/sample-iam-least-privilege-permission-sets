@@ -141,7 +141,27 @@ export class EngineStack extends cdk.Stack {
         resultPath: `$.${name}Result`,
       });
 
-    const definition = stage("collect")
+    // 🔴 collect 만 결과를 상태 **루트로 승격**한다. 스케줄 트리거는 run_id/started_at 을 null 로
+    // 주는데(아래 Rule) 모든 stage 가 입력의 `$.run_id` 를 읽으므로, 승격하지 않으면 stage 마다
+    // 각자 새 run 컨텍스트를 만들고(`handler.py` — run_id 가 없으면 새로 생성) analyze 가
+    // 선행 산출물을 못 찾아 StageBarrierError 로 죽는다. 스케줄 실행 2건이 실제로 그렇게 실패했다
+    // (2026-09-12·09-13). API 트리거는 run_id 를 넣어주므로 우연히 살아 있었다 —
+    // 즉 **트리거 경로에 따라 결과가 갈리던 것**이고, 승격이 그 차이를 없앤다.
+    const collect = new tasks.LambdaInvoke(this, "Stage-collect", {
+      lambdaFunction: engineFn,
+      payload: sfn.TaskInput.fromObject({
+        stage: "collect",
+        "run_id.$": "$.run_id",
+        "started_at.$": "$.started_at",
+      }),
+      resultSelector: {
+        "run_id.$": "$.Payload.run_id",
+        "started_at.$": "$.Payload.started_at",
+      },
+      resultPath: "$", // 상태 입력을 {run_id, started_at} 로 교체 → 이후 stage 가 같은 run 을 본다.
+    });
+
+    const definition = collect
       .next(stage("analyze"))
       .next(stage("synth"))
       .next(stage("report"));

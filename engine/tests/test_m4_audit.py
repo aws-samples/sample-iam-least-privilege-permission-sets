@@ -40,6 +40,39 @@ def test_score_is_sum_of_weights(tmp_path):
     assert r.risk_level == "high"
 
 
+def test_reasons_are_ordered_by_contribution_and_carry_points(tmp_path):
+    """근거는 **기여도 내림차순**이고 각 문장에 그 규칙의 점수가 붙는다.
+
+    화면이 첫 줄을 "왜 이 등급인지" 한 줄 요약으로 쓴다(사용자 피드백 2026-09-11). 예전에는
+    `reasons.sort()` 알파벳 정렬이라 첫 줄이 최대 기여라는 보장이 없었다.
+
+    🔴 이 픽스처는 **알파벳 1위 ≠ 기여 1위** 로 잡았다 — 옛 코드에서 첫 줄은 "관리자급…"(+25)이고
+    기여 1위는 "권한 상승 경로 2건"(+40, 상한)이다. 그래야 어서션이 정렬을 실제로 잰다.
+    """
+    rules = RiskRules()
+    st = LocalFSStorage(tmp_path, "test", "run-x")
+    rec = _rec(
+        granted_actions=["*"],  # admin_like(25) + wildcard_action(20)
+        escalation_paths=[EscalationPath(via="a", to="b", mitre="TA0004"),
+                          EscalationPath(via="c", to="d", mitre="TA0004")],  # 2건 → 60이나 상한 40
+        unused_findings=["s3:a", "s3:b"],  # 2건 × 1 = 2
+    )
+    _seed(st, [rec])
+    reasons = score_risks(st, RUN, rules)[0].risk_reasons
+
+    points = [int(r.rsplit("(+", 1)[1].removesuffix("점)")) for r in reasons]
+    assert points == sorted(points, reverse=True), reasons
+    assert reasons[0].startswith("권한 상승 경로 2건")
+    # 상한에 걸린 사실을 말한다 — 2건인데 60이 아니라 40인 이유가 화면에서 설명돼야 한다.
+    assert "상한" in reasons[0]
+    assert reasons[0].endswith("(+40점)")
+    # 알파벳 정렬이었다면 "관리자급…" 이 첫 줄이었다(대조군: 이 문장은 존재하고 1위가 아니다).
+    assert any(r.startswith("관리자급 광범위 권한") for r in reasons)
+    assert not reasons[0].startswith("관리자급")
+    # 근거 점수 합 == 총점(클램프 전) — 문장에 실린 숫자가 실제 기여도다.
+    assert sum(points) == 40 + 25 + 20 + 2
+
+
 def test_audit_contributions_reproduce_score(tmp_path):
     rules = RiskRules()
     st = LocalFSStorage(tmp_path, "test", "run-x")

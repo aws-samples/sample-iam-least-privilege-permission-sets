@@ -1,6 +1,6 @@
 """M1 Collector — 오케스트레이션.
 
-`resolve_sessions` 로 대상 계정 세션(항상 read-only 가드)을 얻고, 계정마다 고정 순서 collector 4종을
+`resolve_scope` 로 대상 계정 세션(항상 read-only 가드)과 관제 계정 ID 를 얻고, 계정마다 고정 순서 collector 4종을
 실행해 `raw/<account_id>/<source>.json` 을 기록한다. 계정·소스별 상태(ok/degraded/skipped)를
 `collection_manifest.json` 으로 요약한다(수집 단계 계약 — `storage.py` 레이아웃 참조).
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .collectors import CollectorResult, all_collectors
-from .session import resolve_sessions
+from .session import resolve_scope
 
 if TYPE_CHECKING:  # pragma: no cover
     from boto3.session import Session
@@ -33,7 +33,7 @@ def collect(
 
     반환 manifest 구조:
         {
-          "run_id", "customer", "started_at", "account_scope",
+          "run_id", "customer", "started_at", "account_scope", "tooling_account_id",
           "status": "succeeded" | "degraded",   # degraded 는 실제 저품질 소스가 있을 때만.
                                                  # skipped(선택적 소스 미존재)는 정상 → succeeded.
           "status_summary": {"degraded_sources", "skipped_sources", "has_skipped"},
@@ -45,7 +45,8 @@ def collect(
     # run_id 는 assume-role 감사 이벤트의 correlation_id 로 쓰인다(감사 요건). 이 호출은
     # `_run_one` 의 예외 포획 **밖**이므로 assume 실패는 지금과 동일하게 run 을 실패시킨다 —
     # 달라진 것은 실패가 구조화 감사 라인으로 먼저 기록된다는 점뿐이다.
-    sessions = resolve_sessions(config, base_session=base_session, run_id=run.run_id)
+    scope = resolve_scope(config, base_session=base_session, run_id=run.run_id)
+    sessions = scope.sessions
 
     account_entries: list[dict] = []
     any_degraded = False
@@ -96,6 +97,10 @@ def collect(
         "customer": run.customer,
         "started_at": run.started_at,
         "account_scope": len(sessions),
+        # 관제 계정(호출자) ID. R5 `trust_scope="tooling"` 판정의 유일한 근거다 — 관제 계정은
+        # `accounts` 에 없을 수 있으므로(그게 권장 구성) config 만으로는 알 수 없다.
+        # M2 가 이 값을 읽는다: 신뢰 대상이 이 계정이면 정상 운영 경로로 라벨만 붙인다.
+        "tooling_account_id": scope.tooling_account_id,
         "status": "degraded" if any_degraded else "succeeded",
         # 상태 근거 요약(UI 실행 이력 상세용). skipped 는 정상(선택적 소스 미존재)임을 명시.
         "status_summary": {

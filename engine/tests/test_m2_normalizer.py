@@ -478,7 +478,11 @@ def test_excluded_from_catalog_but_kept_in_cleanup(tmp_path) -> None:
     # M6 은 is_exception 을 보지 않으므로 미사용 역할 조치 항목은 유지된다.
     records[0].used_actions = []
     items = _cleanup_items(records, _cfg_for_cleanup())
-    assert any(i.type == "unused_role" and i.principal == _SLR for i in items), \
+    # 유형은 신뢰 축에 따라 갈린다(`unused_role` = 내부 확인 / `unconfirmed_trust_role` = 미확인).
+    # 이 테스트가 고정하는 것은 **항목이 남는다**는 사실이고, 어느 쪽이든 정리 대상 목록에 있어야
+    # 한다. 유형을 하나로 못 박으면 신뢰 판정이 바뀔 때 이 어서션이 무관한 이유로 깨진다.
+    unused_types = {"unused_role", "unconfirmed_trust_role"}
+    assert any(i.type in unused_types and i.principal == _SLR for i in items), \
         "제외가 조치 항목까지 지우면 안 됨(미사용 서비스 역할도 정리 대상)"
 
 
@@ -648,18 +652,20 @@ def test_role_last_used_passthrough_and_unused_days(tmp_path) -> None:
     assert r.unused_days == 14
 
 
-def test_unused_days_none_when_no_iam_record(tmp_path) -> None:
-    """대조군 — 활동 기록이 없으면 unused_days 도 None.
+def test_unused_days_falls_back_to_create_date_with_basis(tmp_path) -> None:
+    """활동 기록이 없으면 **생성일부터** 센다 — 단, 무엇부터 셌는지를 basis 로 함께 남긴다(R2 ②).
 
-    생성일로 메꾸면(age_days 재사용) "이만큼 안 썼다" 를 실측처럼 주장하게 된다. 하한 서술은
-    소비자(m6_reporter._unused_period)의 몫이고, 여기서 숫자를 만들지 않는다.
+    예전엔 여기서 None 을 반환했다. 그러면 "기록 없음" 역할이 등급도 일수도 없어, 화면에서
+    3년 된 역할과 어제 만든 역할이 같은 '확인 불가' 로 묶였다. 숫자를 만들지 않는 대신 basis 를
+    실어, 같은 "195일" 이 AWS 가 기록한 사실(①)인지 우리가 생성일부터 센 것(②)인지 구분한다.
     """
     storage = LocalFSStorage(tmp_path, "test", "run-fixed")
     _seed_role_last_used(storage, None, None)
     r = normalize(storage, RUN)[0]
     assert r.role_last_used is None
     assert r.role_last_used_region is None
-    assert r.unused_days is None
+    assert r.unused_days == 195
+    assert r.unused_days_basis == "create_date"
     assert r.age_days == 195, "생성 후 경과는 그대로 계산돼야 한다(대조)"
 
 

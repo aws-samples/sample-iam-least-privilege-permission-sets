@@ -89,6 +89,9 @@ def handler(event: dict | None = None, context: Any = None) -> dict:  # noqa: AN
         run = RunContext(run_id=params["run_id"], customer=cfg.customer, started_at=run.started_at)
     result = _run_stage(params.get("stage", "run"), cfg, run, params.get("out", "out"))
     result["run_id"] = run.run_id
+    # started_at 도 돌려준다 — Step Functions 의 collect 단계가 이 둘을 상태 루트로 승격해
+    # 이후 stage 에 넘긴다(트리거가 run 컨텍스트를 주지 않는 스케줄 실행의 유일한 전달 경로).
+    result["started_at"] = run.started_at
     return result
 
 

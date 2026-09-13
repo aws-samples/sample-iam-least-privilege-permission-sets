@@ -45,3 +45,6 @@ CLAUDE.md
 
 # Build config directory (on macOS it collides case-insensitively with config/)
 /Config
+
+# 로컬 전용 config(계정 리터럴 포함 가능) — 커밋 금지.
+config/*.local.yaml

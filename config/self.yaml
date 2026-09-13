@@ -60,6 +60,8 @@ catalog:
     - "cdk-*-file-publishing-role-*"
     - "cdk-*-image-publishing-role-*"
     - "cdk-*-lookup-role-*"
+    # `cdk bootstrap` 다섯 번째 역할 — 지우면 그 리전 CFN 배포가 전부 실패한다.
+    - "cdk-*-cfn-exec-role-*"
   # 접근 성격(Admin/Write/ReadOnly) 판정 임계치. "광범위" 의 기준은 계정 규모에 따라 다르다.
   admin_min_services_with_identity: 20
   admin_min_services: 50

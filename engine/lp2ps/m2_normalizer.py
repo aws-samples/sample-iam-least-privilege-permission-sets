@@ -8,6 +8,7 @@ M1 수집 raw JSON 을 계정 단위로 읽어 principal 단위 `PrincipalRecord
 - undetermined_findings ← 같은 갭 중 **판정 불가**(아래 3단 근거)
 - mfa / access_key_age_days ← credential report CSV
 - principal_kind / trust_principals ← role 신뢰정책(AssumeRolePolicyDocument)
+- tenant_group / trust_scope ← 이 계정의 테넌트 그룹(R5) + 신뢰 대상이 **내부라고 확인됐는지**
 - tags            ← role/user 태그
 - source          ← 이 principal 에 기여한 수집 소스 목록
 
@@ -48,10 +49,12 @@ from .collectors.analyzer_unused import SOURCE as ANALYZER
 from .collectors.cloudtrail import SOURCE as CLOUDTRAIL
 from .collectors.credential_report import SOURCE as CRED_REPORT
 from .collectors.idc_permission_sets import SOURCE as IDC
+from .config import DEFAULT_TENANT_GROUP
 from .models import PrincipalKind, PrincipalRecord, UsedAction
 from .timeutil import max_ts
 
 if TYPE_CHECKING:  # pragma: no cover
+    from .config import RiskRules
     from .runctx import RunContext
     from .storage import Storage
 
@@ -126,6 +129,116 @@ def _trust_principals(trust_policy: dict) -> tuple[set[str], list[str]]:
     return keys, sorted(values)
 
 
+def _account_of_arn(value: str) -> str:
+    """신뢰 대상 문자열에서 계정 ID 를 뽑는다(ARN 이 아니거나 계정 자리가 비면 "").
+
+    `arn:partition:service:region:ACCOUNT:resource` — 5번째 필드다. 와일드카드(`*`)는 계정 ID 가
+    아니므로 빈 문자열을 준다(그건 `trust_wildcard` 가 다룬다).
+    """
+    if not value.startswith("arn:"):
+        return ""
+    parts = value.split(":")
+    if len(parts) < 5:
+        return ""
+    acct = parts[4]
+    return acct if acct.isdigit() else ""
+
+
+def _trust_scope(
+    identity_type: str,
+    trust_keys: set[str],
+    trust_values: list[str],
+    own_group: str,
+    account_groups: dict[str, str],
+    tooling_account_id: str,
+) -> str:
+    """신뢰 대상이 우리 테넌트인가(R5). **"외부인가" 가 아니라 "내부라고 확인됐나" 를 묻는다.**
+
+    오판의 비대칭 때문이다 — 벤더가 심어둔 역할을 내부로 오판하면 삭제 권고 목록에 올라가 고객이
+    연동을 끊는다. 반대 방향 오판은 "소유자 확인" 으로 한 단계 밀릴 뿐이다. 그래서 판정 순서는
+    **위험한 결론을 먼저** 낸다: cross_tenant → unconfirmed → tooling → internal → service.
+
+    `account_groups` 는 **이번 run 이 실제로 수집한 계정**의 그룹 맵이다(config 선언이 아니라
+    산출물 기준). 이 맵에 없는 계정 = 우리가 들여다본 적 없는 계정 = 내부라고 말할 근거가 없다.
+    """
+    # IAM 사용자·PS 할당은 **신뢰정책이 없다**. 신뢰 대상 부재를 "확인 안 됨" 으로 읽으면 전 사용자가
+    # 소유자 확인 트랙으로 밀려나는데, 사용자는 우리가 수집한 계정 안에 사는 신원이다(외부에서 집을
+    # 대상이 아니다). 정의상 internal 이다.
+    if identity_type in ("user", "sso_ps"):
+        return "internal"
+
+    accounts = {a for a in (_account_of_arn(v) for v in trust_values) if a}
+    if accounts:
+        others = {a for a in accounts if a != tooling_account_id}
+        groups = {account_groups.get(a, "") for a in others}
+        # 1. 다른 그룹 계정을 하나라도 신뢰하면 그게 결론이다 — 테넌트 경계 위반 의심.
+        #    (같은 그룹 계정도 함께 신뢰하고 있어도 문제의 성격은 바뀌지 않는다.)
+        if any(g and g != own_group for g in groups):
+            return "cross_tenant"
+        # 2. 수집 범위 밖 계정(맵에 없음) → 내부라고 말할 근거가 없다. 벤더·다른 도구일 수 있다.
+        if any(g == "" for g in groups):
+            return "unconfirmed"
+        # 3. 남은 계정 신뢰가 관제 계정뿐 → 이 도구 자신을 포함한 정상 운영 경로.
+        if not others:
+            return "tooling"
+        return "internal"
+    # 계정 신뢰가 전혀 없을 때만 다른 축을 본다. 서비스 신뢰는 계정 경계 문제가 아니다.
+    if _TRUST_SERVICE in trust_keys:
+        return "service"
+    if _TRUST_FEDERATED in trust_keys:
+        # 페더레이션 IdP 는 계정이 아니라 이 계정 안의 SAML/OIDC provider 를 가리킨다 → 내부다.
+        return "internal"
+    # 신뢰정책 미수집(인벤토리 밖) · Principal 이 와일드카드뿐 · 알 수 없는 형태.
+    return "unconfirmed"
+
+
+def _is_wildcard_principal(value: str) -> bool:
+    """신뢰 대상 문자열이 **누구든**을 뜻하는가.
+
+    두 형태를 잡는다: `"*"` 그 자체와, 계정 자리가 `*` 인 ARN(`arn:aws:iam::*:root` — 모든 계정의
+    루트를 신뢰한다는 뜻이다). 특정 계정 ARN 은 여기 걸리지 않는다 — 교차계정 신뢰는 와일드카드가
+    아니라 범위 문제이고, `trust_scope` 가 다룬다.
+    """
+    if value == "*":
+        return True
+    if not value.startswith("arn:"):
+        return False
+    parts = value.split(":")
+    return len(parts) > 4 and parts[4] == "*"  # arn:partition:service:region:ACCOUNT:...
+
+
+def _trust_wildcard(trust_policy: dict) -> bool:
+    """신뢰정책이 **조건 없이** 누구든에게 열려 있는가(R4 — `trust_policy_wildcard`).
+
+    Condition 이 붙은 와일드카드는 잡지 않는다. `Principal:"*"` + `aws:PrincipalOrgID` 는 조직
+    범위로 신뢰를 묶는 정상 패턴이고, IAM Access Analyzer 도 이 경우를 외부 접근으로 보고하지
+    않는다 — 같은 기준을 쓰지 않으면 AWS 콘솔이 '문제 없음' 이라고 말하는 것을 이 도구가
+    '보안 결함' 이라고 주장하게 된다.
+
+    🔴 한계: Condition 의 **강도는 보지 않는다**. 약한 조건(`aws:SourceIp` 등)으로 열린 신뢰는
+    여기서 안 잡힌다. 조건 내용 판정은 별 문제이고(정책 평가), 이번 범위 밖이다.
+    """
+    statements = trust_policy.get("Statement", []) if isinstance(trust_policy, dict) else []
+    if isinstance(statements, dict):
+        statements = [statements]
+    for stmt in statements:
+        if not isinstance(stmt, dict) or stmt.get("Effect") != "Allow":
+            continue
+        if stmt.get("Condition"):
+            continue
+        principal = stmt.get("Principal")
+        vals: list[str] = []
+        if isinstance(principal, str):
+            vals = [principal]
+        elif isinstance(principal, dict):
+            for val in principal.values():
+                vals.extend(v for v in ([val] if isinstance(val, str) else val or [])
+                            if isinstance(v, str))
+        if any(_is_wildcard_principal(v) for v in vals):
+            return True
+    return False
+
+
 def _principal_kind(identity_type: str, trust_keys: set[str]) -> PrincipalKind:
     """사용 주체 구분. IAM 사용자는 신뢰정책이 없으므로 identity_type 으로 즉시 판정."""
     if identity_type == "user":
@@ -140,14 +253,123 @@ def _principal_kind(identity_type: str, trust_keys: set[str]) -> PrincipalKind:
     return "unknown"
 
 
-def normalize(storage: "Storage", run: "RunContext") -> list[PrincipalRecord]:
-    """raw/** → PrincipalRecord[] (정렬됨) 를 만들고 normalized.parquet 로 기록."""
+# ---- 사용 주체(R1) — 신뢰정책이 아니라 **실제로 누가 집었나** ----
+#
+# `principal_kind`(누가 집을 수 **있나**)와 별개 축이다. 신뢰정책만 보면 사람이 쓰는 역할이 전부
+# unknown 으로 떨어진다 — 실측에서 사람 판정이 0건이었던 이유가 이것이다.
+#
+# 🔴 양성 근거만 승격한다. **부재는 근거가 아니다** — MFA 표시가 없는 것은 사람이 아니라는 뜻이
+#    아니고(IdC 콘솔 세션도 표시가 없을 수 있다), 이벤트가 없는 것은 기계라는 뜻이 아니다.
+
+# AssumeRole 호출자가 이것이면 사람이 한 일이다.
+_HUMAN_CALLER_KINDS = frozenset({"iam_user", "federated", "sso", "root"})
+# 자동화만 만드는 세션 이름 형태. `service_name` 은 **넣지 않는다** — 사람의 SSO 사용자명도 그 형태다.
+_MACHINE_SESSION_SHAPES = frozenset({"account_id_embedded", "uuid_suffix"})
+# 하나의 라벨을 결정론적으로 고르기 위한 우선순위(개인정보성·판정력 순).
+_SHAPE_PRIORITY = ("email_like", "account_id_embedded", "uuid_suffix", "service_name", "other")
+
+
+def _subjects_by_principal(ct_raw: dict) -> dict[str, dict]:
+    """CloudTrail raw 의 주체 신호 행 → principal ARN → 신호 dict.
+
+    구버전 raw(이 키가 없는 run)에서도 동작해야 하므로 없으면 빈 맵 — 그때 판정은 신뢰정책 근거만
+    쓰고 `none` 으로 남는다(추측하지 않는다).
+    """
+    rows = ct_raw.get("subjects") or []
+    return {r["principal"]: r for r in rows if isinstance(r, dict) and r.get("principal")}
+
+
+def _pick_session_shape(signals: dict | None) -> str | None:
+    """관측된 세션 이름 라벨 중 하나를 결정론적으로 고른다(원문은 애초에 없다)."""
+    if not signals:
+        return None
+    shapes = set(signals.get("session_name_shapes") or [])
+    for shape in _SHAPE_PRIORITY:
+        if shape in shapes:
+            return shape
+    return None
+
+
+def _usage_subject(
+    identity_type: str, trust_keys: set[str], trust_values: list[str], signals: dict | None
+) -> tuple[str, str]:
+    """(usage_subject, basis) — R1 우선순위. basis 는 화면 근거 문장의 소스다.
+
+    근거가 없을 때 `no_events`(CloudTrail 에 이 principal 이 아예 없었다)와
+    `events_without_subject_signal`(이벤트는 있었는데 주체 신호가 없었다)을 구분한다 — 전자는
+    "관측 밖", 후자는 "관측했지만 못 갈랐다" 로 다른 사실이다.
+    """
+    # 1. IAM 사용자·PS 할당은 정의상 사람이다(신호를 볼 필요가 없다).
+    if identity_type == "user":
+        return "human", "iam_user"
+    if identity_type == "sso_ps":
+        return "human", "idc_assignment"
+
+    s = signals or {}
+    # 2. MFA 인증 표시 — 사람만 통과할 수 있는 관문이다.
+    if s.get("mfa_seen"):
+        return "human", "mfa_session"
+    # 3. 이 역할을 집은 호출자가 사람이었다.
+    if _HUMAN_CALLER_KINDS & set(s.get("assume_caller_kinds") or []):
+        return "human", "assume_caller_human"
+    # 3-b. 세션 이름이 이메일 형태다 — 자동화는 이메일을 세션명으로 쓰지 않는다. `service_name` 과
+    #      달리 사람과 겹치지 않는 유일한 형태이므로 사람 근거로 쓴다(`_MACHINE_SESSION_SHAPES` 와
+    #      대칭이다: 그쪽은 기계만 만드는 형태, 이쪽은 사람만 만드는 형태).
+    if "email_like" in set(s.get("session_name_shapes") or []):
+        return "human", "session_name_email"
+    # 4. 신뢰정책이 IAM **사용자** ARN 을 직접 가리킨다(`:root` 는 계정 신뢰이므로 제외).
+    if any(":user/" in v for v in trust_values):
+        return "human", "trust_iam_user"
+    # 5. 서비스가 이 역할로 호출했다.
+    if s.get("invoked_by"):
+        return "machine", "invoked_by"
+    # 6. 세션 이름이 자동화 형식이다.
+    if _MACHINE_SESSION_SHAPES & set(s.get("session_name_shapes") or []):
+        return "machine", "session_name_automation"
+    # 7. 신뢰정책이 AWS 서비스를 가리킨다.
+    if _TRUST_SERVICE in trust_keys:
+        return "machine", "trust_service"
+    return "none", ("events_without_subject_signal" if signals else "no_events")
+
+
+def normalize(
+    storage: "Storage",
+    run: "RunContext",
+    risk_rules: "RiskRules | None" = None,
+    *,
+    account_groups: "dict[str, str] | None" = None,
+    tooling_account_id: str = "",
+) -> list[PrincipalRecord]:
+    """raw/** → PrincipalRecord[] (정렬됨) 를 만들고 normalized.parquet 로 기록.
+
+    `risk_rules` 는 미사용 등급 경계(R2)에만 쓰인다. 미지정이면 config 기본값(`RiskRules()`)을
+    쓴다 — 임계치의 SSOT 는 여전히 config 이고(불변식 ④) 이 기본값은 그 모델의 기본값이다.
+
+    `account_groups`(계정 ID → 테넌트 그룹) · `tooling_account_id` 는 R5 판정에만 쓰인다. 둘 다
+    **이번 run 이 실제로 수집한 것** 기준이어야 한다(`pipeline.tenancy_of` 가 만든다) — config
+    선언만 쓰면 `cross_account=false` 모드(`accounts=["self"]`)에서 자기 계정조차 맵에 없어
+    모든 역할이 `unconfirmed` 가 된다. 미지정이면 전 계정이 기본 그룹이고 관제 계정은 모른다.
+    """
+    from .config import RiskRules
+
+    rules = risk_rules or RiskRules()
     as_of = run.started_dt
     records: list[PrincipalRecord] = []
 
-    for account_id in storage.list_accounts():
+    accounts_seen = storage.list_accounts()
+    groups = dict(account_groups) if account_groups else {}
+    # 수집했는데 그룹 선언이 없는 계정은 기본 그룹으로 채운다. 여기서 비워 두면 자기 계정을
+    # 신뢰하는 역할이 `unconfirmed` 가 되어 단일 계정 고객의 모든 역할이 소유자 확인으로 밀린다.
+    for account_id in accounts_seen:
+        groups.setdefault(account_id, DEFAULT_TENANT_GROUP)
+
+    for account_id in accounts_seen:
         raw = _load_account_raw(storage, account_id)
-        records.extend(_normalize_account(account_id, raw, run.run_id, as_of))
+        records.extend(
+            _normalize_account(
+                account_id, raw, run.run_id, as_of, rules, groups, tooling_account_id
+            )
+        )
 
     records.sort(key=lambda r: (r.account_id, r.principal))
     storage.write_normalized(records)
@@ -163,8 +385,15 @@ def _load_account_raw(storage: "Storage", account_id: str) -> dict[str, dict]:
 
 
 def _normalize_account(
-    account_id: str, raw: dict[str, dict], run_id: str, as_of: datetime
+    account_id: str,
+    raw: dict[str, dict],
+    run_id: str,
+    as_of: datetime,
+    rules: "RiskRules",
+    account_groups: dict[str, str],
+    tooling_account_id: str,
 ) -> list[PrincipalRecord]:
+    own_group = account_groups.get(account_id, DEFAULT_TENANT_GROUP)
     cred = raw.get(CRED_REPORT, {})
     inventory = {p["principal"]: p for p in (cred.get("principals", []) or [])}
     cred_by_arn = _index_credential_report(cred.get("credential_report", []) or [])
@@ -175,6 +404,7 @@ def _normalize_account(
 
     used_by_arn, used_sources_by_arn = _used_actions_by_principal(raw)
     observed_days, observed_from = _observed_window(raw.get(CLOUDTRAIL, {}), as_of)
+    subjects_by_arn = _subjects_by_principal(raw.get(CLOUDTRAIL, {}))
     analyzer_by_arn = _analyzer_findings_by_principal(raw.get(ANALYZER, {}))
     authed_svcs_by_arn, tracked_by_arn_svc, advisor_covered = _advisor_evidence(raw.get(ADVISOR, {}))
 
@@ -192,6 +422,10 @@ def _normalize_account(
 
         # (granted − used) 갭을 "미사용 확정" 과 "판정 불가" 로 가른다(모듈 독스트링의 3단 근거).
         gap = sorted(a for a in granted if a not in used_action_names and not _is_wildcard(a))
+        # 갭에서 뺀 와일드카드를 **버리지 않고 따로 남긴다**(R4). 빼는 것 자체는 맞다 — 부여 범위에
+        # 상한이 없어 "미사용 N개" 를 셀 수 없다. 문제는 그 결과 전 권한 보유자가 findings 0 으로
+        # 가장 깨끗해 보였다는 것이다. 보유 사실을 여기서 보존해 M6 이 별 유형으로 승격한다.
+        wildcard_grants = sorted(a for a in granted if _is_wildcard(a))
         authed_svcs = authed_svcs_by_arn.get(arn, frozenset())
         confirmed_unused: list[str] = []
         undetermined: list[str] = []
@@ -233,8 +467,26 @@ def _normalize_account(
 
         # 신뢰정책 → 사용 주체. 인벤토리 밖 principal(credential_report degraded 등)은 신뢰정책이
         # 없어 'unknown' 이 된다 — 추측하지 않고 모른다고 남긴다.
-        trust_keys, trust_values = _trust_principals(p.get("trust_policy") or {} if in_inventory else {})
+        trust_policy = p.get("trust_policy") or {} if in_inventory else {}
+        trust_keys, trust_values = _trust_principals(trust_policy)
         kind = _principal_kind(identity_type, trust_keys)
+        # 실사용 축(R1). 주체 신호는 **이미 principal 집합에 있는 ARN 에만** 적용한다 — AssumeRole 의
+        # 대상 ARN 은 다른 계정 역할일 수 있어서, 신호가 있다는 이유로 레코드를 만들면 수집 범위 밖
+        # 계정의 역할이 이 계정 산출물에 나타난다.
+        signals = subjects_by_arn.get(arn)
+        subject, subject_basis = _usage_subject(identity_type, trust_keys, trust_values, signals)
+
+        # 미사용 일수·등급(R2). 양성 사용 근거(CloudTrail used action / Advisor 인증 서비스)가 있으면
+        # 생성일 폴백을 쓰지 않는다 — 쓰이는 중인 대상에 "생성 후 N일 미사용" 을 붙이지 않기 위해서다.
+        role_last_used = p.get("role_last_used") if in_inventory else None
+        create_date = p.get("create_date") if in_inventory else None
+        age_days = _days_since(create_date, as_of)
+        unused_days, unused_basis = _unused_days(
+            role_last_used, create_date, bool(used) or bool(authed_svcs), as_of
+        )
+        unused_tier = _unused_tier(
+            unused_days, age_days, rules.unused_tier_days, rules.new_principal_days
+        )
 
         records.append(
             PrincipalRecord(
@@ -243,6 +495,17 @@ def _normalize_account(
                 identity_type=identity_type,
                 principal_kind=kind,
                 trust_principals=trust_values,
+                tenant_group=own_group,
+                trust_scope=_trust_scope(
+                    identity_type, trust_keys, trust_values, own_group,
+                    account_groups, tooling_account_id,
+                ),
+                trust_wildcard=_trust_wildcard(trust_policy),
+                wildcard_grants=wildcard_grants,
+                usage_subject=subject,
+                usage_subject_basis=subject_basis,
+                # 🔴 분류 라벨만. 세션 이름 원문은 수집기가 이미 버렸다(R1-a).
+                session_name_shape=_pick_session_shape(signals),
                 tags=dict(p.get("tags") or {}) if in_inventory else {},
                 granted_actions=sorted(set(granted)),
                 used_actions=used,
@@ -253,11 +516,13 @@ def _normalize_account(
                 console_login=_console_login(cred_row),
                 has_managed_policies=has_managed,
                 access_key_age_days=_access_key_age_days(cred_row, as_of),
-                create_date=(p.get("create_date") if in_inventory else None),
-                age_days=_days_since(p.get("create_date") if in_inventory else None, as_of),
-                role_last_used=(p.get("role_last_used") if in_inventory else None),
+                create_date=create_date,
+                age_days=age_days,
+                role_last_used=role_last_used,
                 role_last_used_region=(p.get("role_last_used_region") if in_inventory else None),
-                unused_days=_days_since(p.get("role_last_used") if in_inventory else None, as_of),
+                unused_days=unused_days,
+                unused_days_basis=unused_basis,
+                unused_tier=unused_tier,
                 observed_days=observed_days,
                 observed_from=observed_from,
                 is_exception=exc_type is not None,
@@ -272,7 +537,7 @@ def _normalize_account(
     # 같은 사람의 접근은 (a) 이 sso_ps 레코드와 (b) IdC 가 대상 계정에 만든 AWSReservedSSO_* 역할
     # 두 곳에 나뉘어 있고, 실사용 action 은 (b) 에만 기록된다 → PS 별로 (b) 의 실사용을 귀속시킨다.
     # 그래야 "이 PS 가 과다권한인가"를 granted−used 로 판정할 수 있다.
-    records.extend(_sso_ps_records(account_id, raw.get(IDC, {}), run_id, records))
+    records.extend(_sso_ps_records(account_id, raw.get(IDC, {}), run_id, records, own_group))
     return records
 
 
@@ -306,7 +571,11 @@ def _reserved_sso_usage(records: list[PrincipalRecord]) -> dict[str, list[UsedAc
 
 
 def _sso_ps_records(
-    account_id: str, idc_raw: dict, run_id: str, iam_records: list[PrincipalRecord]
+    account_id: str,
+    idc_raw: dict,
+    run_id: str,
+    iam_records: list[PrincipalRecord],
+    tenant_group: str = DEFAULT_TENANT_GROUP,
 ) -> list[PrincipalRecord]:
     """IdC account assignment → identity_type='sso_ps' 레코드(할당 principal 당 1건, 중복 제거)."""
     usage_by_ps = _reserved_sso_usage(iam_records)
@@ -328,6 +597,11 @@ def _sso_ps_records(
                 principal=key,
                 identity_type="sso_ps",
                 principal_kind="human",  # PS 할당은 사람 접근이다.
+                tenant_group=tenant_group,
+                # 이 계정 안의 사람 접근이다 — 외부에서 집을 대상이 아니라 신뢰 범위는 internal.
+                trust_scope="internal",
+                usage_subject="human",  # 실사용 축에서도 사람이다(R1 순위 1).
+                usage_subject_basis="idc_assignment",
                 # 이 PS 로 실제 호출된 action(대상 계정의 AWSReservedSSO_* 역할에서 귀속).
                 # granted 는 PS 정책 문서를 수집하지 않아 아직 비어 있다(후속) → 지금은 미사용 갭 계산
                 # 대상이 아니고, "이 PS 가 실제로 쓰이는지"까지만 판정한다.
@@ -404,6 +678,57 @@ def _actions_from_document(document: dict) -> set[str]:
 
 def _is_wildcard(action: str) -> bool:
     return "*" in action
+
+
+# ---- 미사용 일수와 등급(R2) ----
+def _unused_days(
+    rec_role_last_used: str | None,
+    create_date: str | None,
+    has_usage_evidence: bool,
+    as_of: datetime,
+) -> tuple[int | None, str | None]:
+    """(미사용 일수, 무엇부터 셌나) — 값만으로는 부족하다. 화면 문구가 근거에 따라 갈린다.
+
+    ① IAM 활동 기록(`RoleLastUsed`, 전 리전)이 있으면 그 날짜부터. **상한을 두지 않는다** —
+       AWS 문서상 추적 보장은 400일이지만 실측에서 1,076일 전 날짜가 그대로 나왔다. AWS 가 기록한
+       사실이므로 잘라내지 않는다.
+    ② 활동 기록이 없고 **양성 사용 근거도 없으면** 생성일부터. 400일 문구는 여기에만 붙는다.
+    ③ 활동 기록이 없는데 양성 사용 근거(CloudTrail used_actions / Advisor used_services)는 있으면
+       **일수를 말하지 않는다**(None). 쓰이는 중인 대상에 "생성 후 500일 미사용" 을 붙이면 화면이
+       스스로를 반박한다. IAM 사용자는 `RoleLastUsed` 가 애초에 없어서 이 경로로 자주 들어온다.
+    """
+    if rec_role_last_used:
+        return _days_since(rec_role_last_used, as_of), "role_last_used"
+    if has_usage_evidence:
+        return None, None
+    days = _days_since(create_date, as_of)
+    return (days, "create_date") if days is not None else (None, None)
+
+
+def _unused_tier(
+    unused_days: int | None, age_days: int | None, boundaries: list[int], new_days: int
+) -> str | None:
+    """미사용 등급. 경계는 config(`risk_rules.unused_tier_days`, 기본 30/60/90).
+
+    `new`(생성 후 `new_principal_days` 미만)가 **먼저 이긴다** — 관측 기간 자체가 짧아 등급을
+    주장할 근거가 없다. 실측에서 당일 생성 역할이 '미사용 0일' 로 나왔다: 참이지만 정보가 없고
+    숫자가 판단처럼 읽힌다. (`new` 와 `cleanup` 은 실제로 겹칠 수 없다 — 생성 전에 쓸 수 없으므로
+    30일 미만 대상의 미사용 일수는 30일을 넘지 못한다. 겹치는 것은 `active` 뿐이다.)
+
+    등급 없음(None)은 0 이 아니라 **미측정**이다(활동 기록도 생성일도 없음).
+    """
+    if age_days is not None and age_days < new_days:
+        return "new"
+    if unused_days is None:
+        return None
+    watch, review, cleanup = boundaries
+    if unused_days < watch:
+        return "active"
+    if unused_days < review:
+        return "watch"
+    if unused_days < cleanup:
+        return "review"
+    return "cleanup"
 
 
 # ---- 관측 가능 기간 ----

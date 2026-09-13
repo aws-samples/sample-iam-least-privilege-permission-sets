@@ -98,7 +98,7 @@ export default function Assistant() {
                   <Bubble key={i} side="left">
                     <SpaceBetween size="xs">
                       <SpaceBetween direction="horizontal" size="xs">
-                        <Badge color="blue">✦ AI 제안—검증 필요</Badge>
+                        <Badge color="blue">✦ AI 제안</Badge>
                         {m.answer?.grounded && <Badge color="green">grounded</Badge>}
                       </SpaceBetween>
                       <Box>{m.text}</Box>

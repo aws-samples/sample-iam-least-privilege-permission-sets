@@ -656,6 +656,20 @@ def test_risk_criteria(monkeypatch):
     assert body["level_high"] == 50
     esc = next(x for x in body["rules"] if x["key"] == "escalation_path")
     assert esc["weight"] == 30
+    # 미사용 등급 경계도 함께 내린다 — 화면 라벨이 "N일 이상 미사용" 이라 이 값이 없으면
+    # 프런트가 30/60/90 을 박아야 하고, 경계를 조정한 고객의 화면이 거짓을 말한다.
+    assert body["unused_tier_days"] == [30, 60, 90]
+
+
+@mock_aws
+def test_risk_criteria_tier_days_follow_config(monkeypatch):
+    """경계를 조정한 고객은 조정한 값을 받아야 한다(기본값을 응답에 박으면 FAIL)."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    monkeypatch.setenv("LP2PS_CONFIG_INLINE", json.dumps(
+        {"risk_rules": {"unused_tier_days": [10, 20, 45], "unused_role_days": 45}}))
+    c = _client(monkeypatch)
+    body = c.get("/cleanup-backlog/risk-criteria").json()
+    assert body["unused_tier_days"] == [10, 20, 45]
 
 
 @mock_aws
@@ -745,6 +759,57 @@ def test_get_schedule_default_disabled(monkeypatch):
     assert r.status_code == 200
     assert r.json()["enabled"] is False
     assert r.json()["cron"] == "0 2 * * ? *"
+    # 우리 daily 형태이므로 프리셋으로 복원돼야 한다(예전엔 무조건 "custom" 이었다).
+    assert r.json()["frequency"] == "daily"
+    assert r.json()["hour_utc"] == 2
+
+
+@mock_aws
+@pytest.mark.parametrize(
+    ("payload", "cron", "restored"),
+    [
+        ({"frequency": "daily", "hour_utc": 17},
+         "0 17 * * ? *", {"frequency": "daily", "hour_utc": 17}),
+        ({"frequency": "weekly", "hour_utc": 5, "day_of_week": 2},
+         "0 5 ? * 2 *", {"frequency": "weekly", "hour_utc": 5, "day_of_week": 2}),
+        ({"frequency": "monthly", "hour_utc": 23, "day_of_month": 28},
+         "0 23 28 * ? *", {"frequency": "monthly", "hour_utc": 23, "day_of_month": 28}),
+    ],
+)
+def test_schedule_roundtrip_restores_preset(monkeypatch, payload, cron, restored):
+    """F4 — 저장한 프리셋이 재조회에서 그대로 돌아온다.
+
+    이 왕복이 깨져 있었던 것이 "사용자에게 cron 이 보인" 진짜 원인이다(GET 이 무조건
+    `frequency="custom"` 을 돌려줬다). 어서션은 cron 문자열이 아니라 **프리셋 필드**를 잰다 —
+    cron 만 재면 예전 코드로도 통과한다(= 미측정).
+    """
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    monkeypatch.setenv("LP2PS_SCHEDULE_RULE_NAME", "lp2ps-self-scan-schedule")
+    _seed_schedule_rule()
+    c = _client(monkeypatch)
+    assert c.put("/schedule", json={"enabled": True, **payload}).status_code == 200
+    got = c.get("/schedule").json()
+    assert got["cron"] == cron
+    assert got["enabled"] is True
+    for k, v in restored.items():
+        assert got[k] == v, f"{k}: {got[k]!r} != {v!r}"
+
+
+@mock_aws
+def test_schedule_foreign_cron_stays_custom(monkeypatch):
+    """우리 형태가 아닌 cron(손으로 만든 규칙)은 `custom` 으로 남고 422 가 아니다.
+
+    422 를 내면 손으로 만든 규칙이 있는 계정에서 예약 화면 자체를 열 수 없게 된다.
+    """
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    monkeypatch.setenv("LP2PS_SCHEDULE_RULE_NAME", "lp2ps-self-scan-schedule")
+    events = boto3.client("events", region_name="us-west-2")
+    events.put_rule(Name="lp2ps-self-scan-schedule",
+                    ScheduleExpression="cron(30 3 ? * MON-FRI *)", State="ENABLED")
+    c = _client(monkeypatch)
+    got = c.get("/schedule").json()
+    assert got["frequency"] == "custom"
+    assert got["cron"] == "30 3 ? * MON-FRI *"
 
 
 @mock_aws
@@ -1236,3 +1301,79 @@ def test_spill_versioned_key_does_not_overwrite_previous(monkeypatch):
     # 옛 객체는 그대로 남아 있다(참조가 살아있는 요청이 계속 읽을 수 있다).
     s3 = boto3.client("s3", region_name="us-west-2")
     assert s3.head_object(Bucket=BUCKET, Key=f"{CUSTOMER}/{first}")["ContentLength"] > 0
+
+
+# ---------------------------------------------------------------------------
+# 트랙② 서비스 역할 (GET /service-roles)
+# ---------------------------------------------------------------------------
+
+def _seed_service_roles(rollups=None, **kw):
+    """`service_roles.json` 을 최신 run 의 S3 에 심는다(엔진 산출물 형식)."""
+    from lp2ps.storage import S3Storage
+    st = S3Storage(f"s3://{BUCKET}", CUSTOMER, "run-001")
+    entry = {
+        "account_id": "444455556666",
+        "tenant_group": "default",
+        "principal": "arn:aws:iam::444455556666:role/lambda-exec",
+        "group_key": "abc123def456",
+        "unused_tier": "review",
+        "unused_days": 71,
+        "unused_days_basis": "role_last_used",
+        "observed_days": 12,
+        # 화면이 관측 구간을 숫자로 말해도 되는 기준값(config `catalog.count_min_observed_days`).
+        # API 는 계산하지 않고 그대로 통과시킨다 — 기준을 두 곳에서 정하면 화면과 산출물이 갈린다.
+        "count_min_observed_days": 7,
+        "granted_count": 40,
+        "unused_count": 33,
+        "wildcard_grants": ["s3:*"],
+        "service_rollups": rollups if rollups is not None else [
+            {"namespace": "s3", "granted_count": 8, "wildcard_grants": ["s3:*"],
+             "used_count": 3, "last_used": "2026-07-10T00:00:00Z", "tier": "active", "verdict": "keep"},
+            {"namespace": "sqs", "granted_count": 32, "wildcard_grants": [],
+             "used_count": 0, "last_used": None, "tier": "cleanup", "verdict": "remove"},
+        ],
+        "decision_count": 2,
+    }
+    entry.update(kw)
+    st.write_json("service_roles.json", [entry])
+
+
+@mock_aws
+def test_get_service_roles(monkeypatch):
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    _seed_service_roles()
+    c = _client(monkeypatch)
+    r = c.get("/service-roles")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 1
+    e = body[0]
+    # 접기 결과가 그대로 통과해야 한다 — API 가 다시 세면 화면과 산출물이 갈린다.
+    assert e["decision_count"] == 2
+    assert [x["namespace"] for x in e["service_rollups"]] == ["s3", "sqs"]
+    # 와일드카드는 granted_count 에서 빠져 있으므로 행에 원문이 실려 있어야 한다(R4).
+    assert e["service_rollups"][0]["wildcard_grants"] == ["s3:*"]
+    # 관측 구간(측정값)과 표기 기준(config 유래) **둘 다** 통과해야 한다. 기준값이 빠지면 화면이
+    # 임계치를 스스로 정하게 되고, 그게 도달 불가 임계치 `OBSERVED_MIN_DAYS=30` 이 생긴 경로다.
+    assert e["observed_days"] == 12
+    assert e["count_min_observed_days"] == 7
+
+
+@mock_aws
+def test_get_service_roles_empty_when_artifact_absent(monkeypatch):
+    """트랙② 대상 0 은 **정상 상태**다 — 404 로 내면 화면이 고장으로 읽는다."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)  # service_roles.json 을 심지 않는다
+    c = _client(monkeypatch)
+    r = c.get("/service-roles")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+@mock_aws
+def test_service_roles_requires_auth(monkeypatch):
+    """인증 없이 열려 있으면 부여 권한 목록이 그대로 새어 나간다."""
+    _seed_env(monkeypatch); _seed_aws(monkeypatch)
+    _seed_service_roles()
+    c = _client(monkeypatch, auth=False)
+    r = c.get("/service-roles")
+    assert r.status_code in (401, 403), r.status_code

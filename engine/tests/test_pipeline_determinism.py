@@ -21,7 +21,8 @@ RUN = RunContext(run_id="run-fixed", customer="test", started_at="2026-07-15T00:
 
 # 결정론 대상 산출물(run.json 은 wall-clock 없는 값만 담지만 started_at 고정이라 포함 가능).
 _ARTIFACTS = [
-    "normalized.parquet", "catalog.json", "risk_audit.jsonl", "escalation_status.json",
+    "normalized.parquet", "catalog.json", "service_roles.json",
+    "risk_audit.jsonl", "escalation_status.json",
     "cleanup_backlog.csv", "exec_summary.json", "iac/permission_sets.tf",
     "iac/providers.tf", "iac/account_assignments.tf", "metrics_timeseries.json",
 ]
@@ -56,7 +57,7 @@ def test_full_run_completes_ai_off(tmp_path):
     result = run_full(st, RUN, _cfg())
     assert result["principals"] >= 1
     # 핵심 산출물 존재.
-    for rel in ("normalized.parquet", "catalog.json", "cleanup_backlog.csv",
+    for rel in ("normalized.parquet", "catalog.json", "service_roles.json", "cleanup_backlog.csv",
                 "iac/permission_sets.tf", "run.json", "report.html"):
         assert st.exists(rel), f"{rel} 산출 안 됨"
 

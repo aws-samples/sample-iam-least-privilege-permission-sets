@@ -8,7 +8,8 @@
 - no_mfa: user 인데 mfa=false (role/service 는 MFA 개념 없음 → 제외)
 - unused_permission: unused_findings 건수 × 가중치(상한)
 - escalation_path: escalation_paths 건수 × 가중치(상한)
-- wildcard_action: granted 에 '*' 또는 'svc:*'
+- wildcard_action: granted 에 '*' 또는 'svc:*'(M2 `wildcard_grants`)
+- trust_policy_wildcard: 신뢰정책이 조건 없이 `Principal:"*"` 등(M2 `trust_wildcard`)
 - admin_like: granted 에 `*`(전체) 또는 `iam:*`(IAM 전체 제어)가 있음 — 둘 중 **하나면** hit 이다.
   (예전 독스트링은 "'iam:*'+대량" 이라고 적혀 있었지만 코드에 '대량' 조건은 없다.)
 
@@ -69,14 +70,23 @@ def score_risks(storage: "Storage", run: "RunContext", rules: "RiskRules") -> li
 
 
 def _score_one(rec: PrincipalRecord, rules: "RiskRules") -> tuple[int, list[str], list[dict]]:
-    """(clamp 점수, 사람이 읽는 reasons, audit contributions) 반환."""
+    """(clamp 점수, 사람이 읽는 reasons, audit contributions) 반환.
+
+    🔴 reasons 는 **기여도 내림차순**이고 각 문장에 그 규칙이 준 점수가 붙는다. 화면은 첫 줄을
+    "이 대상이 왜 이 등급인지" 한 줄 요약으로 쓴다(사용자 피드백 2026-09-11 — 상세 근거에 점수
+    근거가 없다는 지적). 예전에는 알파벳 정렬이어서 첫 줄이 최대 기여라는 보장이 없었다.
+    점수를 문장에 넣는 이유: 규칙별 기여도는 `risk_audit.jsonl` 에만 있었고 `CleanupItem` 에는
+    `risk_reasons: list[str]` 뿐이라 화면이 `+30` 을 렌더할 수 없었다. 계약을 바꾸지 않고
+    문장에 실어 보낸다.
+    """
     contributions: list[dict] = []
-    reasons: list[str] = []
+    # (기여점수, 규칙명, 문장) — 정렬 후 문장만 남긴다.
+    scored: list[tuple[int, str, str]] = []
 
     def _add(rule: str, weight: int, hit: bool, reason: str) -> None:
         contribution = weight if hit else 0
         if hit:
-            reasons.append(reason)
+            scored.append((contribution, rule, reason))
         contributions.append({"rule": rule, "weight": weight, "contribution": contribution})
 
     # long_lived_key
@@ -93,7 +103,10 @@ def _score_one(rec: PrincipalRecord, rules: "RiskRules") -> tuple[int, list[str]
     n_unused = len(rec.unused_findings)
     unused_contribution = min(n_unused * rules.weight_unused_permission, rules.weight_unused_permission_cap)
     if n_unused:
-        reasons.append(f"미사용 권한/발견 {n_unused}건")
+        # 상한에 걸리면 그 사실을 말한다 — 78건인데 25점인 이유를 화면에서 설명할 수 있어야 한다.
+        capped = " · 상한" if unused_contribution < n_unused * rules.weight_unused_permission else ""
+        scored.append((unused_contribution, "unused_permission",
+                       f"미사용 권한/발견 {n_unused}건{capped}"))
     contributions.append({"rule": "unused_permission", "weight": rules.weight_unused_permission,
                           "contribution": unused_contribution, "count": n_unused,
                           "cap": rules.weight_unused_permission_cap})
@@ -102,14 +115,23 @@ def _score_one(rec: PrincipalRecord, rules: "RiskRules") -> tuple[int, list[str]
     n_esc = len(rec.escalation_paths)
     esc_contribution = min(n_esc * rules.weight_escalation_path, rules.weight_escalation_cap)
     if n_esc:
-        reasons.append(f"권한 상승 경로 {n_esc}건")
+        capped = " · 상한" if esc_contribution < n_esc * rules.weight_escalation_path else ""
+        scored.append((esc_contribution, "escalation_path", f"권한 상승 경로 {n_esc}건{capped}"))
     contributions.append({"rule": "escalation_path", "weight": rules.weight_escalation_path,
                           "contribution": esc_contribution, "count": n_esc,
                           "cap": rules.weight_escalation_cap})
 
-    # wildcard_action
-    has_wildcard = any("*" in a for a in rec.granted_actions)
+    # wildcard_action — M2 가 남긴 `wildcard_grants`(R4)를 우선 쓴다. 이 필드가 없던 시절의
+    # normalized 를 다시 읽어도 점수가 떨어지지 않게 granted 스캔과 합집합으로 둔다(가중치가
+    # 조용히 0 이 되면 가장 위험한 대상의 등급이 내려간다).
+    has_wildcard = bool(rec.wildcard_grants) or any("*" in a for a in rec.granted_actions)
     _add("wildcard_action", rules.weight_wildcard_action, has_wildcard, "와일드카드 action 부여('*')")
+
+    # trust_policy_wildcard — granted 와일드카드와 **다른 결함**이다. 전자는 "이 역할이 무엇을 할
+    # 수 있나", 이쪽은 "누가 이 역할을 집을 수 있나" 다. 둘을 한 가중치로 합치면 신뢰가 열린
+    # 역할과 권한이 넓은 역할이 같은 점수가 되어, 조치 우선순위가 사라진다.
+    _add("trust_policy_wildcard", rules.weight_trust_policy_wildcard, rec.trust_wildcard,
+         "신뢰정책 와일드카드(조건 없이 누구든 assume 가능)")
 
     # admin_like
     is_admin = _is_admin_like(rec.granted_actions)
@@ -117,7 +139,9 @@ def _score_one(rec: PrincipalRecord, rules: "RiskRules") -> tuple[int, list[str]
 
     total = sum(c["contribution"] for c in contributions)
     score = max(0, min(100, total))
-    reasons.sort()
+    # 기여도 내림차순 → 동점은 규칙명 오름차순(결정론, 불변식 ②). 첫 줄 = 가장 큰 이유.
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    reasons = [f"{text} (+{pts}점)" for pts, _rule, text in scored]
     return score, reasons, contributions
 
 
